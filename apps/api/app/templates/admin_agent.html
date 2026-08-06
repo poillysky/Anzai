@@ -1,0 +1,71 @@
+{% extends "admin_base.html" %}
+{% block title %}Agent 配置 · 安崽ETF{% endblock %}
+{% block badge %}/admin/agent{% endblock %}
+{% block content %}
+<h2 class="page-title">Agent 配置</h2>
+<p class="page-lead">
+  分析三档管专家组合。对话：全站<strong>一套</strong>
+  <a href="/admin/presets">对话预设</a>；PWA「你是安崽的谁」只改【关系】提示词，不换预设。
+</p>
+
+<h3 class="subhead">分析 Agent · 三档</h3>
+<form method="post" action="/admin/analysis-tiers">
+  {% for tid in tier_ids %}
+  {% set t = tiers[tid] %}
+  <div class="tier-card">
+    <h3>{{ tid }} · {{ t.label }}</h3>
+    <label>显示名</label>
+    <input type="text" name="{{ tid }}_label" value="{{ t.label }}" />
+    <label>说明（App 副文案）</label>
+    <input type="text" name="{{ tid }}_blurb" value="{{ t.blurb }}" />
+    <label>证据档</label>
+    <select name="{{ tid }}_evidence">
+      {% for e in tier_ids %}
+      <option value="{{ e }}" {% if t.evidence_tier == e %}selected{% endif %}>{{ e }}</option>
+      {% endfor %}
+    </select>
+    <label>启用专家 · 权重</label>
+    <div class="agent-grid">
+      {% for aid in agent_ids %}
+      <div class="agent-row">
+        <input
+          type="checkbox"
+          name="{{ tid }}_agent_{{ aid }}"
+          value="1"
+          {% if aid in t.agents %}checked{% endif %}
+        />
+        <span>{{ agent_labels.get(aid, aid) }}</span>
+        <input
+          type="number"
+          name="{{ tid }}_w_{{ aid }}"
+          step="0.05"
+          min="0"
+          value="{{ t.weights.get(aid, 0) }}"
+        />
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+  <div class="row">
+    <button type="submit">保存分析三档</button>
+  </div>
+</form>
+
+<h3 class="subhead">对话安崽</h3>
+<form class="card" method="post" action="/admin/agent-chat">
+  <label class="check-row" style="margin-top:0">
+    <input type="checkbox" name="enabled" value="1" {% if agent_chat.enabled %}checked{% endif %} />
+    启用对话
+  </label>
+  <p class="hint">
+    当前预设：<code>{{ generation.preset_name }}</code>
+    · temp {{ generation.temperature }} / top_p {{ generation.top_p }}
+    · <a href="/admin/presets">编辑预设</a>
+  </p>
+  <p class="hint">开场 chips：{{ generation.suggested_chips | join(' · ') }}</p>
+  <div class="row">
+    <button type="submit">保存开关</button>
+  </div>
+</form>
+{% endblock %}

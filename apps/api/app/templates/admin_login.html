@@ -1,0 +1,20 @@
+{% extends "admin_base.html" %}
+{% block title %}登录 · 安崽ETF 管理后台{% endblock %}
+{% block badge %}/admin{% endblock %}
+{% block content %}
+<div class="card">
+  {% if bootstrap %}
+  <p class="hint" style="margin-top:0">尚无账号。请打开 <strong>PWA</strong> 完成首位管理员注册；注册成功后即可用该账号登录本后台。</p>
+  {% else %}
+  <form method="post" action="/admin/login">
+    <label>管理员用户名</label>
+    <input type="text" name="username" required minlength="2" autocomplete="username" />
+    <label>密码</label>
+    <input type="password" name="password" required minlength="4" autocomplete="current-password" />
+    <div class="row">
+      <button type="submit">登录</button>
+    </div>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}

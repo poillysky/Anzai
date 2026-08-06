@@ -1,0 +1,29 @@
+services:
+  api:
+    build: ./apps/api
+    ports:
+      - "8515:8515"
+    env_file:
+      - ./apps/api/.env
+    volumes:
+      - ./apps/api:/app
+      - api_data:/app/data
+    working_dir: /app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8515 --reload
+
+  web:
+    build: ./apps/web
+    ports:
+      - "3515:3515"
+    environment:
+      NEXT_PUBLIC_API_BASE: http://127.0.0.1:8515
+    volumes:
+      - ./apps/web:/app
+      - /app/node_modules
+    working_dir: /app
+    command: npm run dev
+    depends_on:
+      - api
+
+volumes:
+  api_data:

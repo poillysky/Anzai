@@ -1,0 +1,72 @@
+{% extends "admin_base.html" %}
+{% block title %}对话预设 · 安崽ETF{% endblock %}
+{% block badge %}/admin/presets{% endblock %}
+{% block content %}
+<h2 class="page-title">对话预设</h2>
+<p class="page-lead">
+  <strong>全站仅一套</strong>真人对话预设（人设 / 采样 / chips）。
+  「你是安崽的谁」在 PWA 里选，对话时以【关系】提示词注入，<strong>不</strong>拆成多套预设。
+  密钥在 <a href="/admin/llm">模型连接</a>。
+</p>
+
+{% set p = preset_store.presets[0] %}
+<form class="card" method="post" action="/admin/presets">
+  <input type="hidden" name="action" value="update" />
+  <input type="hidden" name="preset_id" value="{{ p.id }}" />
+
+  <p class="list-section-label">基本</p>
+  <label>名称</label>
+  <input type="text" name="name" value="{{ p.name }}" required maxlength="64" />
+
+  <p class="list-section-label">人设</p>
+  <label>系统人设 system_prompt</label>
+  <textarea name="system_prompt" rows="7">{{ p.system_prompt }}</textarea>
+  <p class="hint">身份语气不要写死在这里；对方是谁由 PWA 身份 →【关系】段决定。</p>
+
+  <label>口吻补充 reply_style（可选）</label>
+  <textarea name="reply_style" rows="2">{{ p.reply_style }}</textarea>
+
+  <p class="list-section-label">采样</p>
+  <div class="field-row">
+    <div>
+      <label>温度</label>
+      <input type="number" name="temperature" step="0.05" min="0" max="2" value="{{ p.temperature }}" />
+    </div>
+    <div>
+      <label>Top P</label>
+      <input type="number" name="top_p" step="0.05" min="0" max="1" value="{{ p.top_p }}" />
+    </div>
+  </div>
+  <div class="field-row">
+    <div>
+      <label>频率惩罚</label>
+      <input type="number" name="frequency_penalty" step="0.05" min="-2" max="2" value="{{ p.frequency_penalty }}" />
+    </div>
+    <div>
+      <label>存在惩罚</label>
+      <input type="number" name="presence_penalty" step="0.05" min="-2" max="2" value="{{ p.presence_penalty }}" />
+    </div>
+  </div>
+  <div class="field-row">
+    <div>
+      <label>最大回复</label>
+      <input type="number" name="max_tokens" step="1" min="64" max="8192" value="{{ p.max_tokens }}" />
+    </div>
+    <div>
+      <label>历史轮数</label>
+      <input type="number" name="history_messages" step="1" min="2" max="100" value="{{ p.history_messages }}" />
+    </div>
+  </div>
+
+  <p class="list-section-label">对话体验</p>
+  <label>建议开场 chips（逗号分隔）</label>
+  <input type="text" name="suggested_chips" value="{{ p.suggested_chips | join(', ') }}" />
+
+  <label>模型覆盖（空 = 当前连接模型）</label>
+  <input type="text" name="model_override" value="{{ p.model_override }}" placeholder="留空" />
+
+  <div class="row">
+    <button type="submit">保存预设</button>
+  </div>
+</form>
+{% endblock %}

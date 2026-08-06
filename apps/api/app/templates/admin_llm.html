@@ -1,0 +1,159 @@
+{% extends "admin_base.html" %}
+{% block title %}LLM 连接 · 安崽ETF{% endblock %}
+{% block badge %}/admin/llm{% endblock %}
+{% block content %}
+<h2 class="page-title">模型连接</h2>
+<p class="page-lead">L0 · 端点 / 密钥 / 模型与配置档。提示词与采样请到 <a href="/admin/presets">生成预设</a>。密钥只存服务端，不进 PWA。</p>
+
+<div class="card profile-bar">
+  <div class="profile-bar-main">
+    <span class="mute">当前配置档</span>
+    <strong>{{ active.name }}</strong>
+  </div>
+  <div class="toolbar" style="margin:0">
+    <form class="inline-form" method="post" action="/admin/llm/profiles">
+      <input type="hidden" name="action" value="switch" />
+      <select name="profile_id" onchange="this.form.submit()">
+        {% for p in profile_store.profiles %}
+        <option value="{{ p.id }}" {% if p.id == profile_store.activeProfileId %}selected{% endif %}>{{ p.name }}</option>
+        {% endfor %}
+      </select>
+    </form>
+    <form class="inline-form" method="post" action="/admin/llm/profiles">
+      <input type="hidden" name="action" value="create" />
+      <input type="hidden" name="copy_active" value="1" />
+      <input type="text" name="name" placeholder="新配置名" maxlength="40" />
+      <button type="submit" class="btn-ghost">新建</button>
+    </form>
+    <form class="inline-form" method="post" action="/admin/llm/profiles">
+      <input type="hidden" name="action" value="rename" />
+      <input type="hidden" name="profile_id" value="{{ active.id }}" />
+      <input type="text" name="name" value="{{ active.name }}" maxlength="40" />
+      <button type="submit" class="btn-ghost">重命名</button>
+    </form>
+    <form class="inline-form" method="post" action="/admin/llm/profiles" onsubmit="return confirm('删除当前配置档？');">
+      <input type="hidden" name="action" value="delete" />
+      <input type="hidden" name="profile_id" value="{{ active.id }}" />
+      <button type="submit" class="btn-danger" {% if profile_store.profiles|length <= 1 %}disabled{% endif %}>删除</button>
+    </form>
+  </div>
+</div>
+
+<form class="card" method="post" action="/admin/settings" id="llm-form">
+  <label>接口来源</label>
+  <select name="LLM_SOURCE" id="llm-source">
+    {% for s in chat_sources %}
+    <option value="{{ s.value }}" data-base="{{ s.baseUrl }}" {% if active.source == s.value %}selected{% endif %}>{{ s.label }}</option>
+    {% endfor %}
+  </select>
+
+  <label>端点（基础 URL）</label>
+  <input type="text" name="LLM_BASE_URL" id="llm-base" value="{{ active.baseUrl }}" placeholder="https://api.openai.com/v1" />
+
+  <div class="field-head">
+    <label style="margin:0">API 密钥</label>
+    <span class="key-badge {% if active.apiKeySet %}key-badge--ok{% endif %}">
+      {% if active.apiKeySet %}密钥已保存{% else %}未配置{% endif %}
+    </span>
+  </div>
+  <input
+    type="password"
+    name="LLM_API_KEY"
+    id="llm-key"
+    value=""
+    autocomplete="off"
+    placeholder="{% if active.apiKeySet %}••••••••（输入以更换）{% else %}sk-…{% endif %}"
+  />
+  {% if active.apiKeySet %}
+  <label class="check-row">
+    <input type="checkbox" name="clear_api_key" value="1" />
+    清除已保存密钥
+  </label>
+  {% endif %}
+
+  <label>模型名</label>
+  <input type="text" name="LLM_MODEL" id="llm-model" value="{{ active.model }}" placeholder="gpt-4o-mini" />
+
+  <label>可用模型</label>
+  <select id="llm-model-pick" {% if not model_list %}disabled{% endif %}>
+    <option value="">{% if model_list %}从列表选择…{% else %}None（先点测试连接）{% endif %}</option>
+    {% for m in model_list %}
+    <option value="{{ m }}" {% if m == active.model %}selected{% endif %}>{{ m }}</option>
+    {% endfor %}
+  </select>
+  <p class="hint">测试连接会请求 <code>GET /models</code> 并填充上表。改密钥/端点后可先测再保存，或直接保存。</p>
+
+  <div class="row">
+    <button type="submit">保存连接</button>
+    <button type="submit" class="btn-ghost" form="llm-test-form">测试连接</button>
+  </div>
+
+  <details class="advanced">
+    <summary>运行环境（高级）· JWT / 行情 / CORS / 数据库</summary>
+    <label>JWT_SECRET（PWA 登录签名；留空则沿用已有值）</label>
+    <input type="password" name="JWT_SECRET" value="" autocomplete="off" placeholder="{% if settings.JWT_SECRET_SET %}已设置 · 输入以更换{% else %}未设置{% endif %}" />
+    <p class="hint">建议正式环境设置独立密钥。留空保存不会清空已有值。</p>
+
+    <label>QUOTE_PROVIDER</label>
+    <select name="QUOTE_PROVIDER">
+      <option value="sina" {% if settings.QUOTE_PROVIDER == "sina" %}selected{% endif %}>sina</option>
+      <option value="mock" {% if settings.QUOTE_PROVIDER == "mock" %}selected{% endif %}>mock</option>
+    </select>
+
+    <label>CORS_ORIGINS（逗号分隔）</label>
+    <textarea name="CORS_ORIGINS">{{ settings.CORS_ORIGINS }}</textarea>
+
+    <label>DATABASE_URL</label>
+    <input type="text" name="DATABASE_URL" value="{{ settings.DATABASE_URL }}" />
+    <p class="hint">修改数据库地址后需重启 uvicorn 才完全生效连接池；LLM 配置保存后即时 reload。</p>
+  </details>
+</form>
+
+<form id="llm-test-form" method="post" action="/admin/llm/test" hidden>
+  <input type="hidden" name="LLM_BASE_URL" id="test-base" value="{{ active.baseUrl }}" />
+  <input type="hidden" name="LLM_API_KEY" id="test-key" value="" />
+  <input type="hidden" name="LLM_MODEL" id="test-model" value="{{ active.model }}" />
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var source = document.getElementById("llm-source");
+  var base = document.getElementById("llm-base");
+  var model = document.getElementById("llm-model");
+  var key = document.getElementById("llm-key");
+  var pick = document.getElementById("llm-model-pick");
+  var testBase = document.getElementById("test-base");
+  var testKey = document.getElementById("test-key");
+  var testModel = document.getElementById("test-model");
+
+  function syncTest() {
+    if (testBase) testBase.value = base ? base.value : "";
+    if (testKey) testKey.value = key ? key.value : "";
+    if (testModel) testModel.value = model ? model.value : "";
+  }
+
+  if (source && base) {
+    source.addEventListener("change", function () {
+      var opt = source.options[source.selectedIndex];
+      var b = opt.getAttribute("data-base") || "";
+      if (b) base.value = b;
+      syncTest();
+    });
+  }
+  if (pick && model) {
+    pick.addEventListener("change", function () {
+      if (pick.value) model.value = pick.value;
+      syncTest();
+    });
+  }
+  ["input", "change"].forEach(function (ev) {
+    if (base) base.addEventListener(ev, syncTest);
+    if (key) key.addEventListener(ev, syncTest);
+    if (model) model.addEventListener(ev, syncTest);
+  });
+  syncTest();
+})();
+</script>
+{% endblock %}

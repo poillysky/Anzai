@@ -1,0 +1,440 @@
+/* Login screen — isolated styles. Keep simple for iOS PWA. */
+
+.login-root {
+  --login-cream: #faf9f6;
+  --login-ink: #1a2b56;
+  --login-teal: #2eb8a6;
+  --login-teal-deep: #1fa896;
+  --login-mute: rgba(26, 43, 86, 0.52);
+  --login-line: rgba(26, 43, 86, 0.12);
+  --login-hero: url("/brand/anzai-login-hero.png");
+
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  color: var(--login-ink);
+  background-color: var(--login-cream);
+  background-image: var(--login-hero);
+  background-size: cover;
+  background-position: center top;
+  background-repeat: no-repeat;
+  font-family: "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Segoe UI", sans-serif;
+  overscroll-behavior: none;
+  touch-action: manipulation;
+}
+
+.login-top {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  padding: calc(6px + env(safe-area-inset-top, 0px)) 8px 0;
+  pointer-events: none;
+}
+
+.login-top-spacer {
+  width: 44px;
+  height: 44px;
+}
+
+.login-back {
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: rgba(26, 43, 86, 0.55);
+  display: grid;
+  place-items: center;
+  pointer-events: auto;
+}
+
+.login-back:active {
+  background: rgba(26, 43, 86, 0.06);
+}
+
+.login-stack {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.login-layer {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: transparent;
+}
+
+.login-layer:has(.login-form-page) {
+  background: linear-gradient(180deg, #faf9f6 0%, #f3f2ed 100%);
+}
+
+.login-layer--enter-push {
+  z-index: 2;
+  animation: login-push-in 0.36s cubic-bezier(0.32, 0.72, 0, 1) both;
+  box-shadow: -12px 0 32px rgba(26, 43, 86, 0.08);
+}
+
+.login-layer--exit-push {
+  z-index: 1;
+  animation: login-push-out 0.36s cubic-bezier(0.32, 0.72, 0, 1) both;
+  pointer-events: none;
+}
+
+.login-layer--enter-pop {
+  z-index: 1;
+  animation: login-pop-in 0.36s cubic-bezier(0.32, 0.72, 0, 1) both;
+}
+
+.login-layer--exit-pop {
+  z-index: 2;
+  animation: login-pop-out 0.36s cubic-bezier(0.32, 0.72, 0, 1) both;
+  box-shadow: -12px 0 32px rgba(26, 43, 86, 0.08);
+  pointer-events: none;
+}
+
+@keyframes login-push-in {
+  from { transform: translate3d(100%, 0, 0); }
+  to { transform: translate3d(0, 0, 0); }
+}
+@keyframes login-push-out {
+  from { transform: translate3d(0, 0, 0); }
+  to { transform: translate3d(-28%, 0, 0); }
+}
+@keyframes login-pop-in {
+  from { transform: translate3d(-28%, 0, 0); }
+  to { transform: translate3d(0, 0, 0); }
+}
+@keyframes login-pop-out {
+  from { transform: translate3d(0, 0, 0); }
+  to { transform: translate3d(100%, 0, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-layer--enter-push,
+  .login-layer--exit-push,
+  .login-layer--enter-pop,
+  .login-layer--exit-pop {
+    animation: none;
+    box-shadow: none;
+    transform: none;
+  }
+}
+
+.login-gate {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0 28px calc(18px + env(safe-area-inset-bottom, 0px));
+}
+
+.login-gate-spacer {
+  flex: 1 1 auto;
+  min-height: 24px;
+}
+
+.login-gate-actions {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  transform-origin: center bottom;
+  animation: login-actions-pop 0.75s cubic-bezier(0.22, 1.15, 0.36, 1) both;
+}
+
+.login-gate-actions--pending {
+  animation: none;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: scale(0.94);
+}
+
+.login-gate-actions--settled {
+  animation: none;
+  opacity: 1;
+  transform: none;
+  visibility: visible;
+}
+
+@keyframes login-actions-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.94);
+    visibility: hidden;
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+    visibility: visible;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-gate-actions {
+    animation: none;
+    opacity: 1;
+    transform: none;
+    visibility: visible;
+  }
+
+  .login-gate-actions--pending {
+    opacity: 0;
+    visibility: hidden;
+  }
+}
+
+.login-form-page {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.login-form-page--enter {
+  animation: login-actions-pop 0.75s cubic-bezier(0.22, 1.15, 0.36, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .login-form-page--enter {
+    animation: none;
+  }
+}
+
+.login-form-head {
+  flex-shrink: 0;
+  padding: calc(8px + env(safe-area-inset-top, 0px) + 44px) 28px 12px;
+  text-align: center;
+}
+
+.login-title {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--login-ink);
+}
+
+.login-lead {
+  margin: 8px 0 0;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--login-mute);
+}
+
+.login-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding: 4px 28px calc(36px + env(safe-area-inset-bottom, 0px));
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.login-field {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 14px;
+  min-height: 52px;
+  padding: 10px 0;
+  border-bottom: 0.5px solid var(--login-line);
+}
+
+.login-field:focus-within {
+  border-bottom-color: var(--login-teal);
+}
+
+.login-label {
+  flex: 0 0 5em;
+  width: 5em;
+  font-size: 16px;
+  color: var(--login-ink);
+  white-space: nowrap;
+}
+
+.login-password {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.login-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  outline: none !important;
+  box-shadow: none !important;
+  background: transparent;
+  padding: 8px 0;
+  margin: 0;
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--login-ink);
+  -webkit-appearance: none;
+  appearance: none;
+  caret-color: var(--login-teal);
+  border-radius: 0;
+}
+
+.login-input:focus,
+.login-input:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+}
+
+.login-input::placeholder {
+  color: rgba(26, 43, 86, 0.32);
+  font-weight: 400;
+}
+
+.login-eye {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  margin-right: -6px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: rgba(26, 43, 86, 0.4);
+  display: grid;
+  place-items: center;
+}
+
+.login-eye:active {
+  background: rgba(26, 43, 86, 0.06);
+}
+
+.login-btn {
+  width: 100%;
+  border-radius: 999px;
+  padding: 14px 16px;
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
+.login-btn--primary {
+  border: 0;
+  color: #fff;
+  background: linear-gradient(180deg, #36c4b2 0%, var(--login-teal-deep) 100%);
+  box-shadow: 0 8px 20px rgba(46, 184, 166, 0.28);
+}
+
+.login-btn--primary:active {
+  opacity: 0.9;
+}
+
+.login-btn--secondary {
+  border: 0.5px solid var(--login-line);
+  color: var(--login-teal-deep);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 4px 14px rgba(26, 43, 86, 0.06);
+}
+
+.login-btn--secondary:active {
+  background: #fff;
+}
+
+.login-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.login-btn--submit {
+  margin-top: 28px;
+}
+
+.login-error {
+  margin: 0;
+  min-height: 20px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: #c04a3e;
+  text-align: center;
+}
+
+.login-error--placeholder {
+  visibility: hidden;
+}
+
+.login-switch {
+  margin: 22px 0 0;
+  text-align: center;
+  font-size: 14px;
+  color: var(--login-mute);
+}
+
+.login-switch button {
+  border: 0;
+  background: transparent;
+  color: var(--login-teal-deep);
+  font-size: 14px;
+  font-weight: 600;
+  padding: 0 4px;
+}
+
+.login-switch-sep {
+  margin: 0 2px;
+  color: rgba(26, 43, 86, 0.28);
+}
+
+/* Shell: login fills main with no safe-top padding */
+.app-shell.app-shell-login,
+.app-shell.app-shell-login .app-main {
+  background: #faf9f6;
+}
+
+.app-shell.app-shell-login .app-main {
+  padding: 0 !important;
+  margin: 0 !important;
+  overflow: hidden;
+  position: relative;
+}
+
+.app-shell.app-shell-login .app-main > .login-root,
+.app-shell.app-shell-login .app-main > .auth-boot {
+  position: absolute;
+  inset: 0;
+}
+
+body.is-login-route {
+  background: #faf9f6;
+}
+
+html.auth-pending-login,
+html.auth-pending-login body {
+  background: #faf9f6;
+}
+
+.auth-boot {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  background: #070708;
+}
+
+.auth-boot-login {
+  background: #faf9f6 url("/brand/anzai-login-hero.png") center top / cover no-repeat;
+}
+
+html.auth-pending-login .auth-boot:not(.auth-boot-login) {
+  background: #faf9f6 url("/brand/anzai-login-hero.png") center top / cover no-repeat;
+}

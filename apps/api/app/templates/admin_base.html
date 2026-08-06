@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}安崽ETF 管理后台{% endblock %}</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --card: #1a1d24;
+      --border: rgba(255,255,255,.1);
+      --text: #f3f4f6;
+      --mute: #9ca3af;
+      --brand: #3b82f6;
+      --danger: #ef4444;
+      --ok: #22c55e;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: ui-sans-serif, system-ui, "Segoe UI", "PingFang SC", sans-serif;
+      background: radial-gradient(700px 320px at 20% -10%, rgba(59,130,246,.15), transparent), var(--bg);
+      color: var(--text);
+    }
+    .wrap { max-width: 920px; margin: 0 auto; padding: 28px 16px 64px; }
+    h1 { font-size: 22px; margin: 0 0 6px; }
+    .sub { color: var(--mute); font-size: 13px; margin: 0 0 16px; line-height: 1.45; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 14px;
+    }
+    label { display: block; font-size: 12px; color: var(--mute); margin: 14px 0 6px; }
+    label:first-child { margin-top: 0; }
+    input, textarea, select {
+      width: 100%;
+      border: 1px solid var(--border);
+      background: #11141a;
+      color: var(--text);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 14px;
+    }
+    textarea { min-height: 88px; resize: vertical; font-family: ui-monospace, monospace; }
+    .row { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; align-items: center; }
+    button, .btn {
+      appearance: none;
+      border: none;
+      border-radius: 8px;
+      background: var(--brand);
+      color: #fff;
+      font-weight: 600;
+      font-size: 14px;
+      padding: 10px 14px;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-block;
+    }
+    .btn-ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    .btn-danger { background: rgba(239,68,68,.2); color: #fca5a5; }
+    .msg-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      background: rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(2px);
+    }
+    .msg-dialog {
+      width: min(360px, 100%);
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 22px 20px 16px;
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+      text-align: center;
+    }
+    .msg-dialog.msg-ok .msg-icon { color: var(--ok); }
+    .msg-dialog.msg-err .msg-icon { color: #fca5a5; }
+    .msg-icon {
+      font-size: 28px;
+      line-height: 1;
+      margin-bottom: 10px;
+    }
+    .msg-title {
+      font-size: 15px;
+      font-weight: 650;
+      margin: 0 0 8px;
+    }
+    .msg-body {
+      font-size: 14px;
+      color: var(--text);
+      line-height: 1.5;
+      margin: 0 0 18px;
+      word-break: break-word;
+    }
+    .msg-dialog .msg-ok-btn { width: 100%; }
+    .hint { font-size: 12px; color: var(--mute); margin-top: 6px; line-height: 1.45; }
+    .topbar { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 8px; }
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: rgba(59,130,246,.15);
+      color: #93c5fd;
+    }
+    code { font-size: 12px; color: #93c5fd; }
+    .nav {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      padding: 0 0 16px;
+      margin: 0 0 4px;
+      border-bottom: 1px solid var(--border);
+    }
+    .nav a {
+      text-decoration: none;
+      color: var(--mute);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      background: transparent;
+    }
+    .nav a:hover { color: var(--text); }
+    .nav a.is-active {
+      color: #93c5fd;
+      border-color: rgba(59,130,246,.45);
+      background: rgba(59,130,246,.12);
+    }
+    .nav .nav-end { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+    .nav .nav-end a {
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,.03);
+      color: var(--text);
+    }
+    .page-title { font-size: 18px; font-weight: 650; margin: 18px 0 6px; }
+    .page-lead { margin: 0 0 16px; font-size: 13px; color: var(--mute); line-height: 1.45; }
+    .tier-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 12px;
+    }
+    .tier-card h3 { margin: 0 0 4px; font-size: 14px; }
+    .agent-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px 12px;
+      margin-top: 8px;
+    }
+    @media (max-width: 640px) {
+      .agent-grid { grid-template-columns: 1fr; }
+    }
+    .agent-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+    }
+    .agent-row input[type="checkbox"] { width: auto; }
+    .agent-row input[type="number"] {
+      width: 72px;
+      padding: 6px 8px;
+      font-size: 13px;
+    }
+    table.users {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      margin-top: 8px;
+    }
+    table.users th, table.users td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    table.users th { color: var(--mute); font-weight: 500; font-size: 12px; }
+    .inline-form { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+    .inline-form input, .inline-form select { width: auto; min-width: 100px; padding: 6px 8px; font-size: 12px; }
+    .inline-form button { padding: 6px 10px; font-size: 12px; }
+    .pill {
+      display: inline-block;
+      font-size: 11px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.08);
+    }
+    .pill-admin { background: rgba(59,130,246,.2); color: #93c5fd; }
+    .pill-off { background: rgba(239,68,68,.15); color: #fca5a5; }
+    .presets { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    .preset {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: rgba(255,255,255,.04);
+      color: #93c5fd;
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    details.advanced {
+      margin-top: 16px;
+      border-top: 1px solid var(--border);
+      padding-top: 12px;
+    }
+    details.advanced > summary {
+      cursor: pointer;
+      color: var(--mute);
+      font-size: 13px;
+      font-weight: 600;
+      list-style: none;
+    }
+    details.advanced > summary::-webkit-details-marker { display: none; }
+    .check-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 12px;
+      font-size: 13px;
+    }
+    .check-row input { width: auto; }
+    .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; align-items: center; }
+    .subhead { font-size: 14px; font-weight: 650; margin: 20px 0 10px; }
+    .mute { color: var(--mute); font-size: 12px; }
+    .profile-bar {
+      display: flex; flex-direction: column; gap: 12px;
+    }
+    .profile-bar-main { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+    .field-head {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 8px; margin: 14px 0 6px;
+    }
+    .key-badge {
+      font-size: 11px; padding: 2px 8px; border-radius: 999px;
+      background: rgba(255,255,255,.08); color: var(--mute);
+    }
+    .key-badge--ok { background: rgba(34,197,94,.15); color: var(--ok); }
+    a.btn { line-height: 1.2; }
+    .list-section-label {
+      margin: 18px 0 4px;
+      font-size: 12px;
+      font-weight: 650;
+      color: #93c5fd;
+      letter-spacing: 0.02em;
+    }
+    .field-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px 12px;
+    }
+    @media (max-width: 640px) {
+      .field-row { grid-template-columns: 1fr; }
+    }
+  </style>
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div>
+        <h1>安崽ETF 管理后台</h1>
+        <p class="sub">仅 API 端口 · 不进 PWA · 一主题一页</p>
+      </div>
+      <span class="badge">{% block badge %}/admin{% endblock %}</span>
+    </div>
+
+    {% if nav %}
+    <nav class="nav" aria-label="管理分区">
+      <a href="/admin/accounts" class="{% if page == 'accounts' %}is-active{% endif %}">账号管理</a>
+      <a href="/admin/llm" class="{% if page == 'llm' %}is-active{% endif %}">模型连接</a>
+      <a href="/admin/presets" class="{% if page == 'presets' %}is-active{% endif %}">对话预设</a>
+      <a href="/admin/agent" class="{% if page == 'agent' %}is-active{% endif %}">Agent 配置</a>
+      <div class="nav-end">
+        <a href="/admin/logout">退出</a>
+        <a href="/docs" target="_blank" rel="noreferrer">OpenAPI</a>
+      </div>
+    </nav>
+    {% endif %}
+
+    {% block content %}{% endblock %}
+  </div>
+
+  {% if flash %}
+  <div class="msg-overlay" id="msg-overlay" role="dialog" aria-modal="true" aria-labelledby="msg-title">
+    <div class="msg-dialog msg-{{ flash.kind }}">
+      <div class="msg-icon" aria-hidden>{% if flash.kind == 'ok' %}✓{% else %}!{% endif %}</div>
+      <p class="msg-title" id="msg-title">{% if flash.kind == 'ok' %}操作成功{% else %}操作失败{% endif %}</p>
+      <p class="msg-body">{{ flash.message }}</p>
+      <button type="button" class="msg-ok-btn" id="msg-close" autofocus>知道了</button>
+    </div>
+  </div>
+  <script>
+    (function () {
+      var overlay = document.getElementById("msg-overlay");
+      var closeBtn = document.getElementById("msg-close");
+      if (!overlay) return;
+      function dismiss() {
+        overlay.remove();
+      }
+      if (closeBtn) {
+        closeBtn.addEventListener("click", dismiss);
+        closeBtn.focus();
+      }
+      overlay.addEventListener("click", function (e) {
+        if (e.target === overlay) dismiss();
+      });
+      document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") dismiss();
+      });
+    })();
+  </script>
+  {% endif %}
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>
