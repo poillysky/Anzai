@@ -2,8 +2,8 @@
 
 Single image: poillysky/anzai:1.0.2 (API + Web)
 
-Path: /vol1/1000/Docker/anzai  
-Restart: lways
+Path: /vol1/1000/Docker/anzai
+Restart policy: always
 
 ## Export local data (folder, no zip)
 
@@ -25,4 +25,4 @@ curl -s http://127.0.0.1:8515/health
 
 Ports: 3515 PWA, 8515 API/admin. Frontend /backend proxies to in-container 8515.
 
-Do not use compose env_file for .env — mount the file only so admin knowledge DB saves stick.
+Do not use compose env_file for .env - mount the file only so admin knowledge DB saves stick.
