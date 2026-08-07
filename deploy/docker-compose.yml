@@ -1,12 +1,13 @@
-# ?? NAS ? ????API + Web?poillysky/anzai:1.0.2
-# ???/vol1/1000/Docker/anzai
+# Anzai NAS deploy - single image poillysky/anzai:1.0.2
+# Host path: /vol1/1000/Docker/anzai
 #
 #   docker compose pull && docker compose up -d
-# ???http://<nas>:3515  ?/backend ? ??? 8515?
-# ???http://<nas>:8515/admin
+# App:   http://<nas>:3515  (/backend -> in-container 8515)
+# Admin: http://<nas>:8515/admin
 #
-# ??????? .env?admin ??????? compose env_file ???
-# ??????? KNOWLEDGE_DATABASE_URL ??????????
+# Config is the mounted .env only (admin can write it).
+# Do NOT use compose env_file: a stale empty KNOWLEDGE_DATABASE_URL
+# injected at start would override page saves.
 
 services:
   anzai:
