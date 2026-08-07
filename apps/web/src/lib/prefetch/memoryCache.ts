@@ -84,7 +84,9 @@ function sharedFetch<T>(key: string, fetcher: () => Promise<T>): Promise<T> {
   if (pending) return pending;
 
   const epoch = writeEpoch.get(key) ?? 0;
-  const run = (async () => {
+  // let + definite assignment: finally must compare the same Promise instance
+  let run!: Promise<T>;
+  run = (async () => {
     try {
       const value = await fetcher();
       if ((writeEpoch.get(key) ?? 0) === epoch) {
