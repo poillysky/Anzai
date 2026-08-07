@@ -1,21 +1,18 @@
 # Combined Anzai image: FastAPI (8515) + Next.js PWA (3515)
 # Build from repo root: docker build -t poillysky/anzai:1.0.1 .
 
-FROM node:20-bookworm-slim AS web-deps
+FROM node:22-bookworm-slim AS web-build
 WORKDIR /web
 COPY apps/web/package.json apps/web/package-lock.json ./
-RUN npm ci
-
-FROM node:20-bookworm-slim AS web-build
-WORKDIR /web
-COPY --from=web-deps /web/node_modules ./node_modules
+# npm ci is brittle across host/CI npm majors; install is enough for image builds
+RUN npm install --no-audit --no-fund
 COPY apps/web/ ./
-ENV NEXT_TELEMETRY_DISABLED=1
-ENV API_PROXY_TARGET=http://127.0.0.1:8515
-ENV NEXT_PUBLIC_API_BASE=/backend
+ENV NEXT_TELEMETRY_DISABLED=1 \
+    API_PROXY_TARGET=http://127.0.0.1:8515 \
+    NEXT_PUBLIC_API_BASE=/backend
 RUN npm run build
 
-FROM node:20-bookworm-slim AS runtime
+FROM node:22-bookworm-slim AS runtime
 RUN apt-get update \
   && apt-get install -y --no-install-recommends python3 python3-pip python3-venv \
   && rm -rf /var/lib/apt/lists/* \
@@ -28,7 +25,6 @@ RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
   && rm /tmp/requirements.txt
 
 COPY apps/api/ /app/api/
-# Drop local junk if copied
 RUN rm -rf /app/api/.venv /app/api/__pycache__ /app/api/*.db /app/api/data || true
 
 COPY --from=web-build /web/public /app/web/public
