@@ -2,7 +2,7 @@ export type Holding = {
   id: number;
   symbol: string;
   name: string;
-  market: "SH" | "SZ";
+  market: "SH" | "SZ" | "JD";
   shares: number;
   cost: number;
   tags: string;
@@ -15,6 +15,7 @@ export type Holding = {
   pnl?: number | null;
   pnl_pct?: number | null;
   day_pnl?: number | null;
+  day_pnl_pct?: number | null;
   weight?: number | null;
 };
 
@@ -73,6 +74,70 @@ export type IndexQuote = {
   prev_close?: number | null;
 };
 
+export type MacroQuote = {
+  key: string;
+  name: string;
+  price: number;
+  unit?: string;
+  change_pct?: number | null;
+  prev?: number | null;
+  as_of?: string | null;
+  live?: boolean;
+  venue?: string;
+  freshness?: string;
+};
+
+export type MacroTopic = {
+  topic: string;
+  calendar?: string;
+  quotes: MacroQuote[];
+  hint?: string;
+  note?: string;
+};
+
+export type GoldEtf = {
+  symbol: string;
+  market: string;
+  name: string;
+  price: number;
+  change_pct?: number | null;
+  prev_close?: number | null;
+};
+
+export type GoldBoardItem = {
+  id: string;
+  name: string;
+  section: string;
+  price?: number | null;
+  change_pct?: number | null;
+  prev?: number | null;
+  unit?: string;
+  freshness?: string;
+  note?: string;
+  holdable?: boolean;
+  symbol?: string;
+  market?: string;
+  chart?: number[];
+  /** HH:mm for each chart point (AU9999); omit → synthesize by session */
+  chart_times?: string[];
+  /** Full-session slot count (JD pointCount); partial chart maps into this span. */
+  chart_slots?: number;
+  /** cn | us | day24 | comex */
+  chart_session?: string;
+};
+
+export type GoldBoardSection = {
+  id: string;
+  title: string;
+  subtitle?: string;
+  items: GoldBoardItem[];
+};
+
+export type GoldBoard = {
+  sections: GoldBoardSection[];
+  note?: string;
+};
+
 export type IntradayPoint = {
   time: string;
   price: number;
@@ -85,8 +150,67 @@ export type IntradaySeries = {
   name: string;
   market: string;
   prev_close?: number | null;
-  session?: "cn" | "us" | string;
+  /** 今开 — stock yellow reference line */
+  open_price?: number | null;
+  session?: "cn" | "us" | "hk" | "day24" | string;
   points: IntradayPoint[];
+};
+
+/** ~5min micro-momentum from 1m bars — tendency, not a forecast */
+export type ShortBias = {
+  symbol: string;
+  market: string;
+  bias: "up" | "down" | "flat" | "na" | "closed" | string;
+  label: string;
+  score?: number | null;
+  lookback_min?: number;
+  sample_n?: number;
+  roc_pct?: number | null;
+  as_of?: string | null;
+};
+
+export type ShortBiasBatch = {
+  items: ShortBias[];
+  note?: string;
+};
+
+export type BookLevel = {
+  price: number;
+  volume: number;
+};
+
+export type OrderBook = {
+  symbol: string;
+  market: string;
+  name: string;
+  bids: BookLevel[];
+  asks: BookLevel[];
+  as_of?: string | null;
+  source?: string;
+  live?: boolean;
+};
+
+export type MoneyFlowDay = {
+  date: string;
+  main_net: number;
+  super_net: number;
+  large_net: number;
+  mid_net: number;
+  small_net: number;
+  main_pct?: number | null;
+};
+
+export type DepthFlow = {
+  symbol: string;
+  market: string;
+  name: string;
+  book?: OrderBook | null;
+  flow_days: MoneyFlowDay[];
+  flow_bias: "in" | "out" | "flat" | "na" | string;
+  flow_label: string;
+  session_state?: string;
+  book_live?: boolean;
+  note?: string;
 };
 
 export type LeaderStock = {
@@ -171,6 +295,36 @@ export type AnzaiIdentity = {
   roles: AnzaiIdentityRole[];
 };
 
+export type NotifyChannelId = "serverchan" | "pushplus" | "wxpusher" | string;
+
+export type NotifySettings = {
+  enabled: boolean;
+  channel: NotifyChannelId;
+  token_set: boolean;
+  token_preview: string;
+  wxpusher_uid: string;
+  hour: number;
+  minute: number;
+  weekdays: string;
+  degree: string;
+  configured: boolean;
+  channels: { id: string; label: string }[];
+  degrees: { id: string; label: string }[];
+};
+
+export type NotifyRunResult = {
+  ok: boolean;
+  skipped?: boolean;
+  reason?: string;
+  channel?: string;
+  detail?: string;
+  job_id?: number | null;
+  title?: string;
+  content?: string;
+  content_preview?: string;
+  dry_run?: boolean;
+};
+
 export type NewsArticle = {
   id: string;
   title: string;
@@ -184,7 +338,7 @@ export type NewsArticle = {
 export type HoldingCreate = {
   symbol: string;
   name?: string;
-  market?: "SH" | "SZ";
+  market?: "SH" | "SZ" | "JD";
   shares: number;
   cost: number;
   tags?: string;
@@ -194,11 +348,15 @@ export type HoldingCreate = {
 export type HoldingUpdate = {
   symbol?: string;
   name?: string;
-  market?: "SH" | "SZ";
+  market?: "SH" | "SZ" | "JD";
   shares?: number;
   cost?: number;
   tags?: string;
   bought_at?: string;
+  /** Fill price for shares delta — 今日盈亏今买/今卖成交额 */
+  trade_price?: number;
+  /** YYYY-MM-DD of this fill; omit → today. Past date → 昨仓进日初仓 */
+  trade_date?: string;
 };
 
 export type AnalysisDegree = {
@@ -262,16 +420,35 @@ export type AnalysisSymbolSummary = {
   summary: string;
 };
 
+export type AnalysisDebateRound = {
+  round: number;
+  summary?: string;
+  stance?: string;
+  bull_points?: string[];
+  bear_points?: string[];
+  open_questions?: string[];
+  bullets?: string[];
+};
+
 export type AnalysisReport = {
   verdict: string;
   stance: string;
   confidence: number;
   highlights?: string[];
+  /** Plain sentences: which stocks need attention after overall verdict */
+  watch?: string[];
+  /** Evidence citations aligned with watch[] */
+  watch_refs?: string[];
+  open_resolutions?: string[];
+  unresolved?: string[];
+  /** Evidence-backed one-liners for current holdings */
+  holding_lines?: string[];
   items?: AnalysisSymbolSummary[];
   bullets?: string[];
   structure?: AnalysisStructureRow[];
   actions?: string[];
   agents?: AnalysisAgentStep[];
+  debate?: AnalysisDebateRound[];
   template?: boolean;
 };
 

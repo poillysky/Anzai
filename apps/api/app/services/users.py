@@ -35,6 +35,8 @@ def create_user(
     password: str,
     role: str = "user",
     claim_orphans: bool = False,
+    identity_role: str = "",
+    identity_label: str = "",
 ) -> User:
     name = username.strip()
     if len(name) < 2:
@@ -63,6 +65,13 @@ def create_user(
     if db.query(AnalysisProfile).filter(AnalysisProfile.user_id == row.id).first() is None:
         db.add(AnalysisProfile(user_id=row.id, degree="standard"))
         db.commit()
+
+    # 注册/引导传入时写入；Admin 建号可后填
+    rid = (identity_role or "").strip()
+    if rid:
+        from app.services import preferences as prefs_svc
+
+        prefs_svc.set_identity(db, row.id, rid, identity_label or "")
 
     return row
 

@@ -3,6 +3,7 @@
 import { useEffect, useLayoutEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useAppViewport } from "@/hooks/useAppViewport";
+import { useAppNativeFeel } from "@/hooks/useAppNativeFeel";
 import { OverlayProvider } from "@/components/overlay/OverlayContext";
 import { getAccessToken } from "@/lib/auth";
 import { scheduleTabWarm } from "@/lib/prefetch";
@@ -24,6 +25,7 @@ const PIN_MAIN_PATHS = new Set(["/", "/market", "/news"]);
  */
 export function AppShell({ children }: { children: React.ReactNode }) {
   const { nativeShell } = useAppViewport();
+  useAppNativeFeel();
   const pathname = usePathname();
   const router = useRouter();
   const isLogin = pathname === "/login";
@@ -73,7 +75,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       <div className={`device-stage ${nativeShell ? "device-stage-native" : ""}`}>
         <div
           className={`device-frame ${nativeShell ? "device-frame-native" : ""}`}
-          aria-label={nativeShell ? "安崽ETF" : "iOS 预览"}
+          aria-label={nativeShell ? "安崽" : "iOS 预览"}
         >
           <div className="device-bezel">
             <div
@@ -96,7 +98,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     <div className={`device-stage ${nativeShell ? "device-stage-native" : ""}`}>
       <div
         className={`device-frame ${nativeShell ? "device-frame-native" : ""}`}
-        aria-label={nativeShell ? "安崽ETF" : "iOS 预览"}
+        aria-label={nativeShell ? "安崽" : "iOS 预览"}
       >
         <div className="device-bezel">
           <OverlayProvider>

@@ -8,17 +8,24 @@ import type {
   HoldingUpdate,
   IndexQuote,
   IntradaySeries,
+  GoldBoard,
+  GoldEtf,
   LeadersBoard,
+  MacroTopic,
   MarketSession,
   NewsFeed,
   NewsBoard,
   NewsInterest,
   NewsArticle,
   AnzaiIdentity,
+  NotifySettings,
+  NotifyRunResult,
   PortfolioReturnsDim,
   PortfolioReturnsSummary,
   PortfolioSummary,
   SearchResult,
+  ShortBiasBatch,
+  DepthFlow,
   WatchlistItem,
 } from "@/lib/types";
 import {
@@ -82,16 +89,26 @@ export const api = {
       auth: false,
       signal: init?.signal,
     }),
-  bootstrap: (username: string, password: string) =>
+  bootstrap: (username: string, password: string, identityRole: string, identityLabel = "") =>
     request<AuthTokenResponse>("/api/auth/bootstrap", {
       method: "POST",
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({
+        username,
+        password,
+        identity_role: identityRole,
+        identity_label: identityLabel,
+      }),
       auth: false,
     }),
-  register: (username: string, password: string) =>
+  register: (username: string, password: string, identityRole: string, identityLabel = "") =>
     request<AuthTokenResponse>("/api/auth/register", {
       method: "POST",
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({
+        username,
+        password,
+        identity_role: identityRole,
+        identity_label: identityLabel,
+      }),
       auth: false,
     }),
   login: (username: string, password: string) =>
@@ -124,6 +141,10 @@ export const api = {
   deleteHolding: (id: number) =>
     request<void>(`/api/holdings/${id}`, { method: "DELETE" }),
   getIndices: () => request<IndexQuote[]>("/api/market/indices"),
+  getMacro: (topic = "gold") =>
+    request<MacroTopic>(`/api/market/macro?topic=${encodeURIComponent(topic)}`),
+  getGoldEtfs: () => request<GoldEtf[]>("/api/market/gold-etfs"),
+  getGoldBoard: () => request<GoldBoard>("/api/market/gold-board"),
   getSession: (key = "sh-composite") =>
     request<MarketSession>(`/api/market/session?key=${encodeURIComponent(key)}`),
   getIntraday: (key = "sh-composite") =>
@@ -131,6 +152,14 @@ export const api = {
   getSymbolIntraday: (symbol: string, market: string) =>
     request<IntradaySeries>(
       `/api/market/intraday?symbol=${encodeURIComponent(symbol)}&market=${encodeURIComponent(market)}`,
+    ),
+  getShortBias: (keys: string[]) =>
+    request<ShortBiasBatch>(
+      `/api/market/short-bias?keys=${encodeURIComponent(keys.join(","))}`,
+    ),
+  getDepthFlow: (symbol: string, market: string, days = 5) =>
+    request<DepthFlow>(
+      `/api/market/depth-flow?symbol=${encodeURIComponent(symbol)}&market=${encodeURIComponent(market)}&days=${days}`,
     ),
   getLeaders: (
     key = "sh-composite",
@@ -191,12 +220,95 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  /** SSE multi-agent committee: meta / stage / agent_* / report / error / done */
+  streamAnalysisJob: async (
+    body: AnalysisJobCreate,
+    onEvent: (ev: {
+      type: string;
+      label?: string;
+      pct?: number;
+      stage?: string;
+      message?: string;
+      job?: AnalysisJob;
+      report?: AnalysisJob["report"];
+      agent?: import("@/lib/types").AnalysisAgentStep;
+      [k: string]: unknown;
+    }) => void,
+    signal?: AbortSignal,
+  ) => {
+    const token = getAccessToken();
+    const res = await fetch(`${API_BASE}/api/analysis/jobs/stream`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(body),
+      signal,
+      cache: "no-store",
+    });
+    if (res.status === 401 && typeof window !== "undefined") {
+      clearSession();
+      if (!window.location.pathname.startsWith("/login")) {
+        window.location.assign("/login");
+      }
+      throw new Error("未登录");
+    }
+    if (!res.ok || !res.body) {
+      const text = await res.text();
+      let message = text || `Request failed: ${res.status}`;
+      try {
+        const j = JSON.parse(text) as { detail?: string; message?: string };
+        message = j.message || j.detail || message;
+      } catch {
+        /* plain */
+      }
+      onEvent({ type: "error", message });
+      onEvent({ type: "done", status: "failed" });
+      return;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    const flushLine = (line: string) => {
+      const trimmed = line.trimEnd();
+      if (!trimmed || trimmed.startsWith(":")) return; // SSE comment / keepalive
+      if (!trimmed.startsWith("data:")) return;
+      const raw = trimmed.slice(5).trim();
+      if (!raw || raw === "[DONE]") {
+        if (raw === "[DONE]") onEvent({ type: "done" });
+        return;
+      }
+      try {
+        onEvent(JSON.parse(raw) as { type: string });
+      } catch {
+        /* ignore partial / malformed */
+      }
+    };
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // SSE events are separated by blank lines; also flush complete lines early
+      const parts = buf.split(/\r?\n/);
+      buf = parts.pop() || "";
+      for (const line of parts) flushLine(line);
+    }
+    if (buf.trim()) flushLine(buf);
+  },
   getAnalysisJob: (id: number) => request<AnalysisJob>(`/api/analysis/jobs/${id}`),
   getLatestAnalysis: (scope?: "portfolio" | "symbol") =>
     request<AnalysisJob | null>(
       scope
         ? `/api/analysis/latest?scope=${encodeURIComponent(scope)}`
         : "/api/analysis/latest",
+    ),
+  getRunningAnalysis: (scope?: "portfolio" | "symbol") =>
+    request<AnalysisJob | null>(
+      scope
+        ? `/api/analysis/running?scope=${encodeURIComponent(scope)}`
+        : "/api/analysis/running",
     ),
 
   getIdentity: () => request<AnzaiIdentity>("/api/me/identity"),
@@ -205,6 +317,34 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ role, label }),
     }),
+
+  getNotifySettings: () => request<NotifySettings>("/api/notify/settings"),
+  putNotifySettings: (body: {
+    enabled?: boolean;
+    channel?: string;
+    token?: string;
+    wxpusher_uid?: string;
+    hour?: number;
+    minute?: number;
+    weekdays?: string;
+    degree?: string;
+  }) =>
+    request<NotifySettings>("/api/notify/settings", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  testNotify: () =>
+    request<NotifyRunResult>("/api/notify/test", { method: "POST" }),
+  runNotifyDigest: (opts?: { force?: boolean; dry_run?: boolean }) => {
+    const q = new URLSearchParams();
+    if (opts?.force) q.set("force", "1");
+    if (opts?.dry_run) q.set("dry_run", "1");
+    const qs = q.toString();
+    return request<NotifyRunResult>(
+      `/api/notify/run-digest${qs ? `?${qs}` : ""}`,
+      { method: "POST" },
+    );
+  },
 
   getAgentSession: (conversationId?: number | null) => {
     const q =
@@ -280,7 +420,7 @@ export const api = {
   },
 
   /**
-   * Stream 安崽 chat (SSE). Events: meta / tool_start / tool_result / tool_status / token / error / done.
+   * Stream 安崽 chat (SSE). Events: meta / tool_start / tool_result / tool_status / card / token / error / done.
    * Uses same-origin Route Handler (not rewrite) so bytes are not buffered.
    */
   streamAgentChat: async (

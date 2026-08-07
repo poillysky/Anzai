@@ -1,4 +1,4 @@
-# Start Anzai ETF API + Web (ports 8515 / 3515)
+# Start Anzai (安崽) API + Web (ports 8515 / 3515)
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 if (-not $root) { $root = (Resolve-Path "$PSScriptRoot\..").Path }

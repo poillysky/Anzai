@@ -4,13 +4,13 @@ import { AppProviders } from "@/providers/AppProviders";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "安崽ETF",
+  title: "安崽",
   description: "个人 A 股 / ETF 分析助手",
-  applicationName: "安崽ETF",
+  applicationName: "安崽",
   appleWebApp: {
     capable: true,
     statusBarStyle: "black-translucent",
-    title: "安崽ETF",
+    title: "安崽",
   },
   formatDetection: {
     telephone: false,
@@ -49,7 +49,7 @@ export default function RootLayout({
         <meta name="mobile-web-app-capable" content="yes" />
         <meta name="apple-touch-fullscreen" content="yes" />
         <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-        <meta name="apple-mobile-web-app-title" content="安崽ETF" />
+        <meta name="apple-mobile-web-app-title" content="安崽" />
         <AppleSplashLinks />
         {/* Runs before paint; html class differs from SSR — suppressHydrationWarning above */}
         <script

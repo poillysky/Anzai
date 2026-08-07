@@ -40,6 +40,8 @@ def bootstrap(payload: AuthBootstrapIn, db: Session = Depends(get_db)) -> AuthTo
             password=payload.password,
             role="admin",
             claim_orphans=True,
+            identity_role=payload.identity_role,
+            identity_label=payload.identity_label,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -57,6 +59,8 @@ def register(payload: AuthRegisterIn, db: Session = Depends(get_db)) -> AuthToke
             username=payload.username,
             password=payload.password,
             role="user",
+            identity_role=payload.identity_role,
+            identity_label=payload.identity_label,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

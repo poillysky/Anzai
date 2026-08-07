@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{% block title %}安崽ETF 管理后台{% endblock %}</title>
+  <title>{% block title %}安崽 管理后台{% endblock %}</title>
   <style>
     :root {
       --bg: #0f1115;
@@ -151,7 +151,50 @@
       padding: 16px;
       margin-bottom: 12px;
     }
-    .tier-card h3 { margin: 0 0 4px; font-size: 14px; }
+    .tier-card h3 { margin: 0; font-size: 14px; }
+    .tier-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 6px;
+    }
+    .tier-pill {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: rgba(10, 132, 255, 0.16);
+      color: #8ec8ff;
+      letter-spacing: 0.01em;
+    }
+    .tier-note {
+      margin: 0 0 12px;
+      font-size: 12px;
+      color: var(--mute);
+      line-height: 1.45;
+    }
+    .callout {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+      margin-bottom: 16px;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    .callout-soft {
+      background: rgba(255, 255, 255, 0.03);
+      margin-top: 10px;
+    }
+    .pipeline-list {
+      margin: 8px 0 0;
+      padding-left: 1.2em;
+      color: var(--mute);
+      font-size: 12px;
+    }
+    .pipeline-list li { margin: 3px 0; }
     .agent-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -167,12 +210,34 @@
       gap: 8px;
       font-size: 13px;
     }
+    .agent-row.is-deferred {
+      opacity: 0.45;
+    }
+    .agent-name {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      line-height: 1.25;
+    }
+    .agent-name small {
+      font-size: 10px;
+      color: var(--mute);
+      font-weight: 500;
+    }
     .agent-row input[type="checkbox"] { width: auto; }
     .agent-row input[type="number"] {
       width: 72px;
       padding: 6px 8px;
       font-size: 13px;
     }
+    .btn-ghost-admin {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--mute);
+    }
+    .btn-ghost-admin:hover { color: var(--text); }
     table.users {
       width: 100%;
       border-collapse: collapse;
@@ -269,7 +334,7 @@
   <div class="wrap">
     <div class="topbar">
       <div>
-        <h1>安崽ETF 管理后台</h1>
+        <h1>安崽 管理后台</h1>
         <p class="sub">仅 API 端口 · 不进 PWA · 一主题一页</p>
       </div>
       <span class="badge">{% block badge %}/admin{% endblock %}</span>
@@ -278,7 +343,10 @@
     {% if nav %}
     <nav class="nav" aria-label="管理分区">
       <a href="/admin/accounts" class="{% if page == 'accounts' %}is-active{% endif %}">账号管理</a>
-      <a href="/admin/llm" class="{% if page == 'llm' %}is-active{% endif %}">模型连接</a>
+      <a href="/admin/llm" class="{% if page == 'llm' %}is-active{% endif %}">安崽对话</a>
+      <a href="/admin/analysis-llm" class="{% if page == 'analysis-llm' %}is-active{% endif %}">分析模型</a>
+      <a href="/admin/embedding" class="{% if page == 'embedding' %}is-active{% endif %}">向量模型</a>
+      <a href="/admin/knowledge" class="{% if page == 'knowledge' %}is-active{% endif %}">知识库</a>
       <a href="/admin/presets" class="{% if page == 'presets' %}is-active{% endif %}">对话预设</a>
       <a href="/admin/agent" class="{% if page == 'agent' %}is-active{% endif %}">Agent 配置</a>
       <div class="nav-end">

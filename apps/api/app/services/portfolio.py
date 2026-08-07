@@ -4,6 +4,12 @@ from app.models import Holding
 from app.providers.cn_calendar import quote_is_for_shanghai_today
 from app.schemas import HoldingOut, PortfolioSummary
 from app.services.holding_dates import earlier_bought_at, normalize_bought_at
+from app.services.holding_day_lots import (
+    day_pnl_parts,
+    ensure_day_session,
+    merge_day_buy_lots,
+    refresh_day_buy_lot,
+)
 from app.services.quote import get_quotes
 
 
@@ -29,8 +35,10 @@ def consolidate_same_symbol(db: Session, user_id: int) -> bool:
         primary.shares = total_shares
         primary.cost = (total_basis / total_shares) if total_shares > 0 else float(primary.cost)
         bought = normalize_bought_at(getattr(primary, "bought_at", None) or "")
+        refresh_day_buy_lot(primary)
         for h in lots[1:]:
             bought = earlier_bought_at(bought, getattr(h, "bought_at", None))
+            merge_day_buy_lots(primary, h)
             db.delete(h)
         if (getattr(primary, "bought_at", "") or "") != bought:
             primary.bought_at = bought
@@ -68,22 +76,51 @@ def build_portfolio(db: Session, user_id: int) -> PortfolioSummary:
         pnl = market_value - cost_value
         pnl_pct = (pnl / cost_value * 100) if cost_value > 0 else 0.0
 
+        bought_at = normalize_bought_at(
+            getattr(h, "bought_at", None) or "",
+            fallback=(h.created_at.date() if h.created_at else None),
+        )
+        ensure_day_session(h)
+        day_s, day_c = refresh_day_buy_lot(h)
+
         # 上海日历已跨日，但行情仍是昨收盘 → 「今日盈亏」归零，勿沿用昨天涨跌
         fresh_today = quote_is_for_shanghai_today(as_of)
 
         day_pnl: float | None = None
-        if fresh_today and prev_close is not None and prev_close > 0:
-            day_pnl = round(h.shares * (price - prev_close), 2)
-            total_prev_mv += h.shares * prev_close
-            total_day_pnl += day_pnl
-        elif fresh_today and change_pct is not None and price > 0:
-            # Fallback when only % is known
-            prev = price / (1 + change_pct / 100)
-            day_pnl = round(h.shares * (price - prev), 2)
-            total_prev_mv += h.shares * prev
-            total_day_pnl += day_pnl
-        elif not fresh_today:
+        day_pnl_pct: float | None = None
+        if fresh_today:
+            day_pnl, baseline = day_pnl_parts(
+                shares=float(h.shares),
+                cost=float(h.cost),
+                price=float(price),
+                prev_close=prev_close,
+                bought_at=bought_at,
+                day_buy_shares=day_s,
+                day_buy_cost=day_c,
+                sod_shares=float(getattr(h, "sod_shares", 0) or 0),
+                day_buy_amount=float(getattr(h, "day_buy_amount", 0) or 0),
+                day_sell_amount=float(getattr(h, "day_sell_amount", 0) or 0),
+            )
+            # Only invent prev from change_pct when cashflow baseline is empty
+            # (no SOD / no buys) — never overwrite a real cash-flow day_pnl.
+            if (
+                baseline <= 1e-9
+                and float(getattr(h, "day_buy_amount", 0) or 0) <= 0
+                and float(getattr(h, "day_sell_amount", 0) or 0) <= 0
+                and change_pct is not None
+                and price > 0
+            ):
+                prev = price / (1 + change_pct / 100)
+                day_pnl = round(h.shares * (price - prev), 2)
+                baseline = h.shares * prev
+            day_pnl_pct = (
+                round(float(day_pnl or 0) / baseline * 100, 2) if baseline > 1e-9 else 0.0
+            )
+            total_prev_mv += baseline
+            total_day_pnl += float(day_pnl or 0)
+        else:
             day_pnl = 0.0
+            day_pnl_pct = 0.0
             change_pct = 0.0
             # 昨收对齐现价，跨日未开盘时今日涨跌视为 0
             if price > 0:
@@ -100,10 +137,7 @@ def build_portfolio(db: Session, user_id: int) -> PortfolioSummary:
                 shares=h.shares,
                 cost=h.cost,
                 tags=h.tags,
-                bought_at=normalize_bought_at(
-                    getattr(h, "bought_at", None) or "",
-                    fallback=(h.created_at.date() if h.created_at else None),
-                ),
+                bought_at=bought_at,
                 created_at=h.created_at,
                 updated_at=h.updated_at,
                 last_price=price,
@@ -113,6 +147,7 @@ def build_portfolio(db: Session, user_id: int) -> PortfolioSummary:
                 pnl=round(pnl, 2),
                 pnl_pct=round(pnl_pct, 2),
                 day_pnl=day_pnl,
+                day_pnl_pct=day_pnl_pct,
             )
         )
 

@@ -1,4 +1,4 @@
-"""Stock sector / concept boards via East Money."""
+"""Stock sector / concept boards via East Money — open + close resilient."""
 
 from __future__ import annotations
 
@@ -8,23 +8,12 @@ from dataclasses import dataclass
 
 import httpx
 
+from app.providers.eastmoney import EM_HEADERS, em_float, host_label, stock_get_urls
+
 logger = logging.getLogger(__name__)
 
 _CACHE: dict[str, tuple[float, list["SectorBoard"]]] = {}
 _CACHE_TTL = 120.0
-
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://quote.eastmoney.com/",
-}
-
-_QUOTE_HOSTS = (
-    "https://push2delay.eastmoney.com/api/qt/stock/get",
-    "https://push2.eastmoney.com/api/qt/stock/get",
-)
 
 
 @dataclass
@@ -46,7 +35,7 @@ def _fetch_boards(symbol: str, market: str) -> list[SectorBoard]:
     code = _em_code(symbol, market)
     url = "https://emweb.securities.eastmoney.com/PC_HSF10/CoreConception/PageAjax"
     try:
-        with httpx.Client(timeout=10.0, headers=_HEADERS, follow_redirects=True) as client:
+        with httpx.Client(timeout=10.0, headers=EM_HEADERS, follow_redirects=True) as client:
             resp = client.get(url, params={"code": code})
             resp.raise_for_status()
             data = resp.json() or {}
@@ -83,21 +72,35 @@ def _quote_board(bk: str) -> tuple[float | None, float | None]:
         "secid": secid,
         "invt": "2",
         "fltt": "2",
+        # f43 最新 / f60 昨收 / f170 涨跌幅
         "fields": "f57,f58,f43,f60,f170",
     }
-    with httpx.Client(timeout=8.0, headers=_HEADERS, follow_redirects=True) as client:
-        for url in _QUOTE_HOSTS:
+    with httpx.Client(timeout=8.0, headers=EM_HEADERS, follow_redirects=True) as client:
+        for url in stock_get_urls():
             try:
                 resp = client.get(url, params=params)
                 resp.raise_for_status()
                 data = (resp.json() or {}).get("data") or {}
                 if not data:
                     continue
-                price = float(data["f43"]) if data.get("f43") is not None else None
-                chg = float(data["f170"]) if data.get("f170") is not None else None
+                price = em_float(data.get("f43"))
+                prev = em_float(data.get("f60"))
+                chg = em_float(data.get("f170"))
+                if price is None or price <= 0:
+                    if prev is not None and prev > 0:
+                        price = prev
+                        if chg is None:
+                            chg = 0.0
+                    else:
+                        continue
                 return price, chg
-            except Exception:
-                logger.warning("board quote miss %s %s", url.split("/")[2], bk)
+            except Exception as exc:
+                logger.warning(
+                    "board quote miss %s %s: %s",
+                    host_label(url),
+                    bk,
+                    type(exc).__name__,
+                )
     return None, None
 
 
@@ -111,7 +114,6 @@ def get_stock_sectors(symbol: str, market: str = "SH") -> list[SectorBoard]:
         return cached[1]
 
     boards = _fetch_boards(sym, mkt)
-    # Enrich top boards with live change
     for b in boards[:6]:
         price, chg = _quote_board(b.code)
         b.price = price

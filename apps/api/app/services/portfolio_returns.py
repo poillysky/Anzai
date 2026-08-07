@@ -86,7 +86,7 @@ def ensure_bought_history(db: Session, user_id: int) -> None:
         return
 
     live_dates = {
-        r.trade_date
+        str(r[0])
         for r in db.query(PortfolioDailySnapshot.trade_date)
         .filter(
             PortfolioDailySnapshot.user_id == user_id,
@@ -102,6 +102,9 @@ def ensure_bought_history(db: Session, user_id: int) -> None:
 
     for h in holdings:
         total_cost += float(h.shares) * float(h.cost)
+        if (h.market or "").upper() == "JD":
+            # 积存金无日K；今日盈亏靠实时昨收，历史回填跳过
+            continue
         start = normalize_bought_at(
             getattr(h, "bought_at", None) or "",
             fallback=(h.created_at.date() if h.created_at else None),
@@ -138,8 +141,27 @@ def ensure_bought_history(db: Session, user_id: int) -> None:
     if not by_date:
         return
 
+    # Upsert by trade_date — unique is (user_id, trade_date) across sources;
+    # concurrent / leftover rows must not 500 the warehouse tab.
     for d, (day_pnl, mv, prev_mv) in by_date.items():
         pct = (day_pnl / prev_mv * 100) if prev_mv > 0 else 0.0
+        row = (
+            db.query(PortfolioDailySnapshot)
+            .filter(
+                PortfolioDailySnapshot.user_id == user_id,
+                PortfolioDailySnapshot.trade_date == d,
+            )
+            .first()
+        )
+        if row is not None:
+            if row.source == "live":
+                continue
+            row.total_market_value = round(mv, 2)
+            row.total_cost = round(total_cost, 2)
+            row.day_pnl = round(day_pnl, 2)
+            row.day_pnl_pct = round(pct, 2)
+            row.source = "bought"
+            continue
         db.add(
             PortfolioDailySnapshot(
                 user_id=user_id,
@@ -151,7 +173,11 @@ def ensure_bought_history(db: Session, user_id: int) -> None:
                 source="bought",
             )
         )
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("ensure_bought_history commit failed user=%s", user_id)
 
 
 def _parse_ref(ref: str | None) -> date:
@@ -226,8 +252,16 @@ def build_returns_summary(
     dim = dim if dim in ("day", "month", "year") else "day"
     purge_estimated_snapshots(db, user_id)
     if portfolio is not None:
-        upsert_today_snapshot(db, user_id, portfolio)
-    ensure_bought_history(db, user_id)
+        try:
+            upsert_today_snapshot(db, user_id, portfolio)
+        except Exception:
+            logger.exception("upsert_today_snapshot failed user=%s", user_id)
+            db.rollback()
+    try:
+        ensure_bought_history(db, user_id)
+    except Exception:
+        logger.exception("ensure_bought_history failed user=%s", user_id)
+        db.rollback()
 
     anchor = _parse_ref(ref)
     today = shanghai_today()

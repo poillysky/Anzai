@@ -76,16 +76,17 @@ def freshness_label(as_of: str | None, *, venue: str = "") -> str:
 
 
 # topic_id -> aliases + sina specs (code, kind, display, unit)
-# kind: hf=外盘期货 | gds=贵金属现货 | nf=国内期货连续 | a=A股(走 quote.get_quotes)
+# kind: hf=外盘期货 | gds=贵金属现货 | nf=国内期货连续 | a=A股(走 quote.get_quotes) | fx=汇率
 _TOPIC_CATALOG: list[dict] = [
     {
         "id": "gold",
-        "aliases": ("黄金", "金价", "沪金", "金饰", "gold", "xau", "au9999"),
+        # 与 App「股票→黄金」页对齐；别名含口语「沪金」便于路由，展示名仍用看板品种
+        "aliases": ("黄金", "金价", "沪金", "金饰", "gold", "xau", "au9999", "金条", "积存金"),
         "items": (
-            ("gds_AU9999", "gds", "沪金AU9999", "元/克"),
-            ("nf_AU0", "nf", "沪金连续", "元/克"),
-            ("hf_GC", "hf", "纽约黄金", "美元/盎司"),
-            ("518880", "a", "黄金ETF华安", "元"),
+            ("gds_AU9999", "gds", "AU9999", "元/克"),
+            ("hf_GC", "hf", "纽约金", "美元/盎司"),
+            ("159937", "a", "博时黄金ETF", "元"),
+            ("518660", "a", "工银瑞信黄金ETF", "元"),
         ),
     },
     {
@@ -113,9 +114,43 @@ _TOPIC_CATALOG: list[dict] = [
         ),
     },
     {
+        "id": "iron",
+        "aliases": ("铁矿石", "铁矿", "iron ore", "i.ore"),
+        "items": (("nf_I0", "nf", "铁矿石连续", "元/吨"),),
+    },
+    {
+        "id": "rebar",
+        "aliases": ("螺纹钢", "螺纹", "钢材", "rebar", "螺纹钢期货"),
+        "items": (("nf_RB0", "nf", "螺纹钢连续", "元/吨"),),
+    },
+    {
+        "id": "soymeal",
+        "aliases": ("豆粕", "大豆粕", "饲料", "soymeal", "m豆粕"),
+        "items": (("nf_M0", "nf", "豆粕连续", "元/吨"),),
+    },
+    {
+        "id": "gas",
+        "aliases": ("天然气", "美气", "气价", "natgas", "lng", "天然气期货"),
+        "items": (("hf_NG", "hf", "纽约天然气", "美元/百万英热"),),
+    },
+    {
         "id": "usd_cny",
-        "aliases": ("美元", "人民币", "汇率", "美元兑人民币", "离岸", "在岸", "usdcny", "usd/cny"),
-        "items": (("fx_susdcny", "fx", "在岸人民币 USD/CNY", "元"),),
+        "aliases": (
+            "美元",
+            "人民币",
+            "汇率",
+            "美元兑人民币",
+            "离岸",
+            "在岸",
+            "usdcny",
+            "usd/cny",
+            "离岸人民币",
+            "在岸人民币",
+        ),
+        "items": (
+            ("fx_susdcny", "fx", "在岸人民币 USD/CNY", "元"),
+            ("fx_husdcny", "fx", "离岸人民币 USD/CNH", "元"),
+        ),
     },
 ]
 
@@ -395,27 +430,113 @@ def get_macro_quotes(topic_query: str) -> tuple[str | None, list[MacroQuote], st
     return topic["id"], quotes, ""
 
 
+def news_keyword_for_topic(topic_id: str) -> str:
+    """Chinese search keyword for EM news (id「gold」搜不出好结果)."""
+    for t in _TOPIC_CATALOG:
+        if t["id"] == topic_id:
+            for a in t["aliases"]:
+                # Prefer CJK alias
+                if any("\u4e00" <= ch <= "\u9fff" for ch in str(a)):
+                    return str(a)
+            return str(t["aliases"][0]) if t["aliases"] else topic_id
+    return topic_id
+
+
 def format_macro_text(topic_query: str) -> str:
+    q = (topic_query or "").strip()
+    # 总览：常见品种一块看（零售高频）
+    if not q or q.lower() in {"overview", "board", "看板", "总览", "宏观", "商品"}:
+        return format_macro_overview()
+
+    topic = resolve_topic(q)
+    # 黄金：与 App「股票→黄金」看板一致，勿用期货连续合约话术
+    if topic is not None and topic["id"] == "gold":
+        from app.providers.gold import format_gold_board_text
+
+        return format_gold_board_text()
+
     topic_id, quotes, err = get_macro_quotes(topic_query)
     if err and not quotes:
         return err
     lines = [
         f"【宏观/商品 · {topic_id}】来源新浪；无报价禁止编造。",
+        "引用方式：嵌进口语短句，不要复述成项目符号看板；"
+        "只许用下列品种与数字，禁止补编美元指数/美债/COMEX 等未列出项。",
         calendar_clock_line(),
     ]
     stale = 0
+    chunks: list[str] = []
+    spoken: list[str] = []
     for q in quotes:
         chg = f"{q.change_pct:+.2f}%" if q.change_pct is not None else "—"
         tag = freshness_label(q.as_of, venue=q.venue)
         if "非今日" in tag:
             stale += 1
-        line = f"- {q.name}：{q.price} {q.unit} · 涨跌 {chg} · [{tag}]"
+        bit = f"{q.name} {q.price} {q.unit}（{chg}，{tag}"
         if q.as_of:
-            line += f" · {q.as_of}"
-        lines.append(line)
+            bit += f"，{q.as_of}"
+        bit += "）"
+        chunks.append(bit)
+        # 一句口语料，方便模型直接嵌句
+        if q.change_pct is not None:
+            direction = "涨了" if q.change_pct > 0 else ("跌了" if q.change_pct < 0 else "差不多平盘")
+            if "今日" in tag:
+                spoken.append(f"{q.name}大概 {q.price}{q.unit}，{direction}约 {abs(q.change_pct):.2f}%")
+            else:
+                spoken.append(
+                    f"{q.name}最新打印约 {q.price}{q.unit}（{tag}），"
+                    f"相对昨收{direction}约 {abs(q.change_pct):.2f}%，别说成今天盘中"
+                )
+    if chunks:
+        lines.append("报价：" + "；".join(chunks) + "。")
+    if spoken:
+        lines.append("口语参考：" + "。".join(spoken[:3]) + "。")
     if stale:
         lines.append(
-            f"说明：其中 {stale} 条不是今天盘中（多为A股昨收）。"
+            f"说明：其中 {stale} 条不是今天盘中（多为A股昨收或外盘旧点）。"
             f"用户问「今天」时，优先讲标了「今日」的品种；昨收要单独说清。"
         )
+    return "\n".join(lines)
+
+
+def format_macro_overview() -> str:
+    """Pulse board: gold / oil / FX — for「宏观怎么样」."""
+    lines = [
+        "【宏观/商品看板】来源新浪；只许引用下列数字。",
+        calendar_clock_line(),
+        "已支持主题："
+        + "、".join(
+            f"{t['id']}（{t['aliases'][0]}）" for t in _TOPIC_CATALOG
+        )
+        + "。想看细的再说主题名。",
+    ]
+    bits: list[str] = []
+    # 黄金速览：取 App 黄金页国内 AU9999（与问黄金细查同源）
+    try:
+        from app.providers.gold import get_gold_board
+
+        board = get_gold_board()
+        for sec in board.sections:
+            if sec.id != "domestic":
+                continue
+            for it in sec.items:
+                if it.id == "au9999" and it.price is not None:
+                    chg = f"{it.change_pct:+.2f}%" if it.change_pct is not None else "—"
+                    bits.append(f"AU9999 {it.price}{it.unit or '元/克'}（{chg}）")
+                    break
+    except Exception:
+        logger.exception("overview gold board failed")
+    for tid in ("oil", "usd_cny", "copper"):
+        _id, quotes, err = get_macro_quotes(tid)
+        if err or not quotes:
+            continue
+        # Prefer CN venue first for oil, else first quote
+        pick = next((q for q in quotes if q.venue in {"spot", "cn_future", "a_share", "fx"}), quotes[0])
+        chg = f"{pick.change_pct:+.2f}%" if pick.change_pct is not None else "—"
+        tag = freshness_label(pick.as_of, venue=pick.venue)
+        bits.append(f"{pick.name} {pick.price}{pick.unit}（{chg}，{tag}）")
+    if bits:
+        lines.append("速览：" + "；".join(bits) + "。")
+    else:
+        lines.append("速览暂时拉不到（勿编造）。")
     return "\n".join(lines)

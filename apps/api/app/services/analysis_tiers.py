@@ -1,6 +1,6 @@
-"""Three analysis tiers (light / standard / deep) — editable via /admin.
+"""Analysis tiers (light / standard / deep) — editable via /admin.
 
-App UI only picks a tier; agent mix & weights live here.
+App：个股三档可选；仓库巡检固定 standard（见 analysis.create job）。
 """
 
 from __future__ import annotations
@@ -15,11 +15,60 @@ logger = logging.getLogger(__name__)
 
 AGENT_IDS = ("trend", "news", "flow", "risk")
 AGENT_LABELS: dict[str, str] = {
-    "trend": "走势",
-    "news": "新闻",
+    "trend": "走势席",
+    "news": "新闻席",
     "flow": "资金情绪",
     "risk": "结构风险",
+    "dialectic": "辩证席",
     "judge": "首席综合",
+}
+
+# Admin UI + blurb migration helpers
+SEAT_META: dict[str, dict[str, str | bool]] = {
+    "trend": {"kind": "LLM", "deferred": False},
+    "news": {"kind": "LLM", "deferred": False},
+    "flow": {"kind": "未接入", "deferred": True},
+    "risk": {"kind": "确定性", "deferred": False},
+}
+
+TIER_META: dict[str, dict[str, str]] = {
+    "light": {
+        "pipeline": "走势∥新闻 → 首席",
+        "note": "跳过辩证与结构风险。适合单票快看。",
+        "evidence_hint": "证据偏薄：报价+指数+少量新闻；可不拉分时。",
+    },
+    "standard": {
+        "pipeline": "走势∥新闻 → 结构风险 → 辩证×1 → 首席",
+        "note": "仓库持仓巡检固定本档。结构风险看集中度 / 今日盈亏相对上证 / 空新闻。",
+        "evidence_hint": "标准证据：分时（昨收·今开·最新）+ 日K + 持仓今日盈亏分列。",
+    },
+    "deep": {
+        "pipeline": "走势∥新闻 → 结构风险 → 辩证×2 → 首席",
+        "note": "证据加厚、辩证两回合；open_questions 必须由首席回应。",
+        "evidence_hint": "深度证据：更长K线、更多新闻；仍禁止编造未纳入宏观。",
+    },
+}
+
+EVIDENCE_BLURBS: dict[str, str] = {
+    "light": "轻量证据",
+    "standard": "分时+K+新闻",
+    "deep": "加厚K/新闻",
+}
+
+_LEGACY_BLURBS: dict[str, frozenset[str]] = {
+    "standard": frozenset(
+        {
+            "走势∥新闻 → 辩证 → 首席",
+            "走势 || 新闻 -> 辩证 -> 首席",
+            "走势∥新闻 → 辩证 → 首席",
+        }
+    ),
+    "deep": frozenset(
+        {
+            "四席委员会 · 辩证多回合 · 证据加厚",
+        }
+    ),
+    "light": frozenset(),
 }
 
 TIER_IDS = ("light", "standard", "deep")
@@ -28,7 +77,7 @@ DEFAULT_TIERS: dict[str, dict[str, Any]] = {
     "light": {
         "id": "light",
         "label": "轻量",
-        "blurb": "走势 + 新闻（双席快评）",
+        "blurb": "走势∥新闻 → 首席（跳过辩证）",
         "agents": ["trend", "news"],
         "weights": {"trend": 0.5, "news": 0.5},
         "evidence_tier": "light",
@@ -36,17 +85,17 @@ DEFAULT_TIERS: dict[str, dict[str, Any]] = {
     "standard": {
         "id": "standard",
         "label": "标准",
-        "blurb": "四专家均衡",
-        "agents": ["trend", "news", "flow", "risk"],
-        "weights": {"trend": 0.25, "news": 0.25, "flow": 0.25, "risk": 0.25},
+        "blurb": "走势∥新闻 → 结构风险 → 辩证 → 首席",
+        "agents": ["trend", "news", "risk"],
+        "weights": {"trend": 0.4, "news": 0.35, "risk": 0.25},
         "evidence_tier": "standard",
     },
     "deep": {
         "id": "deep",
         "label": "深度",
-        "blurb": "四席全开 · 新闻与风险加重",
-        "agents": ["trend", "news", "flow", "risk"],
-        "weights": {"trend": 0.20, "news": 0.30, "flow": 0.15, "risk": 0.35},
+        "blurb": "走势∥新闻 → 结构风险 → 辩证×2 → 首席",
+        "agents": ["trend", "news", "risk"],
+        "weights": {"trend": 0.4, "news": 0.3, "risk": 0.3},
         "evidence_tier": "deep",
     },
 }
@@ -55,14 +104,28 @@ DEFAULT_TIERS: dict[str, dict[str, Any]] = {
 TIERS_PATH = Path(__file__).resolve().parents[2] / "data" / "analysis_tiers.json"
 
 
+def normalize_degree(degree: str | None) -> str:
+    if degree in TIER_IDS:
+        return str(degree)
+    return "standard"
+
+
 def _normalize_tier(tid: str, raw: dict[str, Any] | None) -> dict[str, Any]:
     base = deepcopy(DEFAULT_TIERS[tid])
     if not raw:
         return base
     label = str(raw.get("label") or base["label"]).strip() or base["label"]
     blurb = str(raw.get("blurb") or base["blurb"]).strip() or base["blurb"]
+    # Migrate stale App blurbs saved before 结构风险席
+    legacy = _LEGACY_BLURBS.get(tid, frozenset())
+    if blurb in legacy or (
+        tid in {"standard", "deep"}
+        and "结构风险" not in blurb
+        and ("辩证" in blurb or "四席" in blurb)
+    ):
+        blurb = base["blurb"]
     evidence = str(raw.get("evidence_tier") or base["evidence_tier"]).strip()
-    if evidence not in {"light", "standard", "deep"}:
+    if evidence not in TIER_IDS:
         evidence = base["evidence_tier"]
 
     agents_in = raw.get("agents")
@@ -70,18 +133,24 @@ def _normalize_tier(tid: str, raw: dict[str, Any] | None) -> dict[str, Any]:
     if isinstance(agents_in, list):
         for a in agents_in:
             aid = str(a).strip()
+            # 资金情绪未接入，忽略历史勾选
+            if aid == "flow":
+                continue
             if aid in AGENT_IDS and aid not in agents:
                 agents.append(aid)
     if not agents:
+        agents = list(base["agents"])
+    # 标准/深度若仍是旧的 trend+news，自动补上结构风险
+    if tid in {"standard", "deep"} and agents == ["trend", "news"]:
         agents = list(base["agents"])
 
     weights_in = raw.get("weights") if isinstance(raw.get("weights"), dict) else {}
     weights: dict[str, float] = {}
     for a in agents:
         try:
-            w = float(weights_in.get(a, 1.0 / len(agents)))
+            w = float(weights_in.get(a, base["weights"].get(a, 1.0 / len(agents))))
         except (TypeError, ValueError):
-            w = 1.0 / len(agents)
+            w = float(base["weights"].get(a, 1.0 / len(agents)))
         weights[a] = max(0.0, w)
     total = sum(weights.values()) or 1.0
     weights = {k: round(v / total, 4) for k, v in weights.items()}
@@ -119,7 +188,7 @@ def save_tiers(tiers: dict[str, dict[str, Any]]) -> Path:
 
 
 def get_tier(degree: str) -> dict[str, Any]:
-    tid = degree if degree in TIER_IDS else "standard"
+    tid = normalize_degree(degree)
     return load_tiers()[tid]
 
 
@@ -157,7 +226,6 @@ def get_recipe(recipe_id: str) -> dict[str, Any]:
     """Resolve recipe: tier id first, else legacy aliases."""
     if recipe_id in TIER_IDS:
         return recipe_for_degree(recipe_id)
-    # legacy aliases from earlier P0
     legacy = {
         "quick_two": "light",
         "balanced": "standard",
@@ -172,8 +240,8 @@ def get_recipe(recipe_id: str) -> dict[str, Any]:
 
 
 def resolve_evidence_tier(degree: str | None, recipe_id: str) -> str:
-    if degree in TIER_IDS:
-        return str(get_tier(degree)["evidence_tier"])
+    if degree:
+        return str(get_tier(normalize_degree(degree))["evidence_tier"])
     try:
         return str(get_recipe(recipe_id).get("evidence_tier") or "standard")
     except KeyError:
@@ -184,7 +252,11 @@ def parse_tier_form(form: dict[str, str]) -> dict[str, dict[str, Any]]:
     """Build tiers dict from admin form fields."""
     out: dict[str, dict[str, Any]] = {}
     for tid in TIER_IDS:
-        agents = [a for a in AGENT_IDS if form.get(f"{tid}_agent_{a}") in ("1", "on", "true")]
+        agents = [
+            a
+            for a in AGENT_IDS
+            if a != "flow" and form.get(f"{tid}_agent_{a}") in ("1", "on", "true")
+        ]
         weights: dict[str, float] = {}
         for a in agents:
             raw = form.get(f"{tid}_w_{a}", "")

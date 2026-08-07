@@ -1,5 +1,5 @@
 {
-  "name": "anzai-etf",
+  "name": "anzai",
   "private": true,
   "scripts": {
     "dev": "powershell -ExecutionPolicy Bypass -File scripts/dev.ps1",

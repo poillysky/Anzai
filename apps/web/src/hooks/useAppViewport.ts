@@ -42,6 +42,8 @@ export function useAppViewport() {
     let layoutH = screen.height || window.innerHeight;
     let stabilityTimer: number | null = null;
     let pendingInset = 0;
+    let insetRaf: number | null = null;
+    let insetFrame = 0;
 
     const measureGap = () => {
       const vv = window.visualViewport;
@@ -49,9 +51,24 @@ export function useAppViewport() {
       return Math.max(0, layoutH - vv.height, window.innerHeight - vv.height);
     };
 
+    const flushInset = (px: number) => {
+      insetFrame = px;
+      if (insetRaf != null) return;
+      insetRaf = window.requestAnimationFrame(() => {
+        insetRaf = null;
+        root.style.setProperty("--keyboard-inset", `${insetFrame}px`);
+      });
+    };
+
     const commitKeyboard = (open: boolean, inset: number) => {
       root.dataset.keyboard = open ? "1" : "0";
-      root.style.setProperty("--keyboard-inset", `${Math.round(open ? inset : 0)}px`);
+      const px = open ? inset : 0;
+      if (insetRaf != null) {
+        window.cancelAnimationFrame(insetRaf);
+        insetRaf = null;
+      }
+      insetFrame = px;
+      root.style.setProperty("--keyboard-inset", `${px}px`);
     };
 
     const applyLayoutHeight = () => {
@@ -84,8 +101,13 @@ export function useAppViewport() {
     const onViewportSignal = () => {
       applyVisualHeight();
       const gap = measureGap();
+      // Agent composer tracks VV earlier so lift follows the keyboard rise.
+      const agentComposer =
+        document.activeElement instanceof HTMLElement &&
+        !!document.activeElement.closest(".agent-composer-shell");
+      const threshold = agentComposer ? 24 : KEYBOARD_THRESHOLD;
 
-      if (gap <= KEYBOARD_THRESHOLD) {
+      if (gap <= threshold) {
         if (stabilityTimer) {
           window.clearTimeout(stabilityTimer);
           stabilityTimer = null;
@@ -95,10 +117,22 @@ export function useAppViewport() {
         return;
       }
 
-      // Track keyboard gap for modal-lift only (shell stays frozen).
-      // Soft cap avoids rare VV glitches; half of this is applied in CSS.
-      pendingInset = Math.min(gap, Math.round(layoutH * 0.55));
-      root.style.setProperty("--keyboard-inset", `${pendingInset}px`);
+      // Track keyboard gap for modal-lift / agent composer (shell stays frozen).
+      // Soft cap avoids rare VV glitches; half of this is applied in CSS for modals.
+      pendingInset = Math.min(gap, layoutH * 0.55);
+
+      if (agentComposer) {
+        // rAF-coalesce inset; pin scroll only on first open (avoid per-frame jank).
+        flushInset(pendingInset);
+        if (root.dataset.keyboard !== "1") {
+          root.dataset.keyboard = "1";
+          pinDocumentScroll();
+          pinUnderlyingScrollers();
+        }
+        return;
+      }
+
+      flushInset(pendingInset);
       if (stabilityTimer) window.clearTimeout(stabilityTimer);
       stabilityTimer = window.setTimeout(() => {
         stabilityTimer = null;
@@ -215,6 +249,7 @@ export function useAppViewport() {
     return () => {
       boot.forEach((id) => window.clearTimeout(id));
       if (stabilityTimer) window.clearTimeout(stabilityTimer);
+      if (insetRaf != null) window.cancelAnimationFrame(insetRaf);
       window.removeEventListener("resize", onWinResize);
       window.removeEventListener("scroll", onScroll);
       window.visualViewport?.removeEventListener("resize", onViewportSignal);

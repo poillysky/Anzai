@@ -18,6 +18,21 @@ import "./login.css";
 const PUSH_MS = 360;
 const HERO_SRC = "/brand/anzai-login-hero.png";
 
+/** 与后端 identity.IDENTITY_ROLES 对齐（注册页无 token，用本地目录） */
+const IDENTITY_ROLES: { id: string; label: string }[] = [
+  { id: "dad", label: "爸爸" },
+  { id: "mom", label: "妈妈" },
+  { id: "grandpa", label: "爷爷" },
+  { id: "grandma", label: "奶奶" },
+  { id: "brother", label: "哥哥" },
+  { id: "sister", label: "姐姐" },
+  { id: "friend", label: "朋友" },
+  { id: "wife", label: "老婆" },
+  { id: "husband", label: "老公" },
+  { id: "self", label: "就是我自己" },
+  { id: "custom", label: "自定义" },
+];
+
 type Phase = "gate" | "login" | "register" | "bootstrap";
 type NavDir = "push" | "pop";
 
@@ -41,6 +56,8 @@ export default function LoginScreen() {
   const [password2, setPassword2] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [showPassword2, setShowPassword2] = useState(false);
+  const [identityRole, setIdentityRole] = useState("");
+  const [identityLabel, setIdentityLabel] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [forgotOpen, setForgotOpen] = useState(false);
@@ -171,7 +188,11 @@ export default function LoginScreen() {
     setError("");
     setShowPassword(false);
     setShowPassword2(false);
-    if (next === "register") setPassword2("");
+    if (next === "register") {
+      setPassword2("");
+      setIdentityRole("");
+      setIdentityLabel("");
+    }
     navigate(next, "push");
   }
 
@@ -190,13 +211,35 @@ export default function LoginScreen() {
       haptics.warning();
       return;
     }
+    if (phase === "register" || phase === "bootstrap") {
+      if (!identityRole.trim()) {
+        setError("请选择你是安崽的谁");
+        haptics.warning();
+        return;
+      }
+      if (identityRole === "custom" && !identityLabel.trim()) {
+        setError("自定义请填写称呼，例如「舅舅」");
+        haptics.warning();
+        return;
+      }
+    }
     setBusy(true);
     try {
       const res =
         phase === "bootstrap"
-          ? await api.bootstrap(username.trim(), password)
+          ? await api.bootstrap(
+              username.trim(),
+              password,
+              identityRole.trim(),
+              identityRole === "custom" ? identityLabel.trim() : "",
+            )
           : phase === "register"
-            ? await api.register(username.trim(), password)
+            ? await api.register(
+                username.trim(),
+                password,
+                identityRole.trim(),
+                identityRole === "custom" ? identityLabel.trim() : "",
+              )
             : await api.login(username.trim(), password);
       setSession(res.access_token, res.user);
       haptics.success();
@@ -270,7 +313,9 @@ export default function LoginScreen() {
         <div className="login-form-head">
           <h1 className="login-title">{title}</h1>
           {formPhase === "bootstrap" ? (
-            <p className="login-lead">首位账号为管理员，之后可自助注册普通账号</p>
+            <p className="login-lead">首位账号为管理员；请同时选择你是安崽的谁</p>
+          ) : formPhase === "register" ? (
+            <p className="login-lead">选好身份后注册，安崽说话语气会跟着变</p>
           ) : null}
         </div>
 
@@ -356,6 +401,44 @@ export default function LoginScreen() {
               </label>
             ) : null}
 
+            {formPhase === "register" || formPhase === "bootstrap" ? (
+              <div className="login-identity">
+                <div className="login-identity-head">
+                  <span className="login-label">你是安崽的谁</span>
+                  <span className="login-identity-hint">必选 · 决定对话语气</span>
+                </div>
+                <div className="login-identity-chips" role="group" aria-label="身份">
+                  {IDENTITY_ROLES.map((r) => (
+                    <button
+                      key={r.id}
+                      type="button"
+                      className={`login-identity-chip${identityRole === r.id ? " is-on" : ""}`}
+                      onClick={() => {
+                        haptics.tap();
+                        setIdentityRole(r.id);
+                        if (r.id !== "custom") setIdentityLabel("");
+                      }}
+                    >
+                      {r.label}
+                    </button>
+                  ))}
+                </div>
+                {identityRole === "custom" ? (
+                  <label className="login-field login-field--stack">
+                    <span className="login-label">怎么称呼</span>
+                    <input
+                      className="login-input"
+                      value={identityLabel}
+                      onChange={(e) => setIdentityLabel(e.target.value)}
+                      placeholder="例如 舅舅"
+                      maxLength={16}
+                      required
+                    />
+                  </label>
+                ) : null}
+              </div>
+            ) : null}
+
             {error && phase === formPhase ? (
               <p className="login-error" role="alert">
                 {error}
@@ -383,6 +466,8 @@ export default function LoginScreen() {
                       setError("");
                       setPassword2("");
                       setShowPassword2(false);
+                      setIdentityRole("");
+                      setIdentityLabel("");
                       setPhase("register");
                     }}
                   >

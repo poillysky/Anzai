@@ -58,9 +58,11 @@ def _blank_profile(
     base_url: str = "",
     api_key: str = "",
     model: str = "gpt-4o-mini",
+    available_models: list[str] | None = None,
 ) -> dict[str, Any]:
     if not base_url:
         base_url = SOURCE_BASE.get(source) or "https://api.openai.com/v1"
+    models = [str(x).strip() for x in (available_models or []) if str(x).strip()][:80]
     return {
         "id": profile_id,
         "name": name,
@@ -68,6 +70,7 @@ def _blank_profile(
         "baseUrl": base_url.rstrip("/") or "https://api.openai.com/v1",
         "apiKey": api_key or "",
         "model": model or "gpt-4o-mini",
+        "availableModels": models,
         "updatedAt": _now(),
     }
 
@@ -81,6 +84,7 @@ def _normalize_profile(raw: dict[str, Any] | None) -> dict[str, Any] | None:
     if source not in SOURCE_BASE:
         source = "custom"
     base = str(raw.get("baseUrl") or SOURCE_BASE.get(source) or "").strip()
+    models = raw.get("availableModels") if isinstance(raw.get("availableModels"), list) else []
     return _blank_profile(
         profile_id=pid,
         name=name,
@@ -88,6 +92,7 @@ def _normalize_profile(raw: dict[str, Any] | None) -> dict[str, Any] | None:
         base_url=base,
         api_key=str(raw.get("apiKey") or ""),
         model=str(raw.get("model") or "gpt-4o-mini"),
+        available_models=[str(x) for x in models],
     )
 
 
@@ -162,6 +167,7 @@ def get_active_profile(store: dict[str, Any] | None = None) -> dict[str, Any]:
 
 def public_profile(p: dict[str, Any]) -> dict[str, Any]:
     """Template-safe profile (no raw apiKey)."""
+    models = p.get("availableModels") if isinstance(p.get("availableModels"), list) else []
     return {
         "id": p["id"],
         "name": p["name"],
@@ -170,6 +176,7 @@ def public_profile(p: dict[str, Any]) -> dict[str, Any]:
         "model": p["model"],
         "apiKeySet": bool(str(p.get("apiKey") or "").strip()),
         "updatedAt": p.get("updatedAt") or "",
+        "availableModels": [str(x) for x in models if str(x).strip()][:80],
     }
 
 
@@ -179,6 +186,35 @@ def public_store(store: dict[str, Any] | None = None) -> dict[str, Any]:
         "activeProfileId": st["activeProfileId"],
         "profiles": [public_profile(p) for p in st["profiles"]],
     }
+
+
+def saved_model_list(store: dict[str, Any] | None = None) -> list[str]:
+    p = get_active_profile(store)
+    raw = p.get("availableModels")
+    if not isinstance(raw, list):
+        return []
+    return [str(x).strip() for x in raw if str(x).strip()][:80]
+
+
+def remember_model_list(ids: list[str]) -> None:
+    """Persist model ids on active profile — Session cookie 装不下长列表。"""
+    store = load_profiles()
+    active_id = store["activeProfileId"]
+    cleaned = [str(x).strip() for x in ids if str(x).strip()][:80]
+    for i, p in enumerate(store["profiles"]):
+        if p["id"] != active_id:
+            continue
+        store["profiles"][i] = _blank_profile(
+            profile_id=p["id"],
+            name=p["name"],
+            source=p.get("source") or "custom",
+            base_url=p.get("baseUrl") or "",
+            api_key=p.get("apiKey") or "",
+            model=p.get("model") or "gpt-4o-mini",
+            available_models=cleaned,
+        )
+        break
+    save_profiles(store)
 
 
 def apply_profile_to_env(profile: dict[str, Any]) -> None:
@@ -219,6 +255,7 @@ def sync_active_from_fields(
             base_url=base,
             api_key=key,
             model=(model or "").strip() or p["model"],
+            available_models=list(p.get("availableModels") or []),
         )
         break
     save_profiles(store)
@@ -249,6 +286,7 @@ def create_profile(*, name: str, copy_active: bool = True) -> dict[str, Any]:
             base_url=cur["baseUrl"],
             api_key=cur.get("apiKey") or "",
             model=cur["model"],
+            available_models=list(cur.get("availableModels") or []),
         )
     else:
         profile = _blank_profile(profile_id=pid, name=label)

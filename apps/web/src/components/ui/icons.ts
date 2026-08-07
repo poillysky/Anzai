@@ -21,6 +21,8 @@ export {
   X,
   Inbox,
   MessageSquare,
+  MessagesSquare,
+  Users,
   History,
   MoreHorizontal,
   Sparkles,
@@ -54,6 +56,9 @@ export {
   Settings,
   LogOut,
   KeyRound,
+  Bell,
+  Mic,
+  MicOff,
 } from "lucide-react";
 
 

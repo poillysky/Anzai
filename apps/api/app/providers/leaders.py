@@ -1,4 +1,8 @@
-"""Board / leaderboard stocks via East Money + curated related ETFs."""
+"""Board / leaderboard stocks via East Money + curated related ETFs.
+
+Open + close: try session-ordered hosts (push2 ↔ push2delay). Pre-open rows often
+have f2='-' — fall back to 昨收 f18 so boards still show, never silent mock.
+"""
 
 from __future__ import annotations
 
@@ -8,26 +12,14 @@ from dataclasses import dataclass
 
 import httpx
 
+from app.providers.eastmoney import EM_HEADERS, clist_urls, em_float, host_label
 from app.providers.quote import get_quotes
 
 logger = logging.getLogger(__name__)
 
 _CACHE: dict[str, tuple[float, list["LeaderStock"]]] = {}
 _CACHE_TTL = 20.0
-
-# push2 often disconnects; push2delay keeps board lists available after hours.
-_CLIST_URLS = (
-    "https://push2.eastmoney.com/api/qt/clist/get",
-    "https://push2delay.eastmoney.com/api/qt/clist/get",
-)
-
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://quote.eastmoney.com/",
-}
+_HEADERS = EM_HEADERS
 
 BOARD_FS: dict[str, tuple[str, str]] = {
     "sh-composite": ("m:1+t:2", "沪市"),
@@ -242,8 +234,15 @@ def get_leaders(
 
     out = _fetch_clist(fs=fs, fid=fid, po=po, limit=limit)
     if not out:
-        logger.warning("Leaderboard empty for %s/%s; using mock", key, kind)
-        out = _mock_leaders(key, kind)
+        # Do not silently serve mock boards in production — UI shows empty instead
+        # of 茅台/平安假数据。Dev-only: set QUOTE_PROVIDER=mock.
+        from app.core.config import get_settings
+
+        if (get_settings().quote_provider or "").strip().lower() == "mock":
+            logger.warning("Leaderboard empty for %s/%s; using mock (QUOTE_PROVIDER=mock)", key, kind)
+            out = _mock_leaders(key, kind)
+        else:
+            logger.warning("Leaderboard empty for %s/%s; returning empty (no mock)", key, kind)
 
     _CACHE[cache_key] = (now, out)
     return title, kind, out
@@ -254,24 +253,19 @@ def _parse_clist_row(row: dict) -> LeaderStock | None:
     name = str(row.get("f14") or "").strip() or symbol
     if not symbol:
         return None
-    try:
-        price = float(row.get("f2") or 0)
-    except (TypeError, ValueError):
-        price = 0.0
-    if price <= 0:
-        return None
-    try:
-        chg = float(row.get("f3")) if row.get("f3") is not None else None
-    except (TypeError, ValueError):
-        chg = None
-    try:
-        amount = float(row.get("f6")) if row.get("f6") is not None else None
-    except (TypeError, ValueError):
-        amount = None
-    try:
-        turnover = float(row.get("f8")) if row.get("f8") is not None else None
-    except (TypeError, ValueError):
-        turnover = None
+    price = em_float(row.get("f2"))
+    prev = em_float(row.get("f18"))
+    chg = em_float(row.get("f3"))
+    # Pre-open / after-hours delay: live price may be '-' — use 昨收
+    if price is None or price <= 0:
+        if prev is not None and prev > 0:
+            price = prev
+            if chg is None:
+                chg = 0.0
+        else:
+            return None
+    amount = em_float(row.get("f6"))
+    turnover = em_float(row.get("f8"))
     return LeaderStock(
         symbol=symbol,
         name=name,
@@ -293,17 +287,17 @@ def _fetch_clist(*, fs: str, fid: str, po: str, limit: int) -> list[LeaderStock]
         "invt": "2",
         "fid": fid,
         "fs": fs,
-        "fields": "f12,f13,f14,f2,f3,f6,f8",
+        "fields": "f12,f13,f14,f2,f3,f6,f8,f18",
     }
     with httpx.Client(timeout=8.0, headers=_HEADERS, follow_redirects=True) as client:
-        for url in _CLIST_URLS:
+        for url in clist_urls():
             try:
                 resp = client.get(url, params=params)
                 resp.raise_for_status()
                 data = (resp.json() or {}).get("data") or {}
                 rows = data.get("diff") or []
                 if not rows:
-                    logger.info("Leaders empty from %s fs=%s", url.split("/")[2], fs)
+                    logger.info("Leaders empty from %s fs=%s", host_label(url), fs)
                     continue
                 out: list[LeaderStock] = []
                 for row in rows:
@@ -314,11 +308,16 @@ def _fetch_clist(*, fs: str, fid: str, po: str, limit: int) -> list[LeaderStock]
                         out.append(item)
                 if out:
                     return out
-            except Exception:
-                logger.warning(
-                    "Leaders fetch miss %s fs=%s",
-                    url.split("/")[2],
+                logger.info(
+                    "Leaders rows unusable from %s fs=%s",
+                    host_label(url),
                     fs,
-                    exc_info=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Leaders fetch miss %s fs=%s: %s",
+                    host_label(url),
+                    fs,
+                    type(exc).__name__,
                 )
     return []

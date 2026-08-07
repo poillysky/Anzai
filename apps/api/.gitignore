@@ -6,3 +6,7 @@ __pycache__/
 .pytest_cache/
 # connection profiles hold API keys
 data/llm_profiles.json
+data/analysis_connection.json
+data/embedding_connection.json
+# knowledge vector cache (rebuilt at runtime)
+data/knowledge/.index.json

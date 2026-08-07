@@ -30,6 +30,7 @@ def init_db() -> None:
         dedupe_preferences,
         ensure_agent_conversation_schema,
         ensure_holdings_bought_at,
+        ensure_holdings_day_buy_lot,
         ensure_preference_identity_columns,
         ensure_user_id_columns,
         recreate_unique_if_needed,
@@ -39,6 +40,7 @@ def init_db() -> None:
     ensure_user_id_columns(engine)
     ensure_preference_identity_columns(engine)
     ensure_holdings_bought_at(engine)
+    ensure_holdings_day_buy_lot(engine)
     ensure_agent_conversation_schema(engine)
     dedupe_preferences(engine)
     recreate_unique_if_needed(engine)

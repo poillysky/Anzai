@@ -126,6 +126,15 @@ async def agent_chat(
             latest_user = (m.get("content") or "").strip()
             break
 
+    # 提问立刻落库：换页 / abort 时至少保留用户句，避免整轮消失
+    if latest_user:
+        try:
+            history_svc.append_user_message(
+                db, user_id, latest_user, conversation_id=conversation_id
+            )
+        except Exception:
+            logger.exception("failed to persist user message for user %s", user_id)
+
     async def event_gen():
         assistant_parts: list[str] = []
         had_error = False
@@ -166,18 +175,18 @@ async def agent_chat(
                 yield f"data: {piece}\n\n"
         finally:
             reply = "".join(assistant_parts).strip()
+            # 有正文或错误文案都落库；中断且零字则仅保留已写入的用户句
             if latest_user and (reply or had_error):
                 try:
                     with SessionLocal() as persist_db:
-                        history_svc.append_turn(
+                        history_svc.append_assistant_message(
                             persist_db,
                             user_id,
-                            user_content=latest_user,
-                            assistant_content=reply,
+                            reply or "（已中断）",
                             conversation_id=conversation_id,
                         )
                 except Exception:
-                    logger.exception("failed to persist chat turn for user %s", user_id)
+                    logger.exception("failed to persist assistant reply for user %s", user_id)
 
     return StreamingResponse(
         event_gen(),

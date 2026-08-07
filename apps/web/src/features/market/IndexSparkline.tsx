@@ -7,7 +7,8 @@ type Props = {
   points: IntradayPoint[];
   prevClose?: number | null;
   changePct?: number | null;
-  session?: "cn" | "us" | string;
+  /** cn A-share · hk · us overnight · day24 · comex 外盘金(06:00→次日05:00) */
+  session?: "cn" | "us" | "hk" | "day24" | "comex" | string;
   label?: string;
   interactive?: boolean;
   compact?: boolean;
@@ -18,6 +19,11 @@ const CN_AM = 121;
 const HK_SLOTS = 331;
 const HK_AM = 151;
 const US_SLOTS = 390;
+/** One slot per minute — 00:00 … 23:59 (axis label ends at 24:00). */
+const DAY24_SLOTS = 24 * 60;
+/** COMEX/伦敦金电子盘（北京·夏令）：06:00 → 次日 05:00，约 23h；对齐东财 trendsTotal≈1381 */
+const COMEX_OPEN = 6 * 60;
+const COMEX_SLOTS = 23 * 60 + 1;
 
 /** Plot viewBox: labels overlay inside plot (not a side gutter). */
 const VB_W = 360;
@@ -82,6 +88,36 @@ function usTimeToSlot(hhmm: string): number | null {
   return null;
 }
 
+/** Full-day axis 00:00–24:00 (浙商/民生积存金等近全天品种). */
+function day24TimeToSlot(hhmm: string): number | null {
+  const parts = hhmm.split(":");
+  if (parts.length < 2) return null;
+  let h = Number(parts[0]);
+  const m = Number(parts[1]);
+  if (Number.isNaN(h) || Number.isNaN(m)) return null;
+  if (h === 24 && m === 0) return DAY24_SLOTS - 1;
+  if (h < 0 || h > 23 || m < 0 || m > 59) return null;
+  return Math.min(h * 60 + m, DAY24_SLOTS - 1);
+}
+
+/** 外盘金：06:00 开 → 跨零点 → 05:00 收；休市 05:00–06:00 不落点。 */
+function comexTimeToSlot(hhmm: string): number | null {
+  const parts = hhmm.split(":");
+  if (parts.length < 2) return null;
+  const h = Number(parts[0]);
+  const m = Number(parts[1]);
+  if (Number.isNaN(h) || Number.isNaN(m)) return null;
+  if (h < 0 || h > 23 || m < 0 || m > 59) return null;
+  const mins = h * 60 + m;
+  // 日切休市
+  if (mins > 5 * 60 && mins < COMEX_OPEN) return null;
+  let slot: number;
+  if (mins >= COMEX_OPEN) slot = mins - COMEX_OPEN;
+  else slot = 24 * 60 - COMEX_OPEN + mins;
+  if (slot < 0 || slot >= COMEX_SLOTS) return null;
+  return slot;
+}
+
 function fmtPrice(n: number): string {
   return n.toLocaleString("zh-CN", {
     minimumFractionDigits: 2,
@@ -110,13 +146,16 @@ type Built = {
   last: Coord | null;
   coords: Coord[];
   yTicks: { y: number; price: number; pct: number; isPrev: boolean }[];
-  yLabels: { y: number; price: number; pct: number; isPrev: boolean }[];
+  yLabels: { y: number; price: number; pct: number; isPrev: boolean; kind: "hi" | "prev" | "lo" }[];
   midX: number;
   prevY: number;
   up: boolean;
   prev: number;
   timeLabels: { slot: number; label: string }[];
   sessionSlots: number;
+  /** Actual series extreme coords for peak/trough markers */
+  hiCoord: Coord | null;
+  loCoord: Coord | null;
 };
 
 /** Split polyline at prev-close crossings: above → red, below → green. */
@@ -185,13 +224,39 @@ export function IndexSparkline({
   const [cursor, setCursor] = useState<Coord | null>(null);
   const isUs = session === "us";
   const isHk = session === "hk";
+  const isDay24 = session === "day24";
+  const isComex = session === "comex";
 
   const built = useMemo<Built | null>(() => {
     if (points.length < 2) return null;
 
-    const sessionSlots = isUs ? US_SLOTS : isHk ? HK_SLOTS : CN_SLOTS;
-    const midSlot = isUs ? Math.round(US_SLOTS / 2) : isHk ? HK_AM : CN_AM;
-    const toSlot = isUs ? usTimeToSlot : isHk ? hkTimeToSlot : cnTimeToSlot;
+    const sessionSlots = isUs
+      ? US_SLOTS
+      : isHk
+        ? HK_SLOTS
+        : isComex
+          ? COMEX_SLOTS
+          : isDay24
+            ? DAY24_SLOTS
+            : CN_SLOTS;
+    const midSlot = isUs
+      ? Math.round(US_SLOTS / 2)
+      : isHk
+        ? HK_AM
+        : isComex
+          ? Math.round(COMEX_SLOTS / 2)
+          : isDay24
+            ? 12 * 60
+            : CN_AM;
+    const toSlot = isUs
+      ? usTimeToSlot
+      : isHk
+        ? hkTimeToSlot
+        : isComex
+          ? comexTimeToSlot
+          : isDay24
+            ? day24TimeToSlot
+            : cnTimeToSlot;
     const timeLabels = isUs
       ? [
           { slot: 0, label: "21:30" },
@@ -208,13 +273,29 @@ export function IndexSparkline({
             { slot: HK_AM + 30, label: "13:30" },
             { slot: HK_SLOTS - 1, label: "16:00" },
           ]
-        : [
-            { slot: 0, label: "09:30" },
-            { slot: 60, label: "10:30" },
-            { slot: CN_AM, label: "11:30" },
-            { slot: CN_AM + 30, label: "13:30" },
-            { slot: CN_SLOTS - 1, label: "15:00" },
-          ];
+        : isComex
+          ? [
+              { slot: 0, label: "06:00" },
+              { slot: 6 * 60, label: "12:00" },
+              { slot: 12 * 60, label: "18:00" },
+              { slot: 18 * 60, label: "00:00" },
+              { slot: COMEX_SLOTS - 1, label: "05:00" },
+            ]
+          : isDay24
+            ? [
+                { slot: 0, label: "00:00" },
+                { slot: 6 * 60, label: "06:00" },
+                { slot: 12 * 60, label: "12:00" },
+                { slot: 18 * 60, label: "18:00" },
+                { slot: DAY24_SLOTS - 1, label: "24:00" },
+              ]
+            : [
+                { slot: 0, label: "09:30" },
+                { slot: 60, label: "10:30" },
+                { slot: CN_AM, label: "11:30" },
+                { slot: CN_AM + 30, label: "13:30" },
+                { slot: CN_SLOTS - 1, label: "15:00" },
+              ];
 
     const slotted: { slot: number; price: number; avg: number | null; time: string }[] = [];
     for (const p of points) {
@@ -224,19 +305,51 @@ export function IndexSparkline({
     }
     if (slotted.length < 2) {
       points.forEach((p, i) => {
+        const slot = Math.round((i / Math.max(points.length - 1, 1)) * (sessionSlots - 1));
+        const synth =
+          isDay24 || isComex
+            ? `${String(Math.floor(slot / 60)).padStart(2, "0")}:${String(slot % 60).padStart(2, "0")}`
+            : p.time;
         slotted.push({
-          slot: Math.round((i / Math.max(points.length - 1, 1)) * (sessionSlots - 1)),
+          slot,
           price: p.price,
           avg: p.avg ?? null,
-          time: p.time,
+          time: /^\d{1,2}:\d{2}/.test(p.time) ? p.time : synth,
         });
       });
     }
 
+    // AU9999 等：夜盘跨日折返时按顺序铺满；国际金用 comex 固定开收，不把右端改成「最新时刻」
+    let axisLabels = timeLabels;
+    if (isDay24 && slotted.length >= 2) {
+      let wraps = false;
+      for (let i = 1; i < slotted.length; i++) {
+        if (slotted[i].slot + 30 < slotted[i - 1].slot) {
+          wraps = true;
+          break;
+        }
+      }
+      if (wraps) {
+        const n = slotted.length;
+        for (let i = 0; i < n; i++) {
+          slotted[i] = {
+            ...slotted[i],
+            slot: Math.round((i / Math.max(n - 1, 1)) * (sessionSlots - 1)),
+          };
+        }
+        const at = (t: number) => slotted[Math.min(n - 1, Math.round(t * (n - 1)))];
+        axisLabels = [0, 0.25, 0.5, 0.75, 1].map((t) => {
+          const p = at(t);
+          return { slot: p.slot, label: p.time.slice(0, 5) };
+        });
+      }
+    }
     const prices = slotted.map((s) => s.price);
     const prev = prevClose && prevClose > 0 ? prevClose : prices[0];
-    let lo = Math.min(...prices, prev);
-    let hi = Math.max(...prices, prev);
+    const dataHi = Math.max(...prices);
+    const dataLo = Math.min(...prices);
+    let lo = Math.min(dataLo, prev);
+    let hi = Math.max(dataHi, prev);
     // Symmetric padding around range (East Money style)
     const spanRaw = hi - lo || prev * 0.002;
     const pad = Math.max(spanRaw * 0.08, prev * 0.0006);
@@ -268,7 +381,7 @@ export function IndexSparkline({
       yAt,
     );
 
-    // Grid lines (5) + compact labels (高 / 昨收 / 低 only — less clutter)
+    // Grid lines (5) + labels at real series 高 / 昨收 / 低
     const levels = [0, 0.25, 0.5, 0.75, 1].map((t) => hi - span * t);
     const yTicks = levels.map((price) => ({
       y: yAt(price),
@@ -290,10 +403,26 @@ export function IndexSparkline({
       nearest.y = prevY;
     }
 
-    const yLabels = [
-      { y: yAt(hi), price: hi, pct: ((hi - prev) / prev) * 100, isPrev: false },
-      { y: prevY, price: prev, pct: 0, isPrev: true },
-      { y: yAt(lo), price: lo, pct: ((lo - prev) / prev) * 100, isPrev: false },
+    // First occurrence of extremes (stable if flat)
+    const hiCoord = priceCoords.find((c) => c.price === dataHi) ?? null;
+    const loCoord = priceCoords.find((c) => c.price === dataLo) ?? null;
+
+    const yLabels: Built["yLabels"] = [
+      {
+        y: yAt(dataHi),
+        price: dataHi,
+        pct: ((dataHi - prev) / prev) * 100,
+        isPrev: false,
+        kind: "hi",
+      },
+      { y: prevY, price: prev, pct: 0, isPrev: true, kind: "prev" },
+      {
+        y: yAt(dataLo),
+        price: dataLo,
+        pct: ((dataLo - prev) / prev) * 100,
+        isPrev: false,
+        kind: "lo",
+      },
     ];
 
     const up = changePct != null ? changePct >= 0 : lastPt.price >= prev;
@@ -310,10 +439,12 @@ export function IndexSparkline({
       prevY,
       up,
       prev,
-      timeLabels,
+      timeLabels: axisLabels,
       sessionSlots,
+      hiCoord,
+      loCoord,
     };
-  }, [points, prevClose, changePct, isUs, isHk]);
+  }, [points, prevClose, changePct, isUs, isHk, isDay24, isComex]);
 
   function pickAtClientX(clientX: number) {
     if (!built || !svgRef.current) return;
@@ -418,20 +549,32 @@ export function IndexSparkline({
         strokeWidth={0.5}
       />
 
-      {/* Quiet grids */}
-      {built.yTicks.map((t, i) => (
-        <line
-          key={`yg-${i}`}
-          x1={PAD.left}
-          y1={t.y}
-          x2={PAD.left + PLOT_W}
-          y2={t.y}
-          stroke={t.isPrev ? C.prev : i === 0 || i === built.yTicks.length - 1 ? C.gridStrong : C.grid}
-          strokeWidth={t.isPrev ? 0.85 : 0.4}
-          strokeDasharray={t.isPrev ? "3.5 2.5" : undefined}
-          opacity={t.isPrev ? 1 : 0.8}
-        />
-      ))}
+      {/* Quiet grids — skip 昨收 slot; drawn separately */}
+      {built.yTicks
+        .filter((t) => !t.isPrev)
+        .map((t, i) => (
+          <line
+            key={`yg-${i}`}
+            x1={PAD.left}
+            y1={t.y}
+            x2={PAD.left + PLOT_W}
+            y2={t.y}
+            stroke={i === 0 || i === built.yTicks.filter((x) => !x.isPrev).length - 1 ? C.gridStrong : C.grid}
+            strokeWidth={0.4}
+            opacity={0.8}
+          />
+        ))}
+
+      {/* 昨收 — yellow reference (also drives red/green fill split) */}
+      <line
+        x1={PAD.left}
+        y1={built.prevY}
+        x2={PAD.left + PLOT_W}
+        y2={built.prevY}
+        stroke={C.prev}
+        strokeWidth={0.9}
+        strokeDasharray="3.5 2.5"
+      />
 
       {/* Midday divider */}
       <line
@@ -502,6 +645,47 @@ export function IndexSparkline({
           </>
         )}
       </g>
+
+      {/* High / low markers */}
+      {!tip &&
+        (
+          [
+            { c: built.hiCoord, kind: "hi" as const, fill: C.up },
+            { c: built.loCoord, kind: "lo" as const, fill: C.down },
+          ] as const
+        ).map(({ c, kind, fill }) => {
+          if (!c) return null;
+          const placeRight = c.x < PAD.left + PLOT_W * 0.7;
+          const tx = placeRight ? c.x + 5 : c.x - 5;
+          const ty =
+            kind === "hi"
+              ? Math.max(PAD.top + 9, c.y - 5)
+              : Math.min(PAD.top + PLOT_H - 1, c.y + 11);
+          return (
+            <g key={kind} pointerEvents="none">
+              <circle
+                cx={c.x}
+                cy={c.y}
+                r={2.2}
+                fill={fill}
+                stroke="rgba(0,0,0,0.35)"
+                strokeWidth={0.6}
+              />
+              <text
+                x={tx}
+                y={ty}
+                textAnchor={placeRight ? "start" : "end"}
+                fill={fill}
+                fontSize={9}
+                fontWeight={650}
+                fontFamily='ui-monospace, "SF Mono", Menlo, monospace'
+                style={{ paintOrder: "stroke", stroke: "rgba(12,12,14,0.72)", strokeWidth: 2.5 }}
+              >
+                {fmtPrice(c.price)}
+              </text>
+            </g>
+          );
+        })}
 
       {tip && (
         <g>
@@ -581,19 +765,18 @@ export function IndexSparkline({
       })}
       </svg>
       <div className="market-spark-yaxis" aria-hidden>
-        {built.yLabels.map((t, i) => {
-          const tone =
-            t.isPrev ? "is-prev" : t.pct > 0.01 ? "text-up" : t.pct < -0.01 ? "text-down" : "text-mute";
-          return (
+        {built.yLabels
+          .filter((t) => t.kind === "prev")
+          .map((t, i) => (
             <span
-              key={`yl-${i}`}
-              className={`market-spark-yaxis-tick ${tone}`}
+              key={`yl-prev-${i}`}
+              className="market-spark-yaxis-tick is-prev"
+              data-kind="prev"
               style={{ top: `${(t.y / VB_H) * 100}%` }}
             >
               {fmtPrice(t.price)}
             </span>
-          );
-        })}
+          ))}
       </div>
     </div>
   );

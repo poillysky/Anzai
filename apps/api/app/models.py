@@ -24,12 +24,21 @@ class Holding(Base):
     user_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
     symbol: Mapped[str] = mapped_column(String(16), index=True)
     name: Mapped[str] = mapped_column(String(64), default="")
-    market: Mapped[str] = mapped_column(String(8), default="SH")  # SH / SZ
+    market: Mapped[str] = mapped_column(String(8), default="SH")  # SH / SZ / JD（积存金）
     shares: Mapped[float] = mapped_column(Float, default=0)
     cost: Mapped[float] = mapped_column(Float, default=0)
     tags: Mapped[str] = mapped_column(String(128), default="")
     # First buy / position start — YYYY-MM-DD; default Shanghai today on create
     bought_at: Mapped[str] = mapped_column(String(10), default="")
+    # Same-day top-up lot (for 今日盈亏 split); reset when day_buy_asof ≠ Shanghai today
+    day_buy_shares: Mapped[float] = mapped_column(Float, default=0.0)
+    day_buy_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    day_buy_asof: Mapped[str] = mapped_column(String(10), default="")
+    # Broker cash-flow day P&L: SOD shares + today's buy/sell notional
+    sod_shares: Mapped[float] = mapped_column(Float, default=0.0)
+    sod_asof: Mapped[str] = mapped_column(String(10), default="")
+    day_buy_amount: Mapped[float] = mapped_column(Float, default=0.0)
+    day_sell_amount: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -71,6 +80,8 @@ class UserPreference(Base):
     # PWA「你是安崽的谁」— drives chat tone (dad → 跟爸爸说话)
     identity_role: Mapped[str] = mapped_column(String(32), default="")
     identity_label: Mapped[str] = mapped_column(String(32), default="")
+    # WeChat digest (Server酱 / PushPlus / WxPusher) — per-user JSON
+    notify_json: Mapped[str] = mapped_column(Text, default="{}")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )

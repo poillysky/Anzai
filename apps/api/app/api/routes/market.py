@@ -4,12 +4,30 @@ from sqlalchemy.orm import Session
 from app.core.auth import AuthUser, require_user
 from app.database import get_db
 from app.models import WatchlistItem
+from app.providers.gold import get_gold_board, list_gold_etfs
 from app.providers.intraday import get_intraday
 from app.providers.leaders import get_leaders
+from app.providers.macro import (
+    calendar_clock_line,
+    freshness_label,
+    get_macro_quotes,
+)
 from app.providers.quote import Quote, fetch_sina_int, get_quote, get_quotes, normalize_symbol
 from app.providers.search import search_symbols
 from app.providers.session import session_for_index_key
+from app.providers.short_bias import get_short_biases
+from app.providers.depth_flow import get_depth_flow
 from app.schemas import (
+    DepthFlowOut,
+    BookLevelOut,
+    GoldBoardItemOut,
+    GoldBoardOut,
+    GoldBoardSectionOut,
+    GoldEtfOut,
+    MoneyFlowDayOut,
+    MacroQuoteOut,
+    MacroTopicOut,
+    OrderBookOut,
     IndexQuoteOut,
     IntradayOut,
     IntradayPointOut,
@@ -19,6 +37,8 @@ from app.schemas import (
     SearchHitOut,
     SearchOut,
     SessionOut,
+    ShortBiasBatchOut,
+    ShortBiasOut,
     WatchlistCreate,
     WatchlistOut,
 )
@@ -119,6 +139,90 @@ def indices() -> list[IndexQuoteOut]:
     return out
 
 
+@router.get("/macro", response_model=MacroTopicOut)
+def market_macro(topic: str = Query(default="gold")) -> MacroTopicOut:
+    """Macro / commodity reference quotes (gold spot & futures are view-only)."""
+    topic_id, quotes, err = get_macro_quotes(topic or "gold")
+    # Drop A-share ETF rows here — they belong on /gold-etfs + detail modal
+    ref_quotes = [q for q in quotes if q.venue != "a_share"]
+    return MacroTopicOut(
+        topic=topic_id or (topic or "gold"),
+        calendar=calendar_clock_line(),
+        quotes=[
+            MacroQuoteOut(
+                key=q.key,
+                name=q.name,
+                price=q.price,
+                unit=q.unit,
+                change_pct=q.change_pct,
+                prev=q.prev,
+                as_of=q.as_of,
+                live=q.live,
+                venue=q.venue,
+                freshness=freshness_label(q.as_of, venue=q.venue),
+            )
+            for q in ref_quotes
+        ],
+        hint=err or "",
+        note="现货/外盘为参考价，不可入仓；下方黄金 ETF 可看分时并加入仓库",
+    )
+
+
+@router.get("/gold-etfs", response_model=list[GoldEtfOut])
+def gold_etfs() -> list[GoldEtfOut]:
+    """Curated holdable gold ETFs (A-share) for Market discovery."""
+    rows = list_gold_etfs()
+    return [
+        GoldEtfOut(
+            symbol=r.symbol,
+            market=r.market,
+            name=r.name,
+            price=r.price,
+            change_pct=r.change_pct,
+            prev_close=r.prev_close,
+        )
+        for r in rows
+    ]
+
+
+@router.get("/gold-board", response_model=GoldBoardOut)
+def gold_board() -> GoldBoardOut:
+    """Gold board: domestic (浙商/民生) / international (伦敦/纽约) / shop (周大福等门店)."""
+    board = get_gold_board()
+    return GoldBoardOut(
+        note=board.note,
+        sections=[
+            GoldBoardSectionOut(
+                id=sec.id,
+                title=sec.title,
+                subtitle=sec.subtitle,
+                items=[
+                    GoldBoardItemOut(
+                        id=it.id,
+                        name=it.name,
+                        section=it.section,
+                        price=it.price,
+                        change_pct=it.change_pct,
+                        prev=it.prev,
+                        unit=it.unit,
+                        freshness=it.freshness,
+                        note=it.note,
+                        holdable=it.holdable,
+                        symbol=it.symbol,
+                        market=it.market,
+                        chart=it.chart,
+                        chart_times=it.chart_times,
+                        chart_slots=it.chart_slots,
+                        chart_session=it.chart_session,
+                    )
+                    for it in sec.items
+                ],
+            )
+            for sec in board.sections
+        ],
+    )
+
+
 @router.get("/session", response_model=SessionOut)
 def market_session(key: str = Query(default="sh-composite")) -> SessionOut:
     """Trading session strip for the selected index tab."""
@@ -142,6 +246,7 @@ def intraday(
                 name=sym,
                 market="US",
                 prev_close=None,
+                open_price=None,
                 session="us",
                 points=[],
             )
@@ -152,6 +257,7 @@ def intraday(
             name=series.name or sym,
             market=series.market,
             prev_close=series.prev_close,
+            open_price=series.open_price,
             session=series.session,
             points=[IntradayPointOut(time=p.time, price=p.price, avg=p.avg) for p in series.points],
         )
@@ -172,8 +278,93 @@ def intraday(
         name=name,
         market=series.market,
         prev_close=series.prev_close,
+        open_price=series.open_price,
         session=series.session,
         points=[IntradayPointOut(time=p.time, price=p.price, avg=p.avg) for p in series.points],
+    )
+
+
+@router.get("/short-bias", response_model=ShortBiasBatchOut)
+def short_bias(
+    keys: str = Query(
+        ...,
+        description="Comma-separated MARKET:SYMBOL, e.g. SH:601138,SZ:159915",
+    ),
+) -> ShortBiasBatchOut:
+    """Batch ~5min short-horizon bias from 1-minute intraday (momentum, not forecast)."""
+    pairs: list[tuple[str, str]] = []
+    for raw in keys.split(","):
+        part = raw.strip()
+        if not part:
+            continue
+        if ":" in part:
+            mkt, sym = part.split(":", 1)
+            pairs.append((sym.strip(), mkt.strip().upper() or "SH"))
+        else:
+            sym, mkt = normalize_symbol(part, "SH")
+            pairs.append((sym, mkt))
+    items = get_short_biases(pairs)
+    return ShortBiasBatchOut(
+        items=[
+            ShortBiasOut(
+                symbol=b.symbol,
+                market=b.market,
+                bias=b.bias,
+                label=b.label,
+                score=b.score,
+                lookback_min=b.lookback_min,
+                sample_n=b.sample_n,
+                roc_pct=b.roc_pct,
+                as_of=b.as_of,
+            )
+            for b in items
+        ]
+    )
+
+
+@router.get("/depth-flow", response_model=DepthFlowOut)
+def depth_flow(
+    symbol: str = Query(..., min_length=1),
+    market: str = Query(default="SH"),
+    days: int = Query(default=5, ge=1, le=30),
+) -> DepthFlowOut:
+    """买卖五档 + 近几日资金流向（主力为成交额分档，非庄家）。"""
+    sym, mkt = normalize_symbol(symbol, market)
+    snap = get_depth_flow(sym, mkt, flow_days=days)
+    book_out = None
+    if snap.book:
+        book_out = OrderBookOut(
+            symbol=snap.book.symbol,
+            market=snap.book.market,
+            name=snap.book.name,
+            bids=[BookLevelOut(price=x.price, volume=x.volume) for x in snap.book.bids],
+            asks=[BookLevelOut(price=x.price, volume=x.volume) for x in snap.book.asks],
+            as_of=snap.book.as_of,
+            source=snap.book.source,
+            live=snap.book.live,
+        )
+    return DepthFlowOut(
+        symbol=snap.symbol,
+        market=snap.market,
+        name=snap.name,
+        book=book_out,
+        flow_days=[
+            MoneyFlowDayOut(
+                date=d.date,
+                main_net=d.main_net,
+                super_net=d.super_net,
+                large_net=d.large_net,
+                mid_net=d.mid_net,
+                small_net=d.small_net,
+                main_pct=d.main_pct,
+            )
+            for d in snap.flow_days
+        ],
+        flow_bias=snap.flow_bias,
+        flow_label=snap.flow_label,
+        session_state=snap.session_state,
+        book_live=snap.book_live,
+        note=snap.note,
     )
 
 

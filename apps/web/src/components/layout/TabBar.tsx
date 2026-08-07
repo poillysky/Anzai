@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  Bot,
   ChartColumn,
   ICON_SIZE_TAB,
   ICON_STROKE,
@@ -15,13 +14,17 @@ import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useTransition, type MouseEvent } from "react";
 import { warmTabRoutes } from "@/lib/prefetch";
 
+type Tab =
+  | { href: string; label: string; Icon: LucideIcon; avatar?: undefined }
+  | { href: string; label: string; Icon?: undefined; avatar: string };
+
 /** 五 Tab：仓库 / 股票 / 新闻 / 分析 / 安崽 — docs/界面设计.md §3 */
-const tabs: { href: string; label: string; Icon: LucideIcon }[] = [
+const tabs: Tab[] = [
   { href: "/", label: "仓库", Icon: Warehouse },
   { href: "/market", label: "股票", Icon: ChartColumn },
   { href: "/news", label: "新闻", Icon: Newspaper },
   { href: "/analysis", label: "分析", Icon: PieChart },
-  { href: "/agent", label: "安崽", Icon: Bot },
+  { href: "/agent", label: "安崽", avatar: "/avatars/anzai.png" },
 ];
 
 function isActive(pathname: string, href: string): boolean {
@@ -48,7 +51,6 @@ export function TabBar() {
     <nav className="tabbar" aria-label="主导航">
       {tabs.map((tab) => {
         const active = isActive(pathname, tab.href);
-        const Icon = tab.Icon;
         return (
           <Link
             key={tab.href}
@@ -63,7 +65,18 @@ export function TabBar() {
             }}
           >
             <span className="tab-icon" aria-hidden>
-              <Icon size={ICON_SIZE_TAB} strokeWidth={ICON_STROKE} absoluteStrokeWidth />
+              {tab.avatar ? (
+                <img
+                  className="tab-avatar"
+                  src={tab.avatar}
+                  alt=""
+                  width={ICON_SIZE_TAB}
+                  height={ICON_SIZE_TAB}
+                  draggable={false}
+                />
+              ) : tab.Icon ? (
+                <tab.Icon size={ICON_SIZE_TAB} strokeWidth={ICON_STROKE} absoluteStrokeWidth />
+              ) : null}
             </span>
             <span className="tab-label">{tab.label}</span>
           </Link>

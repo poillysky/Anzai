@@ -1,4 +1,4 @@
-"""Intraday (分时) trends via East Money."""
+"""Intraday (分时) trends via East Money — open + close resilient."""
 
 from __future__ import annotations
 
@@ -8,25 +8,12 @@ from dataclasses import dataclass
 
 import httpx
 
+from app.providers.eastmoney import EM_HEADERS, em_float, host_label, trends_urls
+
 logger = logging.getLogger(__name__)
 
 _CACHE: dict[str, tuple[float, "IntradaySeries"]] = {}
 _CACHE_TTL = 30.0
-
-# push2 often empty/unstable after close; push2delay keeps the day's series.
-_TRENDS_URLS = (
-    "https://push2.eastmoney.com/api/qt/stock/trends2/get",
-    "https://push2delay.eastmoney.com/api/qt/stock/trends2/get",
-    "https://push2his.eastmoney.com/api/qt/stock/trends2/get",
-)
-
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Referer": "https://quote.eastmoney.com/",
-}
 
 
 @dataclass
@@ -34,6 +21,7 @@ class IntradayPoint:
     time: str
     price: float
     avg: float | None = None
+    volume: float | None = None
 
 
 @dataclass
@@ -44,37 +32,49 @@ class IntradaySeries:
     prev_close: float | None
     points: list[IntradayPoint]
     session: str = "cn"  # cn | us | hk
+    open_price: float | None = None  # 今开
 
 
 def _secid(symbol: str, market: str, override: str | None = None) -> str:
     if override:
         return override
-    # East Money: SH=1.*, SZ=0.*
-    prefix = "1" if market.upper() == "SH" else "0"
-    return f"{prefix}.{symbol}"
+    mkt = market.upper()
+    sym = symbol.strip()
+    if mkt == "HK":
+        code = sym.zfill(5) if sym.isdigit() else sym
+        return f"116.{code}"
+    if mkt == "US":
+        return f"105.{sym}"
+    prefix = "1" if mkt == "SH" else "0"
+    return f"{prefix}.{sym}"
 
 
-def _parse_trends(data: dict) -> tuple[list[IntradayPoint], float | None, str | None]:
+def _parse_trends(data: dict) -> tuple[list[IntradayPoint], float | None, str | None, float | None]:
     """Parse EM trends2 payload. Row: time,open,close,high,low,vol,amount,avg."""
     trends = data.get("trends") or []
     points: list[IntradayPoint] = []
+    day_open: float | None = None
     for row in trends:
         parts = str(row).split(",")
         if len(parts) < 3:
             continue
         t = parts[0].split(" ")[-1] if " " in parts[0] else parts[0]
-        # Prefer 收盘 (close); fall back to 开盘 if close missing
-        close = float(parts[2] or 0) if parts[2] else 0.0
-        open_px = float(parts[1] or 0) if parts[1] else 0.0
-        price = close if close > 0 else open_px
-        if price <= 0:
+        close = em_float(parts[2]) if len(parts) > 2 else None
+        open_px = em_float(parts[1]) if len(parts) > 1 else None
+        if day_open is None and open_px and open_px > 0:
+            day_open = open_px
+        price = close if close and close > 0 else (open_px if open_px and open_px > 0 else None)
+        if price is None or price <= 0:
             continue
-        avg = float(parts[7]) if len(parts) > 7 and parts[7] else None
-        points.append(IntradayPoint(time=t, price=price, avg=avg))
-    prev = data.get("preClose")
-    prev_close = float(prev) if prev is not None else None
+        avg = em_float(parts[7]) if len(parts) > 7 else None
+        vol = em_float(parts[5]) if len(parts) > 5 else None
+        points.append(IntradayPoint(time=t, price=price, avg=avg, volume=vol))
+    prev_close = em_float(data.get("preClose"))
+    # Some payloads expose open on the root
+    if day_open is None:
+        day_open = em_float(data.get("open")) or em_float(data.get("openPrice"))
     name = data.get("name")
-    return points, prev_close, str(name) if name else None
+    return points, prev_close, str(name) if name else None, day_open
 
 
 def _fetch_em_trends(secid: str) -> dict | None:
@@ -86,8 +86,9 @@ def _fetch_em_trends(secid: str) -> dict | None:
         "ndays": "1",
     }
     last_err: Exception | None = None
-    with httpx.Client(timeout=8.0, headers=_HEADERS, follow_redirects=True) as client:
-        for url in _TRENDS_URLS:
+    best_empty: dict | None = None
+    with httpx.Client(timeout=8.0, headers=EM_HEADERS, follow_redirects=True) as client:
+        for url in trends_urls():
             try:
                 resp = client.get(url, params=params)
                 resp.raise_for_status()
@@ -95,21 +96,22 @@ def _fetch_em_trends(secid: str) -> dict | None:
                 trends = data.get("trends") or []
                 if trends:
                     return data
-                logger.info("Intraday empty from %s for %s", url.split("/")[2], secid)
+                # Keep a payload that at least has preClose (pre-open / after-hours edge)
+                if data and (data.get("preClose") is not None or data.get("name")):
+                    best_empty = data
+                logger.info("Intraday empty from %s for %s", host_label(url), secid)
             except Exception as exc:
                 last_err = exc
                 logger.warning(
                     "Intraday fetch miss %s for %s: %s",
-                    url.split("/")[2],
+                    host_label(url),
                     secid,
-                    exc,
+                    type(exc).__name__,
                 )
+    if best_empty is not None:
+        return best_empty
     if last_err is not None:
-        logger.exception(
-            "Intraday all hosts failed for %s",
-            secid,
-            exc_info=last_err,
-        )
+        logger.warning("Intraday all hosts failed for %s: %s", secid, type(last_err).__name__)
     return None
 
 
@@ -138,7 +140,12 @@ def get_intraday(
     secid = _secid(sym, mkt, em_secid)
     data = _fetch_em_trends(secid)
     if data:
-        points, prev_close, em_name = _parse_trends(data)
+        points, prev_close, em_name, day_open = _parse_trends(data)
+        # Pre-open: no trends yet — seed one flat point at 昨收 so chart isn't blank
+        if not points and prev_close and prev_close > 0:
+            points = [IntradayPoint(time="09:30", price=prev_close, avg=prev_close)]
+            if day_open is None:
+                day_open = prev_close
         series = IntradaySeries(
             symbol=sym,
             market=mkt,
@@ -146,9 +153,9 @@ def get_intraday(
             prev_close=prev_close,
             points=points,
             session=sess,
+            open_price=day_open,
         )
     else:
-        # Prefer empty over synthetic sawtooth — chart stays blank, hero quote still live
         logger.warning("Intraday unavailable for %s.%s; returning empty series", mkt, sym)
         series = IntradaySeries(
             symbol=sym,
@@ -157,6 +164,7 @@ def get_intraday(
             prev_close=None,
             points=[],
             session=sess,
+            open_price=None,
         )
 
     _CACHE[cache_key] = (now, series)
@@ -181,7 +189,6 @@ def format_intraday_summary(
     chg = None
     if prev and prev > 0:
         chg = round((last / prev - 1) * 100, 2)
-    # Rough shape: compare last third vs first third
     n = len(prices)
     a = sum(prices[: max(1, n // 3)]) / max(1, n // 3)
     b = sum(prices[-max(1, n // 3) :]) / max(1, n // 3)

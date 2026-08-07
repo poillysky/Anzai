@@ -38,4 +38,44 @@ def quote_is_for_shanghai_today(as_of: str | None) -> bool:
     d = parse_as_of_date(as_of)
     if d is None:
         return True
-    return d >= shanghai_today()
+    return d == shanghai_today()
+
+
+def a_share_day_label(as_of: str | None) -> str:
+    """Evidence / prompt tag so models don't call last session 「今日」."""
+    d = parse_as_of_date(as_of)
+    today = shanghai_today()
+    if d is None:
+        return "时间未知"
+    if d == today:
+        return "今日"
+    return f"收盘·{d.isoformat()}（非今日）"
+
+
+def normalize_a_share_day_move(
+    change_pct: float | None,
+    as_of: str | None,
+) -> dict[str, float | str | bool | None]:
+    """Split calendar-today move vs last printed session move.
+
+    Cross-calendar stale quotes: today move = 0; keep last session % under
+    ``last_session_change_pct`` with an explicit non-今日 label.
+    """
+    fresh = quote_is_for_shanghai_today(as_of)
+    label = a_share_day_label(as_of)
+    raw = float(change_pct) if isinstance(change_pct, (int, float)) else None
+    if fresh:
+        return {
+            "fresh_today": True,
+            "day_label": label,
+            "change_pct": raw,
+            "last_session_change_pct": raw,
+            "as_of": as_of,
+        }
+    return {
+        "fresh_today": False,
+        "day_label": label,
+        "change_pct": 0.0 if raw is not None else None,
+        "last_session_change_pct": raw,
+        "as_of": as_of,
+    }

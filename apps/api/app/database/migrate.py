@@ -59,7 +59,7 @@ def claim_orphan_rows(engine: Engine, user_id: int) -> int:
 
 
 def ensure_preference_identity_columns(engine: Engine) -> None:
-    """ADD identity_role / identity_label on preferences when missing."""
+    """ADD identity_role / identity_label / notify_json on preferences when missing."""
     cols = _table_columns(engine, "preferences")
     if not cols:
         return
@@ -70,6 +70,10 @@ def ensure_preference_identity_columns(engine: Engine) -> None:
         if "identity_label" not in cols:
             logger.info("migrate: adding identity_label to preferences")
             conn.execute(text("ALTER TABLE preferences ADD COLUMN identity_label VARCHAR(32) DEFAULT ''"))
+        cols2 = _table_columns(engine, "preferences")
+        if "notify_json" not in cols2:
+            logger.info("migrate: adding notify_json to preferences")
+            conn.execute(text("ALTER TABLE preferences ADD COLUMN notify_json TEXT DEFAULT '{}'"))
 
 
 def ensure_holdings_bought_at(engine: Engine) -> None:
@@ -95,6 +99,28 @@ def ensure_holdings_bought_at(engine: Engine) -> None:
             )
         except Exception as exc:
             logger.warning("migrate: bought_at backfill skipped: %s", exc)
+
+
+def ensure_holdings_day_buy_lot(engine: Engine) -> None:
+    """ADD day-lot + SOD cash-flow columns for broker-style 今日盈亏."""
+    cols = _table_columns(engine, "holdings")
+    if not cols:
+        return
+    with engine.begin() as conn:
+        patches = (
+            ("day_buy_shares", "FLOAT DEFAULT 0"),
+            ("day_buy_cost", "FLOAT DEFAULT 0"),
+            ("day_buy_asof", "VARCHAR(10) DEFAULT ''"),
+            ("sod_shares", "FLOAT DEFAULT 0"),
+            ("sod_asof", "VARCHAR(10) DEFAULT ''"),
+            ("day_buy_amount", "FLOAT DEFAULT 0"),
+            ("day_sell_amount", "FLOAT DEFAULT 0"),
+        )
+        for name, decl in patches:
+            if name not in cols:
+                logger.info("migrate: adding %s to holdings", name)
+                conn.execute(text(f"ALTER TABLE holdings ADD COLUMN {name} {decl}"))
+                cols = _table_columns(engine, "holdings")
 
 
 def dedupe_preferences(engine: Engine) -> int:

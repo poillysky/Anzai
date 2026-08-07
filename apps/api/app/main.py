@@ -5,20 +5,25 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routes import admin, agent, analysis, auth, health, holdings, market, me, news
+from app.api.routes import admin, agent, analysis, auth, health, holdings, market, me, news, notify
 from app.core.config import get_settings
 from app.database import init_db
+from app.services.notify_scheduler import start_notify_scheduler, stop_notify_scheduler
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
-    yield
+    start_notify_scheduler()
+    try:
+        yield
+    finally:
+        stop_notify_scheduler()
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    app = FastAPI(title="安崽ETF API", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="安崽 API", version="0.1.0", lifespan=lifespan)
     origins = list(dict.fromkeys(settings.cors_origin_list))
     app.add_middleware(
         CORSMiddleware,
@@ -48,6 +53,7 @@ def create_app() -> FastAPI:
     app.include_router(analysis.router, prefix="/api")
     app.include_router(me.router, prefix="/api")
     app.include_router(agent.router, prefix="/api")
+    app.include_router(notify.router, prefix="/api")
     app.include_router(admin.router)
     return app
 

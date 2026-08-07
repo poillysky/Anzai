@@ -16,7 +16,7 @@ export const metadata: Metadata = {
     capable: true,
     // Draw under notch — hero/cream fills 刘海; chrome uses safe-area padding
     statusBarStyle: "black-translucent",
-    title: "安崽ETF",
+    title: "安崽",
   },
 };
 

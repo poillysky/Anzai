@@ -18,9 +18,16 @@ EDITABLE_KEYS = (
     "LLM_API_KEY",
     "LLM_BASE_URL",
     "LLM_MODEL",
+    "LLM_ANALYSIS_BASE_URL",
+    "LLM_ANALYSIS_API_KEY",
+    "LLM_ANALYSIS_MODEL",
+    "LLM_EMBEDDING_BASE_URL",
+    "LLM_EMBEDDING_API_KEY",
+    "LLM_EMBEDDING_MODEL",
     "QUOTE_PROVIDER",
     "CORS_ORIGINS",
     "DATABASE_URL",
+    "KNOWLEDGE_DATABASE_URL",
 )
 
 
@@ -56,7 +63,7 @@ def write_env_updates(updates: dict[str, str]) -> Path:
 
     # Preserve unknown keys from existing file order when possible
     lines: list[str] = [
-        "# 安崽ETF — managed by /admin (do not commit secrets)",
+        "# 安崽 — managed by /admin (do not commit secrets)",
         "",
     ]
     written: set[str] = set()
@@ -97,9 +104,16 @@ def public_settings_view() -> dict[str, str | bool]:
         "LLM_API_KEY_SET": bool((s.llm_api_key or "").strip()),
         "LLM_BASE_URL": s.llm_base_url,
         "LLM_MODEL": s.llm_model,
+        "LLM_ANALYSIS_BASE_URL": s.llm_analysis_base_url,
+        "LLM_ANALYSIS_API_KEY_SET": bool((s.llm_analysis_api_key or "").strip()),
+        "LLM_ANALYSIS_MODEL": s.llm_analysis_model,
+        "LLM_EMBEDDING_BASE_URL": s.llm_embedding_base_url,
+        "LLM_EMBEDDING_API_KEY_SET": bool((s.llm_embedding_api_key or "").strip()),
+        "LLM_EMBEDDING_MODEL": s.llm_embedding_model,
         "QUOTE_PROVIDER": s.quote_provider,
         "CORS_ORIGINS": s.cors_origins,
         "DATABASE_URL": s.database_url,
+        "KNOWLEDGE_DATABASE_URL": s.knowledge_database_url,
     }
 
 

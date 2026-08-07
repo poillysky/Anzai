@@ -131,9 +131,11 @@ def compose_system_prompt(
         "「今天」以【日历】或行情时间标签为准；标了非今日的是昨收，必须说清。"
     )
     parts.append(
-        "【表达】心里专业、嘴上白话。"
+        "【表达】心里专业、嘴上白话。禁研报体。"
         "禁止用一对星号做 Markdown 加粗（尤其包数字）；"
-        "数字写进口语句子，有判断、有依据，但不念术语清单。"
+        "禁止小标题/项目符号/编号操作清单；"
+        "数字写进口语句子，有判断、有依据，但不念术语清单；"
+        "没在工具结果里出现的宏观指标不许编。"
     )
     return "\n\n".join(parts)
 
@@ -235,6 +237,7 @@ def load_presets() -> dict[str, Any]:
                 or "倾向性建议" not in prompt
                 or "禁止用 Markdown 加粗" not in prompt
                 or "别只回两三个字" not in prompt
+                or "禁研报体" not in prompt
                 or float(chosen.get("temperature") or 0) < 0.95
                 or int(chosen.get("max_tokens") or 0) < 2048
                 or "禁死板套路" in prompt

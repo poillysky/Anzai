@@ -42,16 +42,26 @@ class Quote:
 
 
 def normalize_symbol(symbol: str, market: str | None = None) -> tuple[str, str]:
-    s = symbol.strip().upper()
-    s = re.sub(r"^(SH|SZ|HK|US)", "", s)
+    s = symbol.strip()
+    m_in = (market or "").strip().upper()
+    # 积存金：catalog id（zs-jcj）或 JD sku，不走 A 股推断
+    if m_in == "JD":
+        return s.lower(), "JD"
+    s = s.upper()
+    s = re.sub(r"^(SH|SZ|HK|US|JD)", "", s)
     if market:
         m = market.upper()
     elif s in _INDEX_DEFAULT_MARKET:
         m = _INDEX_DEFAULT_MARKET[s]
+    elif re.fullmatch(r"\d{5}", s):
+        # 五位代码按港股（00700）；A 股为六位
+        m = "HK"
     elif s.startswith(("5", "6", "9")):
         m = "SH"
     else:
         m = "SZ"
+    if m == "HK" and s.isdigit():
+        s = s.zfill(5)
     return s, m
 
 
@@ -107,11 +117,13 @@ def _parse_sina_a(line: str) -> Quote | None:
         name = parts[0]
         prev_close = float(parts[2] or 0)
         price = float(parts[3] or 0)
+        # Pre-open: Sina often leaves price=0 on SZ indices — fall back to prev close
+        # then recompute change (0.00% flat) so UI doesn't show "--".
+        if price <= 0 and prev_close > 0:
+            price = prev_close
         change_pct = None
         if prev_close > 0 and price > 0:
             change_pct = round((price - prev_close) / prev_close * 100, 2)
-        if price <= 0 and prev_close > 0:
-            price = prev_close
         if price <= 0:
             return _empty_quote(symbol, market, name)
         return Quote(
@@ -289,12 +301,21 @@ def get_quotes(items: list[tuple[str, str]]) -> dict[str, Quote]:
     now = time.time()
     use_mock = (get_settings().quote_provider or "sina").strip().lower() == "mock"
     pending: list[tuple[str, str]] = []
+    pending_jd: list[str] = []
     out: dict[str, Quote] = {}
 
     for symbol, market in items:
         sym, mkt = normalize_symbol(symbol, market)
         if use_mock:
             out[sym] = _mock_quote(sym, mkt)
+            continue
+        if mkt == "JD":
+            cache_key = f"JD:{sym}"
+            cached = _CACHE.get(cache_key)
+            if cached and now - cached[0] < _CACHE_TTL:
+                out[sym] = cached[1]
+            else:
+                pending_jd.append(sym)
             continue
         # Unsupported markets for sina A/HK batch (US uses other helpers)
         if mkt not in ("SH", "SZ", "HK"):
@@ -320,6 +341,22 @@ def get_quotes(items: list[tuple[str, str]]) -> dict[str, Quote]:
                 q = _empty_quote(sym, mkt, (q.name if q else "") or sym)
                 logger.warning("No live quote for %s:%s", mkt, sym)
             _CACHE[f"{mkt}:{sym}"] = (now, q)
+            out[sym] = q
+
+    if pending_jd:
+        try:
+            from app.providers.gold import get_jd_holding_quotes
+
+            jd_fetched = get_jd_holding_quotes(pending_jd)
+        except Exception:
+            logger.exception("JD gold quote fetch failed")
+            jd_fetched = {}
+        for sym in pending_jd:
+            q = jd_fetched.get(sym)
+            if q is None or not q.live or q.price <= 0:
+                q = _empty_quote(sym, "JD", (q.name if q else "") or sym)
+                logger.warning("No live quote for JD:%s", sym)
+            _CACHE[f"JD:{sym}"] = (now, q)
             out[sym] = q
 
     return out

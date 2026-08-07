@@ -1,12 +1,17 @@
 "use client";
 
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { History, MessageSquare, Plus, Settings } from "@/components/ui/icons";
+import { History, MessageSquare, Mic, MicOff, Plus, Settings } from "@/components/ui/icons";
 import { useOverlay } from "@/components/overlay/OverlayContext";
 import { api } from "@/lib/api";
 import { haptics } from "@/lib/haptics";
+import { useSpeechDictation } from "@/hooks/useSpeechDictation";
 import type { AnzaiIdentity } from "@/lib/types";
 import { AgentHistory } from "@/features/agent/AgentHistory";
+import {
+  AgentResultCards,
+  type AgentCard,
+} from "@/features/agent/AgentResultCards";
 import {
   AgentSettings,
   type AgentSettingsPage,
@@ -17,6 +22,8 @@ type ChatMsg = {
   role: "user" | "assistant";
   content: string;
   toolNote?: string;
+  toolSteps?: string[];
+  cards?: AgentCard[];
 };
 type StackPage = "chat" | "history" | AgentSettingsPage;
 
@@ -26,6 +33,12 @@ function greetBubble(text: string): ChatMsg {
     role: "assistant",
     content: text || "嗨嗨，安崽来啦～想聊啥跟安崽说呀。",
   };
+}
+
+function isAgentCard(raw: unknown): raw is AgentCard {
+  if (!raw || typeof raw !== "object") return false;
+  const kind = (raw as { kind?: string }).kind;
+  return kind === "portfolio" || kind === "rebalance" || kind === "analysis";
 }
 
 /** 安崽真人对话：多会话 + 气泡线程 + Push 设置 */
@@ -43,6 +56,37 @@ export default function AgentScreen() {
   const abortRef = useRef<AbortController | null>(null);
   const streamingRef = useRef(false);
   streamingRef.current = streaming;
+  const voiceBaseRef = useRef("");
+
+  const onVoiceTranscript = useCallback((text: string) => {
+    const base = voiceBaseRef.current;
+    const joined = !base ? text : /[\s\u3000]$/.test(base) ? `${base}${text}` : `${base} ${text}`;
+    setInput(joined);
+  }, []);
+
+  const {
+    listening: voiceListening,
+    toggle: toggleVoice,
+    stop: stopVoice,
+  } = useSpeechDictation({
+    lang: "zh-CN",
+    onTranscript: onVoiceTranscript,
+    onUnsupported: () => {
+      toast("当前环境不支持网页语音，可用系统键盘上的麦克风", "warning");
+    },
+    onError: (msg) => toast(msg, "warning"),
+  });
+
+  const onMicClick = useCallback(() => {
+    if (streaming) return;
+    haptics.tap();
+    if (voiceListening) {
+      stopVoice();
+      return;
+    }
+    voiceBaseRef.current = input;
+    toggleVoice();
+  }, [input, streaming, stopVoice, toggleVoice, voiceListening]);
 
   const push = useCallback((next: StackPage) => {
     setStack((s) => (s[s.length - 1] === next ? s : [...s, next]));
@@ -99,15 +143,22 @@ export default function AgentScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- mount only
   }, []);
 
+  // 仅真正卸载时中断（登录页卸掉 TabCache）。Tab 切换由 TabCache 保活，不应走到这里。
   useEffect(() => {
-    return () => abortRef.current?.abort();
+    return () => {
+      abortRef.current?.abort();
+    };
   }, []);
 
-  useEffect(() => {
+  const pinThreadBottom = useCallback(() => {
     const el = threadRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [messages, streaming]);
+  }, []);
+
+  useEffect(() => {
+    pinThreadBottom();
+  }, [messages, streaming, pinThreadBottom]);
 
   const onIdentitySaved = useCallback((data: AnzaiIdentity, nextGreeting: string) => {
     setIdentity(data);
@@ -129,13 +180,13 @@ export default function AgentScreen() {
       await api.clearAgentMessages();
       const created = await api.createAgentConversation(false);
       setConversationId(created.conversation.id);
-      setMessages([greetBubble(greeting || "清空啦～安崽又在这儿，想聊啥呀？")]);
+      await loadSession(created.conversation.id, { force: true });
       haptics.success();
       toast("对话记录已清空", "success");
     } catch (e) {
       toast(e instanceof Error ? e.message : "清空失败", "warning");
     }
-  }, [greeting, toast]);
+  }, [loadSession, toast]);
 
   const startNewConversation = useCallback(async () => {
     if (streaming) {
@@ -146,14 +197,14 @@ export default function AgentScreen() {
       abortRef.current?.abort();
       const res = await api.createAgentConversation(true);
       setConversationId(res.conversation.id);
-      setMessages([greetBubble(greeting || "新对话开始啦～安崽在呢，想聊啥？")]);
+      await loadSession(res.conversation.id, { force: true });
       setStack(["chat"]);
       haptics.success();
       toast("已开新对话", "success");
     } catch (e) {
       toast(e instanceof Error ? e.message : "新开失败", "warning");
     }
-  }, [greeting, streaming, toast]);
+  }, [loadSession, streaming, toast]);
 
   const switchConversation = useCallback(
     async (id: number) => {
@@ -190,6 +241,7 @@ export default function AgentScreen() {
       setMessages([...next, { id: assistantId, role: "assistant", content: "" }]);
       setInput("");
       setStreaming(true);
+      stopVoice();
       haptics.tap();
 
       const history = [...next]
@@ -204,31 +256,45 @@ export default function AgentScreen() {
       let sawError = false;
       let sawDone = false;
 
-      const applyAssistant = (body: string, toolNote?: string) => {
+      const applyAssistant = (
+        body: string,
+        opts?: { toolNote?: string; toolSteps?: string[]; cards?: AgentCard[] },
+      ) => {
         setMessages((prev) => {
           const idx = prev.findIndex((m) => m.id === assistantId);
+          const patch: ChatMsg = {
+            id: assistantId,
+            role: "assistant",
+            content: body,
+            ...(opts?.toolNote !== undefined ? { toolNote: opts.toolNote } : {}),
+            ...(opts?.toolSteps !== undefined ? { toolSteps: opts.toolSteps } : {}),
+            ...(opts?.cards !== undefined ? { cards: opts.cards } : {}),
+          };
           if (idx >= 0) {
             const copy = prev.slice();
-            copy[idx] = {
-              ...copy[idx],
-              content: body,
-              ...(toolNote !== undefined ? { toolNote } : {}),
-            };
+            copy[idx] = { ...copy[idx], ...patch, content: body };
+            if (opts?.toolNote === undefined) delete (copy[idx] as { toolNote?: string }).toolNote;
+            if (opts?.toolNote !== undefined) copy[idx].toolNote = opts.toolNote;
+            if (opts?.toolSteps !== undefined) copy[idx].toolSteps = opts.toolSteps;
+            if (opts?.cards !== undefined) copy[idx].cards = opts.cards;
             return copy;
           }
-          return [
-            ...prev.filter((m) => m.id !== assistantId),
-            {
-              id: assistantId,
-              role: "assistant" as const,
-              content: body,
-              ...(toolNote ? { toolNote } : {}),
-            },
-          ];
+          return [...prev.filter((m) => m.id !== assistantId), patch];
         });
       };
 
       let toolNote = "";
+      const toolSteps: string[] = [];
+      const cards: AgentCard[] = [];
+      /** Placeholder ack until model tokens arrive (analysis start). */
+      let analysisAckPinned = false;
+
+      const pushStep = (label: string) => {
+        if (!label) return;
+        if (toolSteps[toolSteps.length - 1] === label) return;
+        toolSteps.push(label);
+        if (toolSteps.length > 8) toolSteps.shift();
+      };
 
       try {
         await api.streamAgentChat(
@@ -240,27 +306,75 @@ export default function AgentScreen() {
             if (ev.type === "tool_start" || ev.type === "tool_status") {
               const label = typeof ev.label === "string" ? ev.label : "查询中";
               toolNote = label;
-              applyAssistant(assembled, toolNote);
+              pushStep(label);
+              applyAssistant(assembled, {
+                toolNote,
+                toolSteps: [...toolSteps],
+                cards: [...cards],
+              });
             } else if (ev.type === "tool_result") {
               const label = typeof ev.label === "string" ? ev.label : "已查到";
               toolNote = `${label} · 完成`;
-              applyAssistant(assembled, toolNote);
+              pushStep(`${label} · 完成`);
+              applyAssistant(assembled, {
+                toolNote,
+                toolSteps: [...toolSteps],
+                cards: [...cards],
+              });
+            } else if (ev.type === "card" && isAgentCard(ev.card)) {
+              const kind = ev.card.kind;
+              const idx = cards.findIndex((c) => c.kind === kind);
+              if (idx >= 0) cards[idx] = ev.card;
+              else cards.push(ev.card);
+              if (ev.card.kind === "analysis") {
+                const ack =
+                  (typeof ev.card.ack === "string" && ev.card.ack.trim()) ||
+                  "已经在分析了，你可以继续聊；去「分析」页也能看进度。";
+                toast(ack, "success");
+                if (!assembled) {
+                  assembled = ack;
+                  analysisAckPinned = true;
+                }
+              }
+              applyAssistant(assembled, {
+                toolNote: toolNote || undefined,
+                toolSteps: [...toolSteps],
+                cards: [...cards],
+              });
             } else if (ev.type === "token") {
               const piece = typeof ev.text === "string" ? ev.text : "";
               if (!piece) return;
-              assembled += piece;
-              applyAssistant(assembled, toolNote || undefined);
+              if (analysisAckPinned) {
+                assembled = piece;
+                analysisAckPinned = false;
+              } else {
+                assembled += piece;
+              }
+              applyAssistant(assembled, {
+                toolNote: toolNote || undefined,
+                toolSteps: [...toolSteps],
+                cards: [...cards],
+              });
             } else if (ev.type === "error") {
               sawError = true;
               const msg = ev.message || "生成失败";
               toast(msg, "warning");
               if (!assembled) {
                 assembled = `（出错）${msg}`;
-                applyAssistant(assembled);
+                applyAssistant(assembled, {
+                  toolSteps: [...toolSteps],
+                  cards: [...cards],
+                });
               }
             } else if (ev.type === "done") {
               sawDone = true;
-              if (assembled) applyAssistant(assembled, "");
+              if (assembled) {
+                applyAssistant(assembled, {
+                  toolNote: "",
+                  toolSteps: [...toolSteps],
+                  cards: [...cards],
+                });
+              }
             }
           },
           ac.signal,
@@ -283,16 +397,17 @@ export default function AgentScreen() {
         setStreaming(false);
       }
     },
-    [conversationId, identity, messages, push, streaming, toast],
+    [conversationId, identity, messages, push, stopVoice, streaming, toast],
   );
 
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
+    stopVoice();
     void send(input);
   };
 
   const overlayOpen = page !== "chat";
-  const settingsOpen = page === "settings" || page === "account" || page === "identity";
+  const settingsOpen = page === "settings" || page === "account" || page === "identity" || page === "notify";
   const historyOpen = page === "history";
 
   return (
@@ -343,60 +458,103 @@ export default function AgentScreen() {
           </div>
         </header>
 
-        <section className="agent-thread" aria-label="对话">
-          <div className="agent-thread-body" ref={threadRef}>
-            {messages.length === 0 ? (
-              <div className="agent-thread-empty">
-                <MessageSquare size={22} strokeWidth={1.75} absoluteStrokeWidth aria-hidden />
-                <p>{greeting || "嗨嗨，安崽来啦～想聊啥跟安崽说呀。"}</p>
-              </div>
-            ) : null}
-            {messages.map((m) => (
-              <div
-                key={m.id}
-                className={`agent-bubble-row ${m.role === "user" ? "is-user" : "is-bot"}`}
-              >
-                {m.role === "assistant" ? (
-                  <span className="agent-avatar" aria-hidden>
-                    <img src="/avatars/anzai.png" alt="" width={32} height={32} />
-                  </span>
-                ) : null}
-                <div
-                  className={`agent-bubble ${m.role === "user" ? "agent-bubble-user" : "agent-bubble-bot"}`}
-                >
-                  {m.toolNote ? <div className="agent-tool-note">{m.toolNote}</div> : null}
-                  {m.content || (streaming ? "…" : "")}
+        <div className="agent-kb-lift">
+          <section className="agent-thread" aria-label="对话">
+            <div className="agent-thread-body" ref={threadRef}>
+              {messages.length === 0 ? (
+                <div className="agent-thread-empty">
+                  <MessageSquare size={22} strokeWidth={1.75} absoluteStrokeWidth aria-hidden />
+                  <p>{greeting || "嗨嗨，安崽来啦～想聊啥跟安崽说呀。"}</p>
                 </div>
-              </div>
-            ))}
-          </div>
-        </section>
+              ) : null}
+              {messages.map((m) => (
+                <div
+                  key={m.id}
+                  className={`agent-bubble-row ${m.role === "user" ? "is-user" : "is-bot"}`}
+                >
+                  {m.role === "assistant" ? (
+                    <span className="agent-avatar" aria-hidden>
+                      <img src="/avatars/anzai.png" alt="" width={32} height={32} />
+                    </span>
+                  ) : null}
+                  <div
+                    className={`agent-bubble ${m.role === "user" ? "agent-bubble-user" : "agent-bubble-bot"}`}
+                  >
+                    {m.toolSteps && m.toolSteps.length > 0 ? (
+                      <div className="agent-tool-steps" aria-label="查询步骤">
+                        {m.toolSteps.map((step, i) => (
+                          <span key={`${step}-${i}`} className="agent-tool-step">
+                            {step}
+                          </span>
+                        ))}
+                      </div>
+                    ) : m.toolNote ? (
+                      <div className="agent-tool-note">{m.toolNote}</div>
+                    ) : null}
+                    {m.cards && m.cards.length > 0 ? (
+                      <AgentResultCards cards={m.cards} />
+                    ) : null}
+                    {m.content ? (
+                      <div className="agent-bubble-text">{m.content}</div>
+                    ) : streaming && m.role === "assistant" ? (
+                      <div
+                        className="agent-thinking"
+                        aria-live="polite"
+                        aria-label="安崽思考中"
+                      >
+                        <span className="agent-thinking-label">安崽在想</span>
+                        <span className="agent-thinking-dots" aria-hidden>
+                          <i />
+                          <i />
+                          <i />
+                        </span>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
 
-        <form className="agent-composer-shell" onSubmit={onSubmit}>
-          <input
-            className="agent-composer-input"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onFocus={() => {
-              window.requestAnimationFrame(() => {
-                const el = threadRef.current;
-                if (el) el.scrollTop = el.scrollHeight;
-              });
-              window.setTimeout(() => {
-                const el = threadRef.current;
-                if (el) el.scrollTop = el.scrollHeight;
-              }, 280);
-            }}
-            placeholder="跟安崽聊仓位…"
-            disabled={streaming}
-            autoCapitalize="none"
-            autoCorrect="off"
-            enterKeyHint="send"
-          />
-          <button type="submit" className="agent-send" disabled={streaming || !input.trim()}>
-            发送
-          </button>
-        </form>
+          <form className="agent-composer-shell" onSubmit={onSubmit}>
+            <div className="agent-composer-row">
+              <button
+                type="button"
+                className="agent-mic"
+                data-listening={voiceListening ? "1" : "0"}
+                aria-label={voiceListening ? "停止语音输入" : "语音输入"}
+                aria-pressed={voiceListening}
+                disabled={streaming}
+                onClick={onMicClick}
+              >
+                {voiceListening ? (
+                  <MicOff size={20} strokeWidth={2} absoluteStrokeWidth aria-hidden />
+                ) : (
+                  <Mic size={20} strokeWidth={2} absoluteStrokeWidth aria-hidden />
+                )}
+              </button>
+              <input
+                className="agent-composer-input"
+                value={input}
+                onChange={(e) => {
+                  if (voiceListening) stopVoice();
+                  setInput(e.target.value);
+                }}
+                onFocus={() => {
+                  window.requestAnimationFrame(pinThreadBottom);
+                }}
+                placeholder={voiceListening ? "正在听…" : "跟安崽聊仓位…"}
+                disabled={streaming}
+                autoCapitalize="none"
+                autoCorrect="off"
+                enterKeyHint="send"
+              />
+              <button type="submit" className="agent-send" disabled={streaming || !input.trim()}>
+                发送
+              </button>
+            </div>
+          </form>
+        </div>
       </div>
 
       {historyOpen ? (

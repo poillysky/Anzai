@@ -10,4 +10,4 @@ router = APIRouter(tags=["health"])
 @router.get("/health", response_model=HealthOut)
 def health() -> HealthOut:
     settings = get_settings()
-    return HealthOut(status="ok", app="anzai-etf", quote_provider=provider_name() or settings.quote_provider)
+    return HealthOut(status="ok", app="anzai", quote_provider=provider_name() or settings.quote_provider)

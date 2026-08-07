@@ -218,9 +218,24 @@ def append_turn(
     a = (assistant_content or "").strip()
     if not u:
         return
+    conv = append_user_message(db, user_id, u, conversation_id=conversation_id)
+    if a and conv is not None:
+        append_assistant_message(db, user_id, a, conversation_id=conv.id)
+
+
+def append_user_message(
+    db: Session,
+    user_id: int,
+    user_content: str,
+    *,
+    conversation_id: int | None = None,
+) -> AgentConversation | None:
+    """Persist user turn immediately (before / during stream)."""
+    u = (user_content or "").strip()
+    if not u:
+        return None
     conv = resolve_conversation(db, user_id, conversation_id)
     if conv.status == "closed":
-        # 关闭会话不再写入；落到新开会话
         conv = create_conversation(db, user_id, close_current=False)
     if (conv.title or "新对话") == "新对话":
         conv.title = _title_from_text(u)
@@ -233,15 +248,34 @@ def append_turn(
             content=u[:8000],
         )
     )
-    if a:
-        db.add(
-            AgentMessage(
-                user_id=user_id,
-                conversation_id=conv.id,
-                role="assistant",
-                content=a[:16000],
-            )
+    db.commit()
+    _prune(db, user_id, conv.id)
+    return conv
+
+
+def append_assistant_message(
+    db: Session,
+    user_id: int,
+    assistant_content: str,
+    *,
+    conversation_id: int | None = None,
+) -> None:
+    """Persist assistant reply (full, partial, or error text) after stream ends."""
+    a = (assistant_content or "").strip()
+    if not a:
+        return
+    conv = resolve_conversation(db, user_id, conversation_id)
+    if conv.status == "closed":
+        return
+    conv.updated_at = _now()
+    db.add(
+        AgentMessage(
+            user_id=user_id,
+            conversation_id=conv.id,
+            role="assistant",
+            content=a[:16000],
         )
+    )
     db.commit()
     _prune(db, user_id, conv.id)
 

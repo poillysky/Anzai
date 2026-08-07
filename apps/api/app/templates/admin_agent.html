@@ -1,54 +1,104 @@
 {% extends "admin_base.html" %}
-{% block title %}Agent 配置 · 安崽ETF{% endblock %}
+{% block title %}Agent 配置 · 安崽{% endblock %}
 {% block badge %}/admin/agent{% endblock %}
 {% block content %}
 <h2 class="page-title">Agent 配置</h2>
 <p class="page-lead">
-  分析三档管专家组合。对话：全站<strong>一套</strong>
-  <a href="/admin/presets">对话预设</a>；PWA「你是安崽的谁」只改【关系】提示词，不换预设。
+  管两块：① <strong>分析委员会</strong>三档（个股可选；仓库巡检固定标准档）；
+  ② <strong>对话安崽</strong>开关（全站一套
+  <a href="/admin/presets">对话预设</a>）。
+  PWA「你是安崽的谁」只改【关系】提示词，不换预设。
 </p>
 
-<h3 class="subhead">分析 Agent · 三档</h3>
+<div class="callout">
+  <strong>现行管线（对齐代码）</strong>
+  <ol class="pipeline-list">
+    <li>冻证据：报价 / 昨收·今开·最新 / 今日盈亏≠行情 / 指数 / 分时 / K / 新闻 / 结构事实</li>
+    <li>走势席 ∥ 新闻席（LLM，共享 L0）</li>
+    <li>结构风险席（确定性计算，不走 LLM；标准/深度默认开）</li>
+    <li>辩证席 ×N（轻量 0 · 标准 1 · 深度 2）→ 未决问题交给首席</li>
+    <li>首席综合 → watch 风控注入 + 证据引用</li>
+  </ol>
+  <p class="hint" style="margin:8px 0 0">
+    「资金情绪」席尚未接入实盘工具，勾选无效（延期）。辩证席 / 首席不在下方勾选里——由档位固定编排。
+  </p>
+</div>
+
+<h3 class="subhead">分析委员会 · 三档</h3>
+<p class="page-lead" style="margin-top:-6px">
+  App 个股可选轻量/标准/深度；仓库「持仓巡检」强制 <code>standard</code>。
+  证据档决定分时/新闻条数/K 线深度，可与档位 id 不同。
+</p>
+
 <form method="post" action="/admin/analysis-tiers">
   {% for tid in tier_ids %}
   {% set t = tiers[tid] %}
+  {% set meta = tier_meta[tid] %}
   <div class="tier-card">
-    <h3>{{ tid }} · {{ t.label }}</h3>
+    <div class="tier-card-head">
+      <h3>{{ tid }} · {{ t.label }}</h3>
+      <span class="tier-pill">{{ meta.pipeline }}</span>
+    </div>
+    <p class="tier-note">{{ meta.note }}</p>
+
     <label>显示名</label>
     <input type="text" name="{{ tid }}_label" value="{{ t.label }}" />
+
     <label>说明（App 副文案）</label>
     <input type="text" name="{{ tid }}_blurb" value="{{ t.blurb }}" />
+
     <label>证据档</label>
     <select name="{{ tid }}_evidence">
       {% for e in tier_ids %}
-      <option value="{{ e }}" {% if t.evidence_tier == e %}selected{% endif %}>{{ e }}</option>
+      <option value="{{ e }}" {% if t.evidence_tier == e %}selected{% endif %}>
+        {{ e }} — {{ evidence_blurbs[e] }}
+      </option>
       {% endfor %}
     </select>
-    <label>启用专家 · 权重</label>
+
+    <label>启用专家席 · 权重（走势/新闻为 LLM；结构风险为确定性）</label>
     <div class="agent-grid">
       {% for aid in agent_ids %}
-      <div class="agent-row">
+      {% set seat = seat_meta[aid] %}
+      <div class="agent-row {% if seat.deferred %}is-deferred{% endif %}">
+        {% if seat.deferred %}
+        <input type="checkbox" disabled tabindex="-1" />
+        {% else %}
         <input
           type="checkbox"
           name="{{ tid }}_agent_{{ aid }}"
           value="1"
           {% if aid in t.agents %}checked{% endif %}
         />
-        <span>{{ agent_labels.get(aid, aid) }}</span>
+        {% endif %}
+        <span class="agent-name">
+          {{ agent_labels.get(aid, aid) }}
+          <small>{{ seat.kind }}</small>
+        </span>
+        {% if seat.deferred %}
+        <input type="number" value="0" disabled tabindex="-1" title="未接入" />
+        {% else %}
         <input
           type="number"
           name="{{ tid }}_w_{{ aid }}"
           step="0.05"
           min="0"
           value="{{ t.weights.get(aid, 0) }}"
+          title="权重（同档归一）"
         />
+        {% endif %}
       </div>
       {% endfor %}
     </div>
+    <p class="hint">{{ meta.evidence_hint }}</p>
   </div>
   {% endfor %}
   <div class="row">
     <button type="submit">保存分析三档</button>
+    <button type="submit" name="reset_defaults" value="1" class="btn-ghost-admin"
+      onclick="return confirm('恢复内置默认三档（含副文案与专家勾选）？');">
+      恢复默认
+    </button>
   </div>
 </form>
 
@@ -61,9 +111,19 @@
   <p class="hint">
     当前预设：<code>{{ generation.preset_name }}</code>
     · temp {{ generation.temperature }} / top_p {{ generation.top_p }}
+    · max_tokens {{ generation.max_tokens }}
     · <a href="/admin/presets">编辑预设</a>
   </p>
   <p class="hint">开场 chips：{{ generation.suggested_chips | join(' · ') }}</p>
+  <p class="hint">
+    身份：用户在 PWA 设置「你是安崽的谁」（注册必选）；注册写入 preferences，对话注入【关系】。
+  </p>
+  <div class="callout callout-soft">
+    <strong>已接 Tools（按场景预取）</strong>
+    <p class="hint" style="margin:6px 0 0">
+      {{ chat_tools | join(' · ') }}
+    </p>
+  </div>
   <div class="row">
     <button type="submit">保存开关</button>
   </div>

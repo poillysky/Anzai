@@ -56,3 +56,40 @@ export function pnlClass(n: number | null | undefined): string {
   if (n == null || n === 0) return "text-mute";
   return n > 0 ? "text-up" : "text-down";
 }
+
+/**
+ * Quote tone for UI. Prefer change_pct; when it rounds to 0% (common in
+ * 集合竞价 / tiny moves), fall back to raw price vs prev_close so red/green still shows.
+ */
+export function pnlTone(
+  changePct: number | null | undefined,
+  price?: number | null,
+  prevClose?: number | null,
+): string {
+  if (changePct != null && changePct !== 0 && !Number.isNaN(changePct)) {
+    return pnlClass(changePct);
+  }
+  if (
+    price != null &&
+    prevClose != null &&
+    !Number.isNaN(price) &&
+    !Number.isNaN(prevClose) &&
+    prevClose > 0
+  ) {
+    const d = price - prevClose;
+    if (d > 0) return "text-up";
+    if (d < 0) return "text-down";
+  }
+  return "text-mute";
+}
+
+export function pnlArrowTone(
+  changePct: number | null | undefined,
+  price?: number | null,
+  prevClose?: number | null,
+): string {
+  const tone = pnlTone(changePct, price, prevClose);
+  if (tone === "text-up") return "↑";
+  if (tone === "text-down") return "↓";
+  return "";
+}

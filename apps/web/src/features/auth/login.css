@@ -21,6 +21,21 @@
   font-family: "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", "Segoe UI", sans-serif;
   overscroll-behavior: none;
   touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-user-drag: none;
+  cursor: default;
+}
+
+.login-root input,
+.login-root textarea,
+.login-root select,
+.login-root .allow-select {
+  -webkit-user-select: text;
+  user-select: text;
+  -webkit-touch-callout: default;
+  cursor: text;
 }
 
 .login-top {
@@ -256,6 +271,75 @@
 
 .login-field:focus-within {
   border-bottom-color: var(--login-teal);
+}
+
+.login-field--stack {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  min-height: 0;
+  padding-top: 12px;
+}
+
+.login-field--stack .login-label {
+  flex: none;
+  width: auto;
+}
+
+.login-identity {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 0 8px;
+  border-bottom: 0.5px solid var(--login-line);
+}
+
+.login-identity-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.login-identity-head .login-label {
+  flex: none;
+  width: auto;
+}
+
+.login-identity-hint {
+  font-size: 12px;
+  color: var(--login-mute);
+}
+
+.login-identity-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.login-identity-chip {
+  margin: 0;
+  padding: 8px 12px;
+  border: 0.5px solid var(--login-line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.55);
+  color: var(--login-ink);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.2;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.login-identity-chip.is-on {
+  border-color: color-mix(in srgb, var(--login-teal) 55%, transparent);
+  background: color-mix(in srgb, var(--login-teal) 18%, #fff);
+  color: var(--login-teal-deep);
+  font-weight: 650;
+}
+
+.login-identity-chip:active {
+  opacity: 0.85;
 }
 
 .login-label {

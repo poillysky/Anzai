@@ -1,4 +1,4 @@
-# 安崽ETF
+# 安崽
 
 个人 A 股 / 场内 ETF 分析助手：iOS 全屏 PWA + FastAPI 后端 + Agent（后续）。
 

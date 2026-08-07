@@ -1,9 +1,15 @@
 {% extends "admin_base.html" %}
-{% block title %}LLM 连接 · 安崽ETF{% endblock %}
+{% block title %}安崽对话 · 安崽{% endblock %}
 {% block badge %}/admin/llm{% endblock %}
 {% block content %}
-<h2 class="page-title">模型连接</h2>
-<p class="page-lead">L0 · 端点 / 密钥 / 模型与配置档。提示词与采样请到 <a href="/admin/presets">生成预设</a>。密钥只存服务端，不进 PWA。</p>
+<h2 class="page-title">安崽对话模型</h2>
+<p class="page-lead">
+  仅安崽助手聊天用。分析委员会请到
+  <a href="/admin/analysis-llm">分析模型</a>；
+  向量检索请到
+  <a href="/admin/embedding">向量模型</a>。
+  提示词与采样在 <a href="/admin/presets">对话预设</a>。密钥只存服务端。
+</p>
 
 <div class="card profile-bar">
   <div class="profile-bar-main">
@@ -76,16 +82,16 @@
 
   <label>可用模型</label>
   <select id="llm-model-pick" {% if not model_list %}disabled{% endif %}>
-    <option value="">{% if model_list %}从列表选择…{% else %}None（先点测试连接）{% endif %}</option>
+    <option value="">{% if model_list %}从列表选择…（{{ model_list|length }}）{% else %}None（先点测试连接）{% endif %}</option>
     {% for m in model_list %}
     <option value="{{ m }}" {% if m == active.model %}selected{% endif %}>{{ m }}</option>
     {% endfor %}
   </select>
-  <p class="hint">测试连接会请求 <code>GET /models</code> 并填充上表。改密钥/端点后可先测再保存，或直接保存。</p>
+  <p class="hint">测试会请求 <code>GET /models</code>（必要时再试 <code>/v1/models</code>），列表写入当前配置档，不依赖 Cookie。</p>
 
   <div class="row">
     <button type="submit">保存连接</button>
-    <button type="submit" class="btn-ghost" form="llm-test-form">测试连接</button>
+    <button type="button" class="btn-ghost" id="llm-test-btn">测试连接</button>
   </div>
 
   <details class="advanced">
@@ -124,6 +130,8 @@
   var model = document.getElementById("llm-model");
   var key = document.getElementById("llm-key");
   var pick = document.getElementById("llm-model-pick");
+  var testForm = document.getElementById("llm-test-form");
+  var testBtn = document.getElementById("llm-test-btn");
   var testBase = document.getElementById("test-base");
   var testKey = document.getElementById("test-key");
   var testModel = document.getElementById("test-model");
@@ -153,6 +161,12 @@
     if (key) key.addEventListener(ev, syncTest);
     if (model) model.addEventListener(ev, syncTest);
   });
+  if (testBtn && testForm) {
+    testBtn.addEventListener("click", function () {
+      syncTest();
+      testForm.submit();
+    });
+  }
   syncTest();
 })();
 </script>

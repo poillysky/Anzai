@@ -1,0 +1,138 @@
+{% extends "admin_base.html" %}
+{% block title %}分析模型 · 安崽{% endblock %}
+{% block badge %}/admin/analysis-llm{% endblock %}
+{% block content %}
+<h2 class="page-title">分析委员会模型</h2>
+<p class="page-lead">
+  个股 / 仓位巡检用的聊天模型，与
+  <a href="/admin/llm">安崽对话</a>
+  、
+  <a href="/admin/embedding">向量模型</a>
+  完全分离。密钥只存服务端。首次未配置时会从对话模型拷贝一份，可再改。
+</p>
+
+<form class="card" method="post" action="/admin/analysis-llm/settings" id="analysis-form">
+  <label>接口来源</label>
+  <select name="ANALYSIS_SOURCE" id="analysis-source">
+    {% for s in analysis_sources %}
+    <option
+      value="{{ s.value }}"
+      data-base="{{ s.baseUrl }}"
+      {% if active.source == s.value %}selected{% endif %}
+    >{{ s.label }}</option>
+    {% endfor %}
+  </select>
+
+  <label>端点（基础 URL）</label>
+  <input
+    type="text"
+    name="ANALYSIS_BASE_URL"
+    id="analysis-base"
+    value="{{ active.baseUrl }}"
+    placeholder="https://api.openai.com/v1"
+  />
+
+  <div class="field-head">
+    <label style="margin:0">API 密钥</label>
+    <span class="key-badge {% if active.apiKeySet %}key-badge--ok{% endif %}">
+      {% if active.apiKeySet %}密钥已保存{% else %}未配置{% endif %}
+    </span>
+  </div>
+  <input
+    type="password"
+    name="ANALYSIS_API_KEY"
+    id="analysis-key"
+    value=""
+    autocomplete="off"
+    placeholder="{% if active.apiKeySet %}••••••••（输入以更换）{% else %}sk-…{% endif %}"
+  />
+  {% if active.apiKeySet %}
+  <label class="check-row">
+    <input type="checkbox" name="clear_api_key" value="1" />
+    清除已保存密钥
+  </label>
+  {% endif %}
+
+  <label>模型名</label>
+  <input
+    type="text"
+    name="ANALYSIS_MODEL"
+    id="analysis-model"
+    value="{{ active.model }}"
+    placeholder="gpt-4o-mini"
+  />
+
+  <label>可用模型</label>
+  <select id="analysis-model-pick" {% if not model_list %}disabled{% endif %}>
+    <option value="">{% if model_list %}从列表选择…（{{ model_list|length }}）{% else %}None（先点测试连接）{% endif %}</option>
+    {% for m in model_list %}
+    <option value="{{ m }}" {% if m == active.model %}selected{% endif %}>{{ m }}</option>
+    {% endfor %}
+  </select>
+  <p class="hint">测试会请求 <code>GET /models</code>（必要时再试 <code>/v1/models</code>），列表落盘不依赖 Cookie。</p>
+
+  <div class="row">
+    <button type="submit">保存分析模型</button>
+    <button type="button" class="btn-ghost" id="analysis-test-btn">测试连接</button>
+  </div>
+</form>
+
+<form id="analysis-test-form" method="post" action="/admin/analysis-llm/test" hidden>
+  <input type="hidden" name="ANALYSIS_BASE_URL" id="test-analysis-base" value="{{ active.baseUrl }}" />
+  <input type="hidden" name="ANALYSIS_API_KEY" id="test-analysis-key" value="" />
+  <input type="hidden" name="ANALYSIS_MODEL" id="test-analysis-model" value="{{ active.model }}" />
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var source = document.getElementById("analysis-source");
+  var base = document.getElementById("analysis-base");
+  var model = document.getElementById("analysis-model");
+  var key = document.getElementById("analysis-key");
+  var pick = document.getElementById("analysis-model-pick");
+  var testForm = document.getElementById("analysis-test-form");
+  var testBtn = document.getElementById("analysis-test-btn");
+  var testBase = document.getElementById("test-analysis-base");
+  var testKey = document.getElementById("test-analysis-key");
+  var testModel = document.getElementById("test-analysis-model");
+
+  function syncTest() {
+    if (testBase) testBase.value = base ? base.value : "";
+    if (testKey) testKey.value = key ? key.value : "";
+    if (testModel) testModel.value = model ? model.value : "";
+  }
+
+  if (source && base) {
+    source.addEventListener("change", function () {
+      var opt = source.options[source.selectedIndex];
+      var b = opt.getAttribute("data-base") || "";
+      if (b) base.value = b;
+      syncTest();
+    });
+  }
+  if (pick && model) {
+    pick.addEventListener("change", function () {
+      if (pick.value) {
+        model.value = pick.value;
+        syncTest();
+      }
+    });
+  }
+  [base, model, key].forEach(function (el) {
+    if (!el) return;
+    ["input", "change"].forEach(function (ev) {
+      el.addEventListener(ev, syncTest);
+    });
+  });
+  if (testBtn && testForm) {
+    testBtn.addEventListener("click", function () {
+      syncTest();
+      testForm.submit();
+    });
+  }
+  syncTest();
+})();
+</script>
+{% endblock %}

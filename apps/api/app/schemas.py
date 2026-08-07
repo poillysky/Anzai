@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 class HoldingBase(BaseModel):
     symbol: str = Field(..., min_length=1, max_length=16)
     name: str = ""
-    market: str = Field(default="SH", pattern="^(SH|SZ)$")
+    market: str = Field(default="SH", pattern="^(SH|SZ|JD)$")
     shares: float = Field(default=0, ge=0)
     cost: float = Field(default=0, ge=0)
     tags: str = ""
@@ -20,11 +20,14 @@ class HoldingCreate(HoldingBase):
 class HoldingUpdate(BaseModel):
     symbol: str | None = Field(default=None, min_length=1, max_length=16)
     name: str | None = None
-    market: str | None = Field(default=None, pattern="^(SH|SZ)$")
+    market: str | None = Field(default=None, pattern="^(SH|SZ|JD)$")
     shares: float | None = Field(default=None, ge=0)
     cost: float | None = Field(default=None, ge=0)
     tags: str | None = None
     bought_at: str | None = None
+    # Fill price / date for this shares delta — 今日盈亏今买/今卖成交额
+    trade_price: float | None = Field(default=None, gt=0)
+    trade_date: str | None = None  # YYYY-MM-DD of this fill; empty → Shanghai today
 
 
 class HoldingOut(HoldingBase):
@@ -39,6 +42,7 @@ class HoldingOut(HoldingBase):
     pnl: float | None = None
     pnl_pct: float | None = None
     day_pnl: float | None = None
+    day_pnl_pct: float | None = None
     weight: float | None = None
 
     model_config = {"from_attributes": True}
@@ -108,6 +112,67 @@ class IndexQuoteOut(QuoteOut):
     key: str = ""  # e.g. sh-composite
 
 
+class MacroQuoteOut(BaseModel):
+    key: str
+    name: str
+    price: float
+    unit: str = ""
+    change_pct: float | None = None
+    prev: float | None = None
+    as_of: str | None = None
+    live: bool = True
+    venue: str = ""
+    freshness: str = ""
+
+
+class MacroTopicOut(BaseModel):
+    topic: str
+    calendar: str = ""
+    quotes: list[MacroQuoteOut] = []
+    hint: str = ""
+    note: str = ""
+
+
+class GoldEtfOut(BaseModel):
+    symbol: str
+    market: str
+    name: str
+    price: float
+    change_pct: float | None = None
+    prev_close: float | None = None
+
+
+class GoldBoardItemOut(BaseModel):
+    id: str
+    name: str
+    section: str
+    price: float | None = None
+    change_pct: float | None = None
+    prev: float | None = None
+    unit: str = "元/克"
+    freshness: str = ""
+    note: str = ""
+    holdable: bool = False
+    symbol: str = ""
+    market: str = ""
+    chart: list[float] = []
+    chart_times: list[str] = []
+    chart_slots: int = 0
+    chart_session: str = ""
+
+
+class GoldBoardSectionOut(BaseModel):
+    id: str
+    title: str
+    subtitle: str = ""
+    items: list[GoldBoardItemOut] = []
+
+
+class GoldBoardOut(BaseModel):
+    sections: list[GoldBoardSectionOut] = []
+    note: str = ""
+
+
 class IntradayPointOut(BaseModel):
     time: str
     price: float
@@ -120,8 +185,67 @@ class IntradayOut(BaseModel):
     name: str
     market: str
     prev_close: float | None = None
+    open_price: float | None = None
     session: str = "cn"
     points: list[IntradayPointOut]
+
+
+class ShortBiasOut(BaseModel):
+    """~5min micro-momentum from 1m intraday — tendency, not a forecast."""
+
+    symbol: str
+    market: str
+    bias: str  # up | down | flat | na | closed
+    label: str
+    score: float | None = None
+    lookback_min: int = 5
+    sample_n: int = 0
+    roc_pct: float | None = None
+    as_of: str | None = None
+
+
+class ShortBiasBatchOut(BaseModel):
+    items: list[ShortBiasOut]
+    note: str = "近5根分时动量倾向，非预测、非投资建议"
+
+
+class BookLevelOut(BaseModel):
+    price: float
+    volume: float  # 手
+
+
+class OrderBookOut(BaseModel):
+    symbol: str
+    market: str
+    name: str
+    bids: list[BookLevelOut]
+    asks: list[BookLevelOut]
+    as_of: str | None = None
+    source: str = ""
+    live: bool = False
+
+
+class MoneyFlowDayOut(BaseModel):
+    date: str
+    main_net: float
+    super_net: float
+    large_net: float
+    mid_net: float
+    small_net: float
+    main_pct: float | None = None
+
+
+class DepthFlowOut(BaseModel):
+    symbol: str
+    market: str
+    name: str
+    book: OrderBookOut | None = None
+    flow_days: list[MoneyFlowDayOut] = []
+    flow_bias: str = "na"  # in | out | flat | na
+    flow_label: str = ""
+    session_state: str = "closed"
+    book_live: bool = False
+    note: str = "主力按成交额分档，非庄家身份；非投资建议"
 
 
 class LeaderStockOut(BaseModel):
@@ -302,18 +426,31 @@ class AnalysisSymbolSummaryOut(BaseModel):
     summary: str = ""
 
 
+class AnalysisDebateRoundOut(BaseModel):
+    round: int = 1
+    summary: str = ""
+    stance: str = "中性"
+    bull_points: list[str] = []
+    bear_points: list[str] = []
+    open_questions: list[str] = []
+    bullets: list[str] = []
+
+
 class AnalysisReportOut(BaseModel):
     verdict: str
     stance: str = "中性"
     confidence: float = 0.5
     highlights: list[str] = []  # ≤2 overall key points
+    watch: list[str] = []  # stocks / points to watch after overall verdict
+    holding_lines: list[str] = []  # evidence one-liners for current holdings
     items: list[AnalysisSymbolSummaryOut] = []  # per-symbol briefs
     # retained for P1 / older clients; UI no longer surfaces these
     bullets: list[str] = []
     structure: list[dict] = []
     actions: list[str] = []
     agents: list[AnalysisAgentStepOut] = []
-    template: bool = True
+    debate: list[AnalysisDebateRoundOut] = []
+    template: bool = False
 
 
 class AnalysisJobOut(BaseModel):
@@ -346,11 +483,15 @@ class AuthLoginIn(BaseModel):
 class AuthBootstrapIn(BaseModel):
     username: str = Field(..., min_length=2, max_length=64)
     password: str = Field(..., min_length=4, max_length=128)
+    identity_role: str = Field(..., min_length=1, max_length=32)
+    identity_label: str = Field(default="", max_length=16)
 
 
 class AuthRegisterIn(BaseModel):
     username: str = Field(..., min_length=2, max_length=64)
     password: str = Field(..., min_length=4, max_length=128)
+    identity_role: str = Field(..., min_length=1, max_length=32)
+    identity_label: str = Field(default="", max_length=16)
 
 
 class UserOut(BaseModel):

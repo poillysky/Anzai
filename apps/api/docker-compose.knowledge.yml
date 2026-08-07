@@ -1,0 +1,25 @@
+# Knowledge DB only (pgvector). Business data stays on SQLite.
+# Usage: docker compose -f docker-compose.knowledge.yml up -d
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: anzai-postgres
+    restart: always
+    ports:
+      - "5437:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: anzai_knowledge
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+      PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: Asia/Shanghai
+    volumes:
+      - /vol1/1000/Docker/anzai-postgres:/var/lib/postgresql/data
+    shm_size: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d anzai_knowledge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

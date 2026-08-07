@@ -97,7 +97,8 @@ def portfolio_context(db: Session, user_id: int) -> str:
             f"- {h.symbol} {h.name or ''} "
             f"市值{_fmt_money(h.market_value)} "
             f"盈亏{_fmt_money(h.pnl)}（{_fmt_pct(h.pnl_pct)}） "
-            f"今日{_fmt_pct(h.change_pct)} "
+            f"今日盈亏{_fmt_money(h.day_pnl)}（{_fmt_pct(h.day_pnl_pct)}） "
+            f"行情{_fmt_pct(h.change_pct)} "
             f"仓位{_fmt_pct(h.weight)}"
         )
     if len(ranked) > 20:
@@ -117,14 +118,21 @@ def _summarize_report(report: dict[str, Any] | None) -> list[str]:
     stance = report.get("stance")
     if stance:
         lines.append(f"立场：{stance}")
+    lines.append(
+        "来源：多 Agent 委员会" if not report.get("template") else "来源：模板快评（委员会未跑通时的兜底）"
+    )
 
     highlights = report.get("highlights") or []
     if isinstance(highlights, list) and highlights:
         lines.append("要点：" + "；".join(str(h)[:80] for h in highlights[:5]))
 
+    actions = report.get("actions") or []
+    if isinstance(actions, list) and actions:
+        lines.append("建议：" + "；".join(str(a)[:80] for a in actions[:4]))
+
     agents = report.get("agents") or report.get("agent_steps") or []
     if isinstance(agents, list) and agents:
-        for step in agents[:4]:
+        for step in agents[:6]:
             if not isinstance(step, dict):
                 continue
             label = step.get("label") or step.get("id") or "席位"
@@ -148,15 +156,20 @@ def _summarize_report(report: dict[str, Any] | None) -> list[str]:
 
 def analysis_context(db: Session, user_id: int) -> str:
     """Very short analysis hint — not a full report dump."""
-    job = (
-        db.query(AnalysisJob)
-        .filter(AnalysisJob.user_id == user_id, AnalysisJob.status == "done")
-        .order_by(AnalysisJob.id.desc())
-        .first()
-    )
+    from app.services import analysis as analysis_svc
+
     lines = ["【最近分析】"]
+    running = analysis_svc.running_job(db, user_id)
+    if running is not None:
+        lines.append(
+            f"进行中：#{running.id} {running.scope}/{running.degree} — "
+            "结论未出；用户问起就说还在跑，跑完下轮带上。"
+        )
+
+    job = analysis_svc.latest_job(db, user_id)
     if job is None:
-        lines.append("（暂无）")
+        if running is None:
+            lines.append("（暂无已完成报告）")
         return "\n".join(lines)
 
     report: dict[str, Any] | None = None
@@ -168,7 +181,7 @@ def analysis_context(db: Session, user_id: int) -> str:
         except json.JSONDecodeError:
             report = None
 
-    lines.append(f"范围 {job.scope} · 档位 {job.degree}")
+    lines.append(f"已完成：#{job.id} · {job.scope} · {job.degree}")
     if report:
         verdict = report.get("verdict") or report.get("summary") or ""
         if isinstance(verdict, dict):
@@ -187,29 +200,60 @@ def silent_portfolio_context(db: Session, user_id: int) -> str:
     pf = build_portfolio(db, user_id)
     lines = [
         "【心里有数·仓库】",
-        "仅供心里对齐。用户没问仓位/盈亏/风险时：回复里禁止出现市值、今日涨跌%、持仓名、分散建议。",
+        "字段：day_pnl=今日盈亏(账户现金流转)；quote_chg=行情涨跌(对昨收)；勿混用。",
+        "仅供心里对齐。用户没问仓位/盈亏时：回复里禁止出现市值、day_pnl、quote_chg、持仓名、分散建议。",
     ]
     holdings = list(pf.holdings or [])
     if not holdings:
         lines.append("暂无持仓。")
-        return "\n".join(lines)
-
-    lines.append(
-        f"总市值 {_fmt_money(pf.total_market_value)} · "
-        f"今日 {_fmt_pct(pf.day_pnl_pct)} · "
-        f"累计 {_fmt_pct(pf.total_pnl_pct)} · "
-        f"共 {len(holdings)} 只"
-    )
-    ranked = sorted(holdings, key=lambda h: float(h.market_value or 0), reverse=True)
-    for h in ranked[:3]:
-        w = h.weight
-        w_s = f"{w:.1f}%" if w is not None else "—"
+    else:
         lines.append(
-            f"- {h.symbol} {h.name or ''} "
-            f"今日{_fmt_pct(h.change_pct)} · 仓位{w_s}"
+            f"总市值 {_fmt_money(pf.total_market_value)} · "
+            f"day_pnl {_fmt_pct(pf.day_pnl_pct)} · "
+            f"累计 {_fmt_pct(pf.total_pnl_pct)} · "
+            f"共 {len(holdings)} 只"
         )
-    if len(ranked) > 3:
-        lines.append(f"…另有 {len(ranked) - 3} 只，明细用 get_portfolio")
+        ranked = sorted(holdings, key=lambda h: float(h.market_value or 0), reverse=True)
+        for h in ranked[:3]:
+            w = h.weight
+            w_s = f"{w:.1f}%" if w is not None else "—"
+            lines.append(
+                f"- {h.symbol} {h.name or ''} "
+                f"day_pnl={_fmt_pct(h.day_pnl_pct)} · "
+                f"quote_chg={_fmt_pct(h.change_pct)} · "
+                f"仓位{w_s}"
+            )
+        if len(ranked) > 3:
+            lines.append(f"…另有 {len(ranked) - 3} 只，明细用 get_portfolio")
+
+    # 轻量「上次巡检」记忆：一句结论，避免每轮复读全文；有进行中则先提示
+    try:
+        from app.services import analysis as analysis_svc
+
+        running = analysis_svc.running_job(db, user_id)
+        if running is not None:
+            lines.append(
+                f"分析进行中：{running.scope}/{running.degree}（任务 #{running.id}）。"
+                "用户没问进度时别念报告；问到了就说还在跑、跑完下轮会带上结论。"
+            )
+        job = analysis_svc.latest_job(db, user_id)
+        report = None
+        if job is not None and job.report_json:
+            try:
+                raw = json.loads(job.report_json)
+                if isinstance(raw, dict):
+                    report = raw
+            except json.JSONDecodeError:
+                report = None
+        if isinstance(report, dict):
+            verdict = str(report.get("verdict") or "").strip()
+            if verdict:
+                lines.append(
+                    f"最近分析结论（已完成·心里有数，可在对话里带一句）：{verdict[:160]}"
+                )
+    except Exception:
+        pass
+
     return "\n".join(lines)
 
 

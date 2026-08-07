@@ -6,6 +6,7 @@ import {
   useCallback,
   useEffect,
   useRef,
+  useState,
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
@@ -29,6 +30,8 @@ type Props = {
 /**
  * iOS-style left-swipe to reveal delete.
  * Vertical scroll stays free until horizontal intent is clear.
+ * Pointer capture only after horizontal lock — otherwise child button clicks die.
+ * Delete paint is gated by `is-revealing` so closed rows never leak #ff3b30.
  */
 export function SwipeRevealRow({
   open,
@@ -45,7 +48,9 @@ export function SwipeRevealRow({
   const curX = useRef(0);
   const axis = useRef<"none" | "h" | "v">("none");
   const dragging = useRef(false);
+  const capturing = useRef(false);
   const suppressClick = useRef(false);
+  const [revealing, setRevealing] = useState(open);
 
   const setX = useCallback((x: number, animate: boolean) => {
     const el = trackRef.current;
@@ -54,11 +59,23 @@ export function SwipeRevealRow({
     curX.current = clamped;
     el.style.transition = animate ? "transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1)" : "none";
     el.style.transform = `translate3d(${clamped}px,0,0)`;
+    const next = clamped < -0.5;
+    setRevealing((prev) => (prev === next ? prev : next));
   }, []);
 
   useEffect(() => {
     setX(open ? -ACTION_W : 0, true);
   }, [open, setX]);
+
+  const releaseCapture = (el: HTMLElement, pointerId: number) => {
+    if (!capturing.current) return;
+    capturing.current = false;
+    try {
+      el.releasePointerCapture(pointerId);
+    } catch {
+      /* ignore */
+    }
+  };
 
   const onPointerDown = (e: ReactPointerEvent) => {
     if (disabled || e.button !== 0) return;
@@ -69,7 +86,7 @@ export function SwipeRevealRow({
     startY.current = e.clientY;
     baseX.current = open ? -ACTION_W : 0;
     curX.current = baseX.current;
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    // Do not capture yet — capture on pointerdown steals the click from children.
   };
 
   const onPointerMove = (e: ReactPointerEvent) => {
@@ -85,6 +102,12 @@ export function SwipeRevealRow({
       }
       axis.current = "h";
       haptics.selection();
+      try {
+        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+        capturing.current = true;
+      } catch {
+        /* ignore */
+      }
     }
     if (axis.current !== "h") return;
     e.preventDefault();
@@ -93,21 +116,20 @@ export function SwipeRevealRow({
 
   const endDrag = (e: ReactPointerEvent) => {
     const wasH = axis.current === "h";
+    const el = e.currentTarget as HTMLElement;
     if (!dragging.current && !wasH) {
       axis.current = "none";
+      releaseCapture(el, e.pointerId);
       return;
     }
     dragging.current = false;
     if (!wasH) {
       axis.current = "none";
+      releaseCapture(el, e.pointerId);
       return;
     }
     axis.current = "none";
-    try {
-      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-    } catch {
-      /* ignore */
-    }
+    releaseCapture(el, e.pointerId);
     if (Math.abs(curX.current - baseX.current) > 6) {
       suppressClick.current = true;
     }
@@ -128,7 +150,11 @@ export function SwipeRevealRow({
   };
 
   return (
-    <div className={`swipe-reveal ${className ?? ""}`.trim()} style={style}>
+    <div
+      className={`swipe-reveal ${revealing ? "is-revealing" : ""} ${className ?? ""}`.trim()}
+      style={style}
+      data-revealing={revealing ? "1" : "0"}
+    >
       <button
         type="button"
         className="swipe-reveal-action"

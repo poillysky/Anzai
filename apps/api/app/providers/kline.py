@@ -36,8 +36,64 @@ class KlineBar:
 
 def _sina_symbol(symbol: str, market: str) -> str:
     mkt = market.upper()
+    if mkt == "HK":
+        code = symbol.strip()
+        if code.isdigit():
+            code = code.zfill(5)
+        return f"hk{code.lower()}"
     prefix = "sh" if mkt == "SH" else "sz"
     return f"{prefix}{symbol.strip().lower()}"
+
+
+def _em_secid(symbol: str, market: str) -> str:
+    mkt = market.upper()
+    sym = symbol.strip()
+    if mkt == "HK":
+        code = sym.zfill(5) if sym.isdigit() else sym
+        return f"116.{code}"
+    prefix = "1" if mkt == "SH" else "0"
+    return f"{prefix}.{sym}"
+
+
+def _fetch_hk_tencent(symbol: str, limit: int) -> tuple[str, list[KlineBar]]:
+    """HK daily bars via Tencent ifzq (qfqday)."""
+    code = symbol.strip()
+    if code.isdigit():
+        code = code.zfill(5)
+    sina = f"hk{code.lower()}"
+    url = "https://web.ifzq.gtimg.cn/appstock/app/hkfqkline/get"
+    params = {"param": f"{sina},day,,,{max(limit, 5)},qfq"}
+    with httpx.Client(timeout=12.0, headers=_HEADERS, follow_redirects=True) as client:
+        resp = client.get(url, params=params)
+        resp.raise_for_status()
+        payload = resp.json() or {}
+    data = (payload.get("data") or {}).get(sina) or {}
+    raw = data.get("qfqday") or data.get("day") or []
+    bars: list[KlineBar] = []
+    for row in raw:
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
+            continue
+        try:
+            close = float(row[2] or 0)
+            if close <= 0:
+                continue
+            bars.append(
+                KlineBar(
+                    date=str(row[0])[:10],
+                    open=float(row[1] or 0),
+                    close=close,
+                    high=float(row[3] or 0),
+                    low=float(row[4] or 0),
+                    volume=float(row[5] or 0) if len(row) > 5 else 0.0,
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    if not bars:
+        return "", []
+    # keep last `limit` bars
+    bars = bars[-limit:]
+    return "", _with_change_pct(bars)
 
 
 def _with_change_pct(bars: list[KlineBar]) -> list[KlineBar]:
@@ -104,8 +160,7 @@ def _fetch_sina(symbol: str, market: str, limit: int) -> list[KlineBar]:
 
 
 def _fetch_em(symbol: str, market: str, limit: int) -> tuple[str, list[KlineBar]]:
-    prefix = "1" if market.upper() == "SH" else "0"
-    secid = f"{prefix}.{symbol.strip()}"
+    secid = _em_secid(symbol, market)
     params = {
         "secid": secid,
         "fields1": "f1,f2,f3,f4,f5,f6",
@@ -179,13 +234,20 @@ def get_daily_klines(
 
     name = ""
     bars: list[KlineBar] = []
-    try:
-        bars = _fetch_sina(sym, mkt, lim)
-    except Exception as exc:
-        logger.warning("Sina kline failed %s:%s: %s", mkt, sym, exc)
-
-    if not bars:
-        name, bars = _fetch_em(sym, mkt, lim)
+    if mkt == "HK":
+        try:
+            name, bars = _fetch_hk_tencent(sym, lim)
+        except Exception as exc:
+            logger.warning("Tencent HK kline failed %s: %s", sym, exc)
+        if not bars:
+            name, bars = _fetch_em(sym, mkt, lim)
+    else:
+        try:
+            bars = _fetch_sina(sym, mkt, lim)
+        except Exception as exc:
+            logger.warning("Sina kline failed %s:%s: %s", mkt, sym, exc)
+        if not bars:
+            name, bars = _fetch_em(sym, mkt, lim)
 
     if not name and bars:
         # best-effort name from quote cache later; leave blank

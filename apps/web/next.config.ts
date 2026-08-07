@@ -11,6 +11,7 @@ const nextConfig: NextConfig = {
     return {
       beforeFiles: [],
       // Prefer filesystem Route Handlers (SSE proxy) before generic rewrite
+      // — agent chat + analysis stream need byte-pipe; rewrites buffer SSE.
       afterFiles: [{ source: "/backend/health", destination: `${API_PROXY}/health` }],
       fallback: [
         {

@@ -1,12 +1,12 @@
 {% extends "admin_base.html" %}
-{% block title %}对话预设 · 安崽ETF{% endblock %}
+{% block title %}对话预设 · 安崽{% endblock %}
 {% block badge %}/admin/presets{% endblock %}
 {% block content %}
 <h2 class="page-title">对话预设</h2>
 <p class="page-lead">
   <strong>全站仅一套</strong>真人对话预设（人设 / 采样 / chips）。
   「你是安崽的谁」在 PWA 里选，对话时以【关系】提示词注入，<strong>不</strong>拆成多套预设。
-  密钥在 <a href="/admin/llm">模型连接</a>。
+  聊天密钥在 <a href="/admin/llm">LLM 聊天</a>；向量在 <a href="/admin/embedding">向量模型</a>。
 </p>
 
 {% set p = preset_store.presets[0] %}

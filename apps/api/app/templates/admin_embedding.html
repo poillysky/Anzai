@@ -1,0 +1,225 @@
+{% extends "admin_base.html" %}
+{% block title %}向量模型 · 安崽{% endblock %}
+{% block badge %}/admin/embedding{% endblock %}
+{% block content %}
+<h2 class="page-title">向量模型</h2>
+<p class="page-lead">
+  经验知识库：上半配置 <strong>Postgres 地址</strong>（存卡片向量），下半配置
+  <strong>Embedding API</strong>（把文字变成向量）。与
+  <a href="/admin/llm">安崽对话</a>
+  /
+  <a href="/admin/analysis-llm">分析模型</a>
+  完全分离；业务库仍是 SQLite。
+</p>
+
+<form class="card" method="post" action="/admin/embedding/knowledge-db" id="kb-db-form">
+  <h3 style="margin:0 0 8px;font-size:1rem">知识库 Postgres（pgvector）</h3>
+  <label>主机 IP <span class="mute">（必填）</span></label>
+  <input
+    type="text"
+    name="KB_HOST"
+    id="kb-host"
+    value="{{ kb_fields.host }}"
+    placeholder="例如 192.168.2.38"
+    autocomplete="off"
+  />
+
+  <div class="row" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
+    <div style="flex:1;min-width:120px">
+      <label>端口</label>
+      <input type="text" name="KB_PORT" id="kb-port" value="{{ kb_fields.port }}" placeholder="5437" />
+    </div>
+    <div style="flex:1;min-width:140px">
+      <label>数据库名</label>
+      <input type="text" name="KB_DBNAME" id="kb-dbname" value="{{ kb_fields.dbname }}" placeholder="anzai_knowledge" />
+    </div>
+  </div>
+
+  <div class="row" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
+    <div style="flex:1;min-width:140px">
+      <label>用户</label>
+      <input type="text" name="KB_USER" id="kb-user" value="{{ kb_fields.user }}" placeholder="postgres" autocomplete="off" />
+    </div>
+    <div style="flex:1;min-width:140px">
+      <label>密码</label>
+      <input type="password" name="KB_PASSWORD" id="kb-password" value="{{ kb_fields.password }}" placeholder="postgres" autocomplete="off" />
+    </div>
+  </div>
+
+  <p class="hint">
+    仅知识库用。默认端口 <code>5437</code> / 库 <code>anzai_knowledge</code> / 用户密码 <code>postgres</code>；
+    主机 IP 留空并保存则回退本地 <code>.index.json</code>。
+  </p>
+  {% if kb_status.configured %}
+  <p class="hint" style="margin-top:4px">
+    {% if kb_status.ok %}
+    <span class="key-badge key-badge--ok">已连通</span>
+    卡片 {{ kb_status.total }} · 已向量化 {{ kb_status.with_embedding }}
+    {% else %}
+    <span class="key-badge">未连通</span>
+    {{ kb_status.error }}
+    {% endif %}
+  </p>
+  {% else %}
+  <p class="hint">当前未配置主机，知识库走本地索引。</p>
+  {% endif %}
+  <div class="row">
+    <button type="submit">保存</button>
+    <button type="submit" class="btn-ghost" form="kb-db-test-form">测试数据库</button>
+  </div>
+</form>
+
+<form id="kb-db-test-form" method="post" action="/admin/embedding/knowledge-db/test" hidden>
+  <input type="hidden" name="KB_HOST" id="test-kb-host" value="{{ kb_fields.host }}" />
+  <input type="hidden" name="KB_PORT" id="test-kb-port" value="{{ kb_fields.port }}" />
+  <input type="hidden" name="KB_USER" id="test-kb-user" value="{{ kb_fields.user }}" />
+  <input type="hidden" name="KB_PASSWORD" id="test-kb-password" value="{{ kb_fields.password }}" />
+  <input type="hidden" name="KB_DBNAME" id="test-kb-dbname" value="{{ kb_fields.dbname }}" />
+</form>
+
+<form class="card" method="post" action="/admin/embedding/settings" id="embed-form">
+  <h3 style="margin:0 0 8px;font-size:1rem">Embedding API（生成向量）</h3>
+  <label>接口来源</label>
+  <select name="EMBED_SOURCE" id="embed-source">
+    {% for s in embed_sources %}
+    <option
+      value="{{ s.value }}"
+      data-base="{{ s.baseUrl }}"
+      data-model="{{ s.defaultModel }}"
+      {% if active.source == s.value %}selected{% endif %}
+    >{{ s.label }}</option>
+    {% endfor %}
+  </select>
+
+  <label>端点（基础 URL）</label>
+  <input
+    type="text"
+    name="EMBED_BASE_URL"
+    id="embed-base"
+    value="{{ active.baseUrl }}"
+    placeholder="https://….maas.aliyuncs.com/compatible-mode/v1"
+  />
+  <p class="hint">用弹窗里的「OpenAI 兼容地址」，不要填聊天中转。</p>
+
+  <div class="field-head">
+    <label style="margin:0">API 密钥</label>
+    <span class="key-badge {% if active.apiKeySet %}key-badge--ok{% endif %}">
+      {% if active.apiKeySet %}密钥已保存{% else %}未配置{% endif %}
+    </span>
+  </div>
+  <input
+    type="password"
+    name="EMBED_API_KEY"
+    id="embed-key"
+    value=""
+    autocomplete="off"
+    placeholder="{% if active.apiKeySet %}••••••••（输入以更换）{% else %}sk-…{% endif %}"
+  />
+  {% if active.apiKeySet %}
+  <label class="check-row">
+    <input type="checkbox" name="clear_api_key" value="1" />
+    清除已保存密钥
+  </label>
+  {% endif %}
+
+  <label>模型名</label>
+  <input
+    type="text"
+    name="EMBED_MODEL"
+    id="embed-model"
+    value="{{ active.model }}"
+    placeholder="text-embedding-v4"
+  />
+
+  <label>可用模型</label>
+  <select id="embed-model-pick" {% if not model_list %}disabled{% endif %}>
+    <option value="">{% if model_list %}从列表选择…{% else %}None（先点测试连接）{% endif %}</option>
+    {% for m in model_list %}
+    <option value="{{ m }}" {% if m == active.model %}selected{% endif %}>{{ m }}</option>
+    {% endfor %}
+  </select>
+  <p class="hint">测试会调用 <code>POST /embeddings</code> 验通；若端点支持再拉 <code>GET /models</code>。</p>
+
+  <div class="row">
+    <button type="submit">保存 Embedding</button>
+    <button type="submit" class="btn-ghost" form="embed-test-form">测试 Embedding</button>
+  </div>
+</form>
+
+<form id="embed-test-form" method="post" action="/admin/embedding/test" hidden>
+  <input type="hidden" name="EMBED_BASE_URL" id="test-embed-base" value="{{ active.baseUrl }}" />
+  <input type="hidden" name="EMBED_API_KEY" id="test-embed-key" value="" />
+  <input type="hidden" name="EMBED_MODEL" id="test-embed-model" value="{{ active.model }}" />
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var kbMap = [
+    ["kb-host", "test-kb-host"],
+    ["kb-port", "test-kb-port"],
+    ["kb-user", "test-kb-user"],
+    ["kb-password", "test-kb-password"],
+    ["kb-dbname", "test-kb-dbname"],
+  ];
+  function syncKb() {
+    kbMap.forEach(function (pair) {
+      var a = document.getElementById(pair[0]);
+      var b = document.getElementById(pair[1]);
+      if (a && b) b.value = a.value || "";
+    });
+  }
+  kbMap.forEach(function (pair) {
+    var a = document.getElementById(pair[0]);
+    if (a) {
+      ["input", "change"].forEach(function (ev) {
+        a.addEventListener(ev, syncKb);
+      });
+    }
+  });
+  syncKb();
+
+  var source = document.getElementById("embed-source");
+  var base = document.getElementById("embed-base");
+  var model = document.getElementById("embed-model");
+  var key = document.getElementById("embed-key");
+  var pick = document.getElementById("embed-model-pick");
+  var testBase = document.getElementById("test-embed-base");
+  var testKey = document.getElementById("test-embed-key");
+  var testModel = document.getElementById("test-embed-model");
+
+  function syncTest() {
+    if (testBase) testBase.value = base ? base.value : "";
+    if (testKey) testKey.value = key ? key.value : "";
+    if (testModel) testModel.value = model ? model.value : "";
+  }
+
+  if (source && base) {
+    source.addEventListener("change", function () {
+      var opt = source.options[source.selectedIndex];
+      var b = opt.getAttribute("data-base") || "";
+      var m = opt.getAttribute("data-model") || "";
+      if (b) base.value = b;
+      if (m && model && !model.value) model.value = m;
+      else if (m && model && (source.value === "openai" || source.value === "dashscope")) {
+        model.value = m;
+      }
+      syncTest();
+    });
+  }
+  if (pick && model) {
+    pick.addEventListener("change", function () {
+      if (pick.value) model.value = pick.value;
+      syncTest();
+    });
+  }
+  ["input", "change"].forEach(function (ev) {
+    if (base) base.addEventListener(ev, syncTest);
+    if (key) key.addEventListener(ev, syncTest);
+    if (model) model.addEventListener(ev, syncTest);
+  });
+  syncTest();
+})();
+</script>
+{% endblock %}

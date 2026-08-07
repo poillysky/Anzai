@@ -7,7 +7,7 @@ import {
   unlockUnderlyingScroll,
 } from "@/lib/iosKeyboard";
 import { getOverlayRoot } from "@/components/overlay/OverlayContext";
-import { X } from "@/components/ui/icons";
+import { ChevronLeft, X } from "@/components/ui/icons";
 import { useEffect, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
@@ -15,6 +15,8 @@ type Props = {
   open: boolean;
   title: string;
   onClose: () => void;
+  /** When set, show back chevron; Escape pops back instead of closing. */
+  onBack?: () => void;
   children: ReactNode;
   footer?: ReactNode;
 };
@@ -31,7 +33,7 @@ const ENTRANCE_MS = 280;
  * - Only `.modal-lift` translates with `--keyboard-inset` (input stays above keyboard)
  * - Autofocus: mark field `data-autofocus`, never raw `autoFocus` / scrollIntoView
  */
-export function CenterModal({ open, title, onClose, children, footer }: Props) {
+export function CenterModal({ open, title, onClose, onBack, children, footer }: Props) {
   const [root, setRoot] = useState<HTMLElement | null>(() => getOverlayRoot());
 
   useEffect(() => {
@@ -46,7 +48,9 @@ export function CenterModal({ open, title, onClose, children, footer }: Props) {
     lockUnderlyingScroll();
 
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key !== "Escape") return;
+      if (onBack) onBack();
+      else onClose();
     };
     const onFocusIn = () => {
       pinDocumentScroll();
@@ -62,7 +66,7 @@ export function CenterModal({ open, title, onClose, children, footer }: Props) {
       window.removeEventListener("keydown", onKey);
       document.removeEventListener("focusin", onFocusIn);
     };
-  }, [open, onClose]);
+  }, [open, onClose, onBack]);
 
   useEffect(() => {
     if (!open || !root) return;
@@ -74,7 +78,7 @@ export function CenterModal({ open, title, onClose, children, footer }: Props) {
       pinUnderlyingScrollers();
     }, ENTRANCE_MS);
     return () => window.clearTimeout(id);
-  }, [open, root]);
+  }, [open, root, title]);
 
   if (!open || !root) return null;
 
@@ -95,7 +99,12 @@ export function CenterModal({ open, title, onClose, children, footer }: Props) {
           aria-modal="true"
           aria-label={title}
         >
-          <header className="modal-header">
+          <header className={`modal-header${onBack ? " modal-header--back" : ""}`}>
+            {onBack ? (
+              <button type="button" className="modal-back" onClick={onBack} aria-label="返回">
+                <ChevronLeft size={20} strokeWidth={2.25} absoluteStrokeWidth />
+              </button>
+            ) : null}
             <h2 className="modal-title">{title}</h2>
             <button type="button" className="modal-close" onClick={onClose} aria-label="关闭">
               <X size={16} strokeWidth={2.25} absoluteStrokeWidth />

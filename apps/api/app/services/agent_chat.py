@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import urljoin
@@ -22,6 +23,159 @@ from app.services import llm_profiles as profiles_svc
 from app.services import preferences as prefs_svc
 
 logger = logging.getLogger(__name__)
+
+# 开场白按身份多套（语气对齐 identity.tone），session / 新对话随机一条
+_GREETINGS: dict[str, tuple[str, ...]] = {
+    "dad": (
+        "爸好呀！安崽在呢～今天想听大盘，还是家里这点仓，跟安崽说说？",
+        "安崽在呢爸～刚醒，今天想听点啥，直接说就行。",
+        "嘿爸，安崽报到。有想问的票或仓位，扔过来就行。",
+        "回来啦～安崽候着。行情还是仓，你想唠哪头？",
+        "安崽待命中。想盯指数、翻翻仓库，还是随便唠两句？",
+        "爸，安崽来了。不端着，有啥想问的直接开口。",
+        "安崽在～刚瞄了眼盘。想听涨跌还是盘盘家里仓？",
+        "嘿，安崽报到。今天复盘也好，问票也好，你说。",
+        "安崽来啦～像回家唠嗑那样就行，想听啥点一下。",
+        "在呢～大盘、仓位、某只票，扔过来安崽接。",
+    ),
+    "mom": (
+        "妈！安崽来陪你啦～不着急，想聊啥慢慢跟安崽讲哦。",
+        "妈好呀～安崽在呢，行情也好仓位也好，慢慢说。",
+        "安崽来啦妈～今天想听轻松一点的，还是看家里仓？",
+        "安崽候着你～有啥担心的也行，先跟安崽唠两句。",
+        "嗨妈～安崽来了。想看大盘还是看看咱们仓，你说。",
+        "安崽在呢～不赶时间，想听涨跌还是安心看看仓？",
+        "来啦～安崽陪你。今天情绪也好、数也好，慢慢讲就行。",
+        "安崽报到～想先听人话版行情，还是翻翻家里仓？",
+        "在呢妈～有放心不下的，跟安崽说一声就好。",
+        "安崽来啦～先接住你想聊的，再慢慢对上数。",
+    ),
+    "wife": (
+        "嘿嘿，安崽来啦～刚瞄了眼咱们仓库，想听安崽聊哪块呀？",
+        "安崽报到～今天想听行情还是仓位，你点题就行。",
+        "嗨嗨～安崽在呢。咱们仓安崽瞄过，想对哪块跟安崽说。",
+        "安崽来啦～不忙的话，大盘还是家里仓，聊哪个？",
+        "嘿，安崽在～想听涨跌还是盘盘仓，随便开口。",
+        "安崽候着～一起理财那档事，想聊哪头你定。",
+        "来啦～刚看了眼咱们仓。想听倾向也行，不硬下单。",
+        "安崽在呢～行情、仓位、某只票，咱们慢慢对。",
+        "嘿嘿报到～今天复盘还是随便唠两句涨跌？",
+        "安崽来啦～务实聊钱就行，想听啥你开口。",
+    ),
+    "husband": (
+        "嗨嗨，安崽报到～仓库安崽瞄过一眼啦，想对哪块，跟安崽说就行。",
+        "安崽来啦～行情或仓位，你想听哪头？",
+        "嘿，安崽在呢。今天想看大盘还是翻仓库？",
+        "安崽待命～有票想问、仓想聊，直接说。",
+        "报到～安崽刚醒，大盘还是仓位，你定。",
+        "安崽在～咱们仓瞄过了，想听倾向或复盘都行。",
+        "来啦～一起把账理清楚，想聊涨跌还是仓？",
+        "安崽候着～务实说，不装专家，你点题。",
+        "嘿报到～今天看盘还是盘盘咱们仓？",
+        "安崽来啦～有想法扔过来，安崽接住再说清楚。",
+    ),
+    "grandpa": (
+        "安崽来啦～今天想听行情还是仓位，跟安崽唠两句呗。",
+        "爷爷好～安崽在呢，慢慢说，行情仓位都行。",
+        "安崽陪您唠唠～想听大盘还是看看仓？",
+        "安崽来啦爷爷～不着急，想问啥跟安崽讲。",
+        "安崽候着～今天用大白话听行情，还是翻翻仓？",
+        "在呢～安崽把涨跌说成人话，您想听哪头？",
+        "安崽来陪您坐会儿～大盘、仓位，慢慢点。",
+        "报到～不赶，想听指数还是家里仓，您说。",
+        "安崽在～有听不懂的数，安崽用比喻讲给您听。",
+        "来啦爷爷～想唠行情或看看仓，开口就行。",
+    ),
+    "grandma": (
+        "安崽来啦～今天想听行情还是仓位，跟安崽唠两句呗。",
+        "奶奶好～安崽在呢，慢慢说就行。",
+        "安崽陪您坐会儿～想听大盘还是家里仓？",
+        "安崽来啦～有想问的，跟安崽慢慢讲哦。",
+        "在呢～安崽把行情说成听得懂的话，您想听哪块？",
+        "安崽候着～不着急，涨跌也好仓也好，慢慢聊。",
+        "来啦奶奶～想先听轻松版行情，还是看看仓？",
+        "安崽报到～有放心不下的，跟安崽说一声。",
+        "安崽在～数字绕的地方，安崽用人话跟您对。",
+        "陪您唠唠～大盘还是家里仓，您点一下就好。",
+    ),
+    "brother": (
+        "嘿，安崽来了！行情也好仓位也好，随便问安崽～",
+        "安崽在～今天想听啥，大盘还是仓？",
+        "嘿，安崽报到。有票想聊直接扔过来。",
+        "安崽来啦～闲聊行情或盘仓，开麦就行。",
+        "哥，安崽在～不端着，想听涨跌还是翻仓？",
+        "报到～有想吐槽的票也行，安崽接着聊。",
+        "安崽候着～复盘、问票、看仓，你挑。",
+        "嘿来啦～今天轻松唠两句盘，还是认真盘仓？",
+        "安崽在呢～风险安崽会讲清，你先开口。",
+        "来了～大盘指数或家里仓，扔个话题就行。",
+    ),
+    "sister": (
+        "嘿，安崽来了！行情也好仓位也好，随便问安崽～",
+        "安崽在～今天想听大盘还是翻翻仓？",
+        "嗨，安崽报到～有想问的票或仓位说一声。",
+        "安崽来啦～行情仓位都行，随便聊。",
+        "姐，安崽在～别端着，想听啥直接说。",
+        "报到～涨跌也好、仓也好，开麦就行。",
+        "安崽候着～轻松唠盘还是认真看看仓？",
+        "嗨来啦～有想问的票扔过来，安崽接。",
+        "安崽在呢～今天复盘还是随便聊聊行情？",
+        "来啦～大盘、仓位、某只票，你点题。",
+    ),
+    "friend": (
+        "嘿，安崽来了！行情也好仓位也好，随便问安崽～",
+        "安崽在呢～今天聊大盘还是仓位？",
+        "嘿，安崽报到。有想法直接说。",
+        "安崽来啦～闲聊涨跌或家里仓，都行。",
+        "在～不装权威，想听啥扔过来。",
+        "报到～吐槽行情也行，问仓也行。",
+        "安崽候着～复盘、问票、看指数，你挑。",
+        "嘿来了～今天轻松唠两句还是认真对仓？",
+        "安崽在～有想法直接开麦，安崽接住。",
+        "来啦～大盘涨跌或仓位结构，随便开口。",
+    ),
+    "self": (
+        "安崽在这儿呢～今天想听点啥，直接跟安崽说就好。",
+        "安崽待命～大盘还是仓位，自己点题。",
+        "嘿，安崽在。想复盘还是看盘，说一声。",
+        "安崽来啦～今天聊涨跌还是翻翻仓？",
+        "安崽在呢～有想法直接扔过来就行。",
+        "报到～平等聊，专业但不端着。想听哪头？",
+        "安崽候着～指数、仓位、单票，你定。",
+        "在～今天复盘、看盘还是随便问一句？",
+        "安崽来啦～不硬加称呼，想聊啥开口就行。",
+        "待命中～行情或仓库，点一下安崽接着讲。",
+    ),
+}
+# 自定义身份 / 未知 role：中性口语
+_GREETINGS_CONFIGURED = (
+    "安崽来啦～想聊行情还是仓位，安崽都听着哦。",
+    "嗨，安崽在呢～今天想听大盘还是家里仓？",
+    "安崽报到～行情仓位都行，你开口就行。",
+    "安崽来啦～不着急，想聊啥跟安崽说。",
+    "嘿，安崽在～刚醒，大盘还是仓，你点题。",
+    "安崽候着～复盘、问票、看涨跌，随便开口。",
+    "来啦～想听人话版行情还是翻翻仓？",
+    "安崽在呢～有想法扔过来就行。",
+)
+_GREETINGS_SETUP = (
+    "嗨嗨，安崽来啦～先去设置里选一下「你是安崽的谁」，安崽好用对的语气陪你聊呀。",
+    "安崽报到～先到设置里选好身份，安崽才能用对的口气陪你聊哦。",
+    "嘿，安崽在～设置里选一下「你是安崽的谁」，选完安崽就好开口啦。",
+    "安崽来啦～去设置里定一下身份，选完安崽就按对的语气陪你聊。",
+    "报到～先选「你是安崽的谁」，安崽好开口，别用错口气～",
+    "在呢～设置里点一下身份，安崽就能用对的语气候着你啦。",
+)
+
+
+def _pick_greeting(identity: dict[str, Any]) -> str:
+    role = str(identity.get("role") or "")
+    pool = _GREETINGS.get(role)
+    if pool:
+        return random.choice(pool)
+    if identity.get("configured"):
+        return random.choice(_GREETINGS_CONFIGURED)
+    return random.choice(_GREETINGS_SETUP)
 
 
 def resolve_llm_connection(gen: dict[str, Any] | None = None) -> dict[str, str]:
@@ -228,6 +382,18 @@ async def stream_chat_completion(
             },
             ensure_ascii=False,
         )
+        card = tools_svc.card_payload_for_tool(db, user_id, it["name"])
+        if card:
+            yield json.dumps({"type": "card", "card": card}, ensure_ascii=False)
+            if it["name"] == "start_analysis" and isinstance(card, dict):
+                yield json.dumps(
+                    {
+                        "type": "tool_status",
+                        "label": "已经在分析了",
+                        "name": it["name"],
+                    },
+                    ensure_ascii=False,
+                )
     if prefetch_block:
         messages.append({"role": "system", "content": prefetch_block})
 
@@ -314,6 +480,22 @@ async def stream_chat_completion(
                         },
                         ensure_ascii=False,
                     )
+                    card = tools_svc.card_payload_for_tool(db, user_id, name)
+                    if card:
+                        yield json.dumps(
+                            {"type": "card", "card": card}, ensure_ascii=False
+                        )
+                        if name == "start_analysis" and isinstance(card, dict):
+                            ack = str(card.get("ack") or "").strip()
+                            if ack:
+                                yield json.dumps(
+                                    {
+                                        "type": "tool_status",
+                                        "label": "已经在分析了",
+                                        "name": name,
+                                    },
+                                    ensure_ascii=False,
+                                )
                     messages.append(
                         {
                             "role": "tool",
@@ -384,27 +566,7 @@ def session_payload(
 ) -> dict[str, Any]:
     identity = prefs_svc.get_identity(db, user_id)
     preset = presets_svc.get_the_preset()
-    role = identity.get("role") or ""
-    if role == "wife":
-        greeting = "嘿嘿，安崽来啦～刚瞄了眼咱们仓库，想听安崽聊哪块呀？"
-    elif role == "dad":
-        greeting = "爸好呀！安崽在呢～今天想听大盘，还是家里这点仓，跟安崽说说？"
-    elif role == "mom":
-        greeting = "妈！安崽来陪你啦～不着急，想聊啥慢慢跟安崽讲哦。"
-    elif role == "husband":
-        greeting = "嗨嗨，安崽报到～仓库安崽瞄过一眼啦，想对哪块，跟安崽说就行。"
-    elif role in {"grandpa", "grandma"}:
-        greeting = "安崽来啦～今天想听行情还是仓位，跟安崽唠两句呗。"
-    elif role in {"brother", "sister", "friend"}:
-        greeting = "嘿，安崽来了！行情也好仓位也好，随便问安崽～"
-    elif role in {"partner"}:
-        greeting = "安崽来啦～想聊行情还是仓位，安崽都在呢。"
-    elif role == "self":
-        greeting = "安崽在这儿呢～今天想听点啥，直接跟安崽说就好。"
-    elif identity.get("configured"):
-        greeting = "安崽来啦～想聊行情还是仓位，安崽都听着哦。"
-    else:
-        greeting = "嗨嗨，安崽来啦～先去设置里选一下「你是安崽的谁」，安崽好用对的语气陪你聊呀。"
+    greeting = _pick_greeting(identity)
 
     conv = history_svc.resolve_conversation(db, user_id, conversation_id)
     return {
@@ -412,7 +574,7 @@ def session_payload(
         "identity": {**identity, "roles": identity_svc.list_roles()},
         "preset_id": preset["id"],
         "preset_name": preset.get("name") or "",
-        "suggested_chips": list(preset.get("suggested_chips") or presets_svc.DEFAULT_CHIPS),
+        "suggested_chips": [],
         "greeting": greeting,
         "conversation_id": conv.id,
         "conversation": history_svc.conversation_dict(conv),

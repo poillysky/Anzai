@@ -7,7 +7,6 @@ import {
   CalendarDays,
   ChevronLeft,
   ChevronRight,
-  CircleOff,
   Lock,
   Minus,
   Plus,
@@ -25,20 +24,39 @@ import {
   formatSignedMoney,
   pnlArrow,
   pnlClass,
+  pnlTone,
 } from "@/lib/format";
 import { haptics } from "@/lib/haptics";
 import { cacheFetch, cachePeek, cacheSet, PrefetchKeys, PrefetchTtl } from "@/lib/prefetch";
 import type {
+  DepthFlow,
   Holding,
   PortfolioReturnsDim,
   PortfolioReturnsSummary,
   PortfolioSummary,
+  ShortBias,
 } from "@/lib/types";
+
+/** A 股六位代码粗分市场：5/6/9→沪，0/1/2/3→深 */
+function inferCnMarket(code: string): "SH" | "SZ" | null {
+  const s = code.trim();
+  if (!/^\d{6}$/.test(s)) return null;
+  const head = s[0];
+  if (head === "5" || head === "6" || head === "9") return "SH";
+  if (head === "0" || head === "1" || head === "2" || head === "3") return "SZ";
+  return null;
+}
 import { SwipeRevealRow } from "@/features/portfolio/SwipeRevealRow";
+import {
+  biasChipClass,
+  biasChipText,
+  biasChipTitle,
+  isGoldBiasKey,
+} from "@/lib/shortBiasChip";
 
 const POLL_MS = 15000;
 
-type SortKind = "weight" | "pnl" | "value" | "day";
+type SortKind = "weight" | "pnl" | "day";
 type PnlMode = "day" | "total";
 type TradeMode = "add" | "reduce" | "edit";
 
@@ -60,7 +78,6 @@ function roundCost(n: number) {
 }
 
 const SORT_TABS: { kind: SortKind; label: string }[] = [
-  { kind: "value", label: "市值" },
   { kind: "day", label: "今日" },
   { kind: "pnl", label: "累计" },
   { kind: "weight", label: "占比" },
@@ -72,6 +89,16 @@ function formatClockShort(d: Date): string {
     minute: "2-digit",
     hour12: false,
   });
+}
+
+/** 元 → 亿/万，带符号 */
+function formatFlowYi(amount: number): string {
+  const yi = amount / 1e8;
+  if (Math.abs(yi) >= 0.01) {
+    return `${yi >= 0 ? "+" : ""}${yi.toFixed(2)}亿`;
+  }
+  const wan = amount / 1e4;
+  return `${wan >= 0 ? "+" : ""}${wan.toFixed(0)}万`;
 }
 
 /** Local calendar YYYY-MM-DD (default 买入日). */
@@ -171,35 +198,43 @@ type HoldingGroup = {
   key: string;
   symbol: string;
   name: string;
-  market: "SH" | "SZ";
+  market: "SH" | "SZ" | "JD";
   lots: Holding[];
   shares: number;
   cost: number;
   market_value: number;
   weight: number;
   day_pnl: number;
+  day_pnl_pct: number | null;
   pnl: number;
   last_price: number | null;
   change_pct: number | null;
   pnl_pct: number | null;
 };
 
-/** Client-side recompute after delete — mirrors backend portfolio.py formulas. */
+/** Client-side recompute after delete — mirrors backend cashflow % when possible. */
 function summarizeHoldings(holdings: Holding[]): PortfolioSummary {
   let totalCost = 0;
   let totalMv = 0;
   let totalDay = 0;
-  let totalPrev = 0;
+  let totalDayBase = 0;
   for (const h of holdings) {
     const price = h.last_price ?? h.cost;
     const mv = h.market_value ?? h.shares * price;
     totalCost += h.shares * h.cost;
     totalMv += mv;
-    if (h.day_pnl != null) totalDay += h.day_pnl;
-    if (h.prev_close != null && h.prev_close > 0) {
-      totalPrev += h.shares * h.prev_close;
-    } else if (h.day_pnl != null) {
-      totalPrev += mv - h.day_pnl;
+    const dp = h.day_pnl ?? 0;
+    totalDay += dp;
+    const dpp = h.day_pnl_pct;
+    if (dpp != null && Number.isFinite(dpp) && Math.abs(dpp) > 1e-9) {
+      // recover baseline: day_pnl / (pct/100)
+      totalDayBase += (dp / dpp) * 100;
+    } else if (dpp === 0 || dpp == null) {
+      if (h.prev_close != null && h.prev_close > 0) {
+        totalDayBase += h.shares * h.prev_close;
+      } else if (Math.abs(dp) > 1e-9) {
+        totalDayBase += Math.max(mv - dp, 0);
+      }
     }
   }
   const totalPnl = totalMv - totalCost;
@@ -219,7 +254,7 @@ function summarizeHoldings(holdings: Holding[]): PortfolioSummary {
       totalCost > 0 ? Math.round((totalPnl / totalCost) * 10000) / 100 : 0,
     day_pnl: Math.round(totalDay * 100) / 100,
     day_pnl_pct:
-      totalPrev > 0 ? Math.round((totalDay / totalPrev) * 10000) / 100 : 0,
+      totalDayBase > 1e-9 ? Math.round((totalDay / totalDayBase) * 10000) / 100 : 0,
     holdings: next,
   };
 }
@@ -245,6 +280,24 @@ function groupHoldings(items: Holding[]): HoldingGroup[] {
     const primary = ordered.reduce((a, b) =>
       (b.market_value ?? 0) > (a.market_value ?? 0) ? b : a,
     );
+    const day_pnl_pct =
+      ordered.length === 1
+        ? (primary.day_pnl_pct ?? null)
+        : (() => {
+            let dayBase = 0;
+            for (const h of ordered) {
+              const dp = h.day_pnl ?? 0;
+              const dpp = h.day_pnl_pct;
+              if (dpp != null && Number.isFinite(dpp) && Math.abs(dpp) > 1e-9) {
+                dayBase += (dp / dpp) * 100;
+              } else if (h.prev_close != null && h.prev_close > 0) {
+                dayBase += h.shares * h.prev_close;
+              }
+            }
+            return dayBase > 1e-9
+              ? Math.round((day_pnl / dayBase) * 10000) / 100
+              : primary.day_pnl_pct ?? null;
+          })();
     return {
       key,
       symbol: primary.symbol,
@@ -256,6 +309,7 @@ function groupHoldings(items: Holding[]): HoldingGroup[] {
       market_value,
       weight,
       day_pnl,
+      day_pnl_pct,
       pnl,
       last_price: primary.last_price ?? null,
       change_pct: primary.change_pct ?? null,
@@ -268,34 +322,11 @@ function sortGroups(groups: HoldingGroup[], kind: SortKind): HoldingGroup[] {
   const list = [...groups];
   if (kind === "day") list.sort((a, b) => b.day_pnl - a.day_pnl);
   else if (kind === "pnl") list.sort((a, b) => (b.pnl_pct ?? 0) - (a.pnl_pct ?? 0));
-  else if (kind === "value") list.sort((a, b) => b.market_value - a.market_value);
   else list.sort((a, b) => b.weight - a.weight);
   return list;
 }
 
-/** Merge same-symbol lots into one row — UI only shows current state. */
-async function consolidateDuplicateLots(holdings: Holding[]): Promise<boolean> {
-  const groups = groupHoldings(holdings).filter((g) => g.lots.length > 1);
-  if (groups.length === 0) return false;
-  for (const g of groups) {
-    const primary = g.lots.reduce((a, b) =>
-      (b.market_value ?? 0) >= (a.market_value ?? 0) ? b : a,
-    );
-    let s = primary.shares;
-    let c = primary.cost;
-    for (const h of g.lots) {
-      if (h.id === primary.id) continue;
-      const merged = applyBuy(s, c, h.shares, h.cost);
-      s = merged.shares;
-      c = merged.cost;
-    }
-    await api.updateHolding(primary.id, { shares: s, cost: c });
-    for (const h of g.lots) {
-      if (h.id !== primary.id) await api.deleteHolding(h.id);
-    }
-  }
-  return true;
-}
+/** @deprecated Removed — server consolidate_same_symbol on GET. */
 
 /** Hero calendar entry — opens 收益日历. */
 function ReturnsCalEntry({
@@ -345,7 +376,7 @@ export default function PortfolioScreen() {
   );
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [pollFailed, setPollFailed] = useState(false);
-  const [sortKind, setSortKind] = useState<SortKind>("value");
+  const [sortKind, setSortKind] = useState<SortKind>("day");
   const [pnlMode, setPnlMode] = useState<PnlMode>("day");
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -353,6 +384,7 @@ export default function PortfolioScreen() {
   const searchRef = useRef<HTMLInputElement>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [detail, setDetail] = useState<Holding | null>(null);
+  const [detailPage, setDetailPage] = useState<"overview" | "trade">("overview");
   const [tradeMode, setTradeMode] = useState<TradeMode>("add");
   const [deleteId, setDeleteId] = useState<number | null>(null);
   const [pendingDelete, setPendingDelete] = useState<{
@@ -360,8 +392,15 @@ export default function PortfolioScreen() {
     label: string;
   } | null>(null);
   const [swipeOpenKey, setSwipeOpenKey] = useState<string | null>(null);
+  const [shortBiasByKey, setShortBiasByKey] = useState<Record<string, ShortBias>>(
+    {},
+  );
+  const [depthFlow, setDepthFlow] = useState<DepthFlow | null>(null);
+  const [depthFlowLoading, setDepthFlowLoading] = useState(false);
+  const [depthExpanded, setDepthExpanded] = useState(false);
   const [tradeQty, setTradeQty] = useState("");
   const [tradePrice, setTradePrice] = useState("");
+  const [tradeDate, setTradeDate] = useState(todayIsoDate);
   const [returnsOpen, setReturnsOpen] = useState(false);
   const [returnsOpening, setReturnsOpening] = useState(false);
   const [returnsDim, setReturnsDim] = useState<PortfolioReturnsDim>("day");
@@ -375,11 +414,16 @@ export default function PortfolioScreen() {
   const [returnsSelected, setReturnsSelected] = useState<string | null>(null);
   const returnsOpenGen = useRef(0);
 
-  const [symbol, setSymbol] = useState("510300");
+  const [symbol, setSymbol] = useState("");
   const [market, setMarket] = useState<"SH" | "SZ">("SH");
   const [shares, setShares] = useState("1000");
   const [cost, setCost] = useState("4.20");
   const [boughtAt, setBoughtAt] = useState(todayIsoDate);
+  const [resolveName, setResolveName] = useState("");
+  const [resolveStatus, setResolveStatus] = useState<"idle" | "loading" | "ok" | "miss">(
+    "idle",
+  );
+  const resolveGen = useRef(0);
 
   const warmReturnsCache = useCallback(() => {
     for (const dim of ["day", "month", "year"] as const) {
@@ -397,9 +441,6 @@ export default function PortfolioScreen() {
     try {
       setError(null);
       let portfolio = await api.getPortfolio();
-      if (await consolidateDuplicateLots(portfolio.holdings)) {
-        portfolio = await api.getPortfolio();
-      }
       cacheSet(PrefetchKeys.portfolio, portfolio);
       setData(portfolio);
       setUpdatedAt(new Date());
@@ -409,6 +450,25 @@ export default function PortfolioScreen() {
         return portfolio.holdings.find((h) => h.id === prev.id) ?? null;
       });
       warmReturnsCache();
+      const keys = [
+        ...new Set(
+          portfolio.holdings.map((h) => `${h.market}:${h.symbol}`),
+        ),
+      ];
+      if (keys.length > 0) {
+        try {
+          const batch = await api.getShortBias(keys);
+          const next: Record<string, ShortBias> = {};
+          for (const item of batch.items) {
+            next[`${item.market}:${item.symbol}`] = item;
+          }
+          setShortBiasByKey(next);
+        } catch {
+          // bias is additive — keep last good map on transient failure
+        }
+      } else {
+        setShortBiasByKey({});
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : "加载失败";
       setError(msg);
@@ -604,6 +664,8 @@ export default function PortfolioScreen() {
           shares: next.shares,
           cost: next.cost,
           bought_at: earlier,
+          trade_price: price,
+          trade_date: buyDate,
         });
         for (const h of same) {
           if (h.id !== primary.id) await api.deleteHolding(h.id);
@@ -614,6 +676,7 @@ export default function PortfolioScreen() {
         await api.createHolding({
           symbol: sym,
           market,
+          name: resolveName.trim() || undefined,
           shares: qty,
           cost: price,
           bought_at: boughtAt.trim() || todayIsoDate(),
@@ -638,9 +701,17 @@ export default function PortfolioScreen() {
         shares: Number(shares),
         cost: Number(cost),
         bought_at: boughtAt.trim() || todayIsoDate(),
+        ...(Number(shares) !== detail.shares
+          ? {
+              trade_price:
+                detail.last_price != null && detail.last_price > 0
+                  ? detail.last_price
+                  : Number(cost) || detail.cost,
+            }
+          : {}),
       });
       toast("已更新", "success");
-      setDetail(null);
+      closeDetail();
       await load();
     } catch {
       toast("更新失败", "warning");
@@ -667,9 +738,14 @@ export default function PortfolioScreen() {
       const next = applyBuy(detail.shares, detail.cost, qty, price);
       setSaving(true);
       try {
-        await api.updateHolding(detail.id, { shares: next.shares, cost: next.cost });
+        await api.updateHolding(detail.id, {
+          shares: next.shares,
+          cost: next.cost,
+          trade_price: price,
+          trade_date: tradeDate.trim() || todayIsoDate(),
+        });
         toast(`已补仓 ${qty} 份`, "success");
-        setDetail(null);
+        closeDetail();
         await load();
       } catch {
         toast("补仓失败", "warning");
@@ -680,6 +756,10 @@ export default function PortfolioScreen() {
     }
 
     if (tradeMode === "reduce") {
+      if (!Number.isFinite(price) || price <= 0) {
+        toast("请输入卖出价", "warning");
+        return;
+      }
       if (qty > detail.shares) {
         toast("减仓份额不能超过持仓", "warning");
         return;
@@ -691,9 +771,12 @@ export default function PortfolioScreen() {
       const next = applySell(detail.shares, detail.cost, qty);
       setSaving(true);
       try {
-        await api.updateHolding(detail.id, { shares: next.shares });
+        await api.updateHolding(detail.id, {
+          shares: next.shares,
+          trade_price: price,
+        });
         toast(`已减仓 ${qty} 份`, "success");
-        setDetail(null);
+        closeDetail();
         await load();
       } catch {
         toast("减仓失败", "warning");
@@ -714,7 +797,7 @@ export default function PortfolioScreen() {
     setDeleteId(null);
     setPendingDelete(null);
     setSwipeOpenKey(null);
-    setDetail(null);
+    closeDetail();
     setData((prev) => {
       if (!prev) return prev;
       return summarizeHoldings(prev.holdings.filter((h) => !idSet.has(h.id)));
@@ -743,17 +826,68 @@ export default function PortfolioScreen() {
 
   function openAdd() {
     haptics.tap();
-    setSymbol("510300");
+    setSymbol("");
     setMarket("SH");
     setShares("1000");
     setCost("4.20");
     setBoughtAt(todayIsoDate());
+    setResolveName("");
+    setResolveStatus("idle");
     setAddOpen(true);
   }
+
+  /** 输入代码 → 搜名称，并尽量对齐市场 */
+  useEffect(() => {
+    if (!addOpen) return;
+    const q = symbol.trim();
+    if (!q) {
+      setResolveName("");
+      setResolveStatus("idle");
+      return;
+    }
+    const inferred = inferCnMarket(q);
+    if (inferred) setMarket(inferred);
+
+    const gen = ++resolveGen.current;
+    setResolveStatus("loading");
+    const timer = window.setTimeout(() => {
+      void api
+        .searchSymbols(q, 8)
+        .then((res) => {
+          if (gen !== resolveGen.current) return;
+          const items = res.items || [];
+          const exact = items.find(
+            (h) => h.symbol.replace(/^0+/, "") === q.replace(/^0+/, "") || h.symbol === q,
+          );
+          const hit =
+            exact ||
+            items.find((h) => h.market === "SH" || h.market === "SZ") ||
+            items[0] ||
+            null;
+          if (!hit || (hit.market !== "SH" && hit.market !== "SZ")) {
+            setResolveName("");
+            setResolveStatus(q.length >= 6 ? "miss" : "idle");
+            return;
+          }
+          setResolveName(hit.name || "");
+          setMarket(hit.market);
+          setResolveStatus(hit.name ? "ok" : "miss");
+        })
+        .catch(() => {
+          if (gen !== resolveGen.current) return;
+          setResolveName("");
+          setResolveStatus("miss");
+        });
+    }, 280);
+    return () => window.clearTimeout(timer);
+  }, [addOpen, symbol]);
 
   function openDetail(h: Holding) {
     haptics.tap();
     setDetail(h);
+    setDetailPage("overview");
+    setDepthFlow(null);
+    setDepthExpanded(false);
     setTradeMode("reduce");
     setShares(String(h.shares));
     setCost(String(h.cost));
@@ -764,23 +898,86 @@ export default function PortfolioScreen() {
     );
   }
 
-  /** Open card using live row — shares on modal must match list (after server consolidate). */
-  async function openGroupDetail(g: HoldingGroup) {
-    try {
-      const portfolio = await api.getPortfolio();
-      setData(portfolio);
-      setUpdatedAt(new Date());
-      const row = portfolio.holdings.find(
-        (h) => h.symbol === g.symbol && h.market === g.market,
+  function closeDetail() {
+    setDetail(null);
+    setDetailPage("overview");
+  }
+
+  function openTradePage(mode: TradeMode) {
+    haptics.tap();
+    setTradeMode(mode);
+    if (mode === "add" && detail) {
+      setTradeDate(todayIsoDate());
+      setTradePrice(
+        detail.last_price != null && detail.last_price > 0
+          ? String(detail.last_price)
+          : String(detail.cost),
       );
-      if (!row) {
-        toast("持仓不存在", "warning");
-        return;
-      }
-      openDetail(row);
-    } catch {
-      toast("打开失败", "warning");
+      setTradeQty("");
+    } else if (mode === "reduce") {
+      setTradeQty("");
+    } else if (mode === "edit" && detail) {
+      setShares(String(detail.shares));
+      setCost(String(detail.cost));
+      setBoughtAt(detail.bought_at?.trim() || todayIsoDate());
     }
+    setDetailPage("trade");
+  }
+
+  function backDetailOverview() {
+    haptics.tap();
+    setDetailPage("overview");
+  }
+
+  useEffect(() => {
+    if (!detail) {
+      setDepthFlow(null);
+      setDepthFlowLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setDepthFlowLoading(true);
+    void api
+      .getDepthFlow(detail.symbol, detail.market, 5)
+      .then((snap) => {
+        if (!cancelled) setDepthFlow(snap);
+      })
+      .catch(() => {
+        if (!cancelled) setDepthFlow(null);
+      })
+      .finally(() => {
+        if (!cancelled) setDepthFlowLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [detail?.id, detail?.symbol, detail?.market]);
+
+  /** Open from list row immediately; soft-refresh so modal stays in sync after consolidate. */
+  function openGroupDetail(g: HoldingGroup) {
+    const live =
+      data?.holdings.find((h) => h.symbol === g.symbol && h.market === g.market) ??
+      g.lots[0];
+    if (!live) {
+      toast("持仓不存在", "warning");
+      return;
+    }
+    openDetail(live);
+    void api
+      .getPortfolio()
+      .then((portfolio) => {
+        setData(portfolio);
+        setUpdatedAt(new Date());
+        const row = portfolio.holdings.find(
+          (h) => h.symbol === g.symbol && h.market === g.market,
+        );
+        if (row) {
+          setDetail((prev) => (prev && prev.symbol === row.symbol ? row : prev));
+        }
+      })
+      .catch(() => {
+        /* keep optimistic open */
+      });
   }
 
   const tradePreview = useMemo(() => {
@@ -990,7 +1187,9 @@ export default function PortfolioScreen() {
                   ? g.pnl_pct
                   : sortKind === "weight"
                     ? g.weight
-                    : g.change_pct;
+                    : sortKind === "day"
+                      ? g.day_pnl_pct
+                      : g.change_pct;
               const pctLabel =
                 sortKind === "weight"
                   ? `${g.weight.toFixed(1)}%`
@@ -1000,20 +1199,25 @@ export default function PortfolioScreen() {
                   ? formatSignedMoney(g.day_pnl)
                   : sortKind === "pnl"
                     ? formatSignedMoney(g.pnl)
-                    : sortKind === "weight"
-                      ? formatMoney(g.market_value)
-                      : formatMoney(g.market_value);
+                    : formatMoney(g.market_value);
               const mainClass =
                 sortKind === "day"
                   ? pnlClass(g.day_pnl)
                   : sortKind === "pnl"
                     ? pnlClass(g.pnl)
                     : "";
-              const live =
-                data?.holdings.find((h) => h.symbol === g.symbol && h.market === g.market) ??
-                g.lots[0];
               const cardTone =
-                g.day_pnl > 0 ? "up" : g.day_pnl < 0 ? "down" : "flat";
+                sortKind === "pnl"
+                  ? g.pnl > 0
+                    ? "up"
+                    : g.pnl < 0
+                      ? "down"
+                      : "flat"
+                  : g.day_pnl > 0
+                    ? "up"
+                    : g.day_pnl < 0
+                      ? "down"
+                      : "flat";
               return (
                 <article key={g.key} className="portfolio-card" data-tone={cardTone}>
                   <SwipeRevealRow
@@ -1035,21 +1239,33 @@ export default function PortfolioScreen() {
                       }}
                     >
                       <div className="portfolio-card-left">
-                        <span className="portfolio-row-name">{g.name}</span>
+                        <span className="portfolio-row-name">
+                          <span className="portfolio-row-name-text">{g.name}</span>
+                          {(() => {
+                            const bias = shortBiasByKey[g.key];
+                            if (!bias) return null;
+                            if (
+                              bias.bias === "na" &&
+                              !bias.label.includes("陈旧")
+                            ) {
+                              return null;
+                            }
+                            return (
+                              <span
+                                className={biasChipClass(bias, g.market, g.symbol)}
+                                title={biasChipTitle(bias, g.market, g.symbol)}
+                              >
+                                {biasChipText(bias, g.market, g.symbol)}
+                              </span>
+                            );
+                          })()}
+                        </span>
                         <span className="portfolio-row-meta">
                           {g.symbol}
                           <span className="portfolio-row-dot" aria-hidden>
                             ·
                           </span>
                           {formatMoney(g.last_price)}
-                          <span className="portfolio-row-dot" aria-hidden>
-                            ·
-                          </span>
-                          {live.shares}份
-                        </span>
-                        <span className="portfolio-card-mv text-mute">
-                          市值 {formatMoney(live.market_value ?? g.market_value)} · 成本{" "}
-                          {formatMoney(live.cost)}
                         </span>
                       </div>
                       <div className="portfolio-card-right">
@@ -1135,11 +1351,30 @@ export default function PortfolioScreen() {
           <input
             className="full"
             value={symbol}
-            onChange={(e) => setSymbol(e.target.value)}
-            placeholder="代码，如 510300"
+            onChange={(e) => {
+              const next = e.target.value.replace(/\s/g, "");
+              setSymbol(next);
+              setResolveName("");
+              setResolveStatus(next ? "loading" : "idle");
+            }}
+            placeholder="代码，如 518880 / 510300"
             inputMode="numeric"
+            autoComplete="off"
             required
           />
+          <p
+            className="portfolio-resolve-hint full"
+            data-status={resolveStatus}
+            aria-live="polite"
+          >
+            {resolveStatus === "loading"
+              ? "识别名称中…"
+              : resolveStatus === "ok" && resolveName
+                ? `${resolveName} · ${market}`
+                : resolveStatus === "miss"
+                  ? "未找到该代码，仍可手动加入（保存时再取行情名）"
+                  : "输入六位代码后自动识别中文名称"}
+          </p>
           <select
             className="full"
             value={market}
@@ -1163,7 +1398,7 @@ export default function PortfolioScreen() {
             type="number"
             min="0"
             step="0.001"
-            placeholder="成本价"
+            placeholder="买入价（成交价）"
             required
           />
           <label className="full portfolio-date-field">
@@ -1175,184 +1410,303 @@ export default function PortfolioScreen() {
               required
             />
           </label>
+          <p className="portfolio-trade-hint full">
+            昨买今录：买入日选昨天、买入价填昨成交价。今日盈亏按昨收算；累计盈亏按买入价算。
+          </p>
         </form>
       </CenterModal>
 
       <CenterModal
         open={detail != null}
-        title={detail?.name || detail?.symbol || "持仓详情"}
-        onClose={() => setDetail(null)}
+        title={
+          detailPage === "trade"
+            ? tradeMode === "add"
+              ? "补仓"
+              : tradeMode === "reduce"
+                ? "减仓"
+                : "改成本"
+            : detail?.name || detail?.symbol || "持仓详情"
+        }
+        onClose={closeDetail}
+        onBack={detailPage === "trade" ? backDetailOverview : undefined}
         footer={
-          tradeMode === "edit" ? (
-            <div className="portfolio-detail-footer">
-              <button
-                type="button"
-                className="btn btn-ghost"
-                onClick={() => {
-                  if (detail) setDeleteId(detail.id);
-                }}
-              >
-                空仓
-              </button>
-              <button
-                className="btn btn-block"
-                type="submit"
-                form="edit-holding-form"
-                disabled={saving}
-              >
-                {saving ? "保存中…" : "保存修改"}
-              </button>
-            </div>
+          detailPage === "overview" ? (
+            <button
+              type="button"
+              className="btn btn-ghost btn-block"
+              onClick={() => {
+                if (detail) setDeleteId(detail.id);
+              }}
+            >
+              空仓
+            </button>
+          ) : tradeMode === "edit" ? (
+            <button
+              className="btn btn-block"
+              type="submit"
+              form="edit-holding-form"
+              disabled={saving}
+            >
+              {saving ? "保存中…" : "保存修改"}
+            </button>
           ) : (
-            <div className="portfolio-detail-footer">
-              <button
-                type="button"
-                className="btn btn-ghost"
-                onClick={() => {
-                  if (detail) setDeleteId(detail.id);
-                }}
-              >
-                空仓
-              </button>
-              <button
-                className="btn btn-block"
-                type="submit"
-                form="trade-holding-form"
-                disabled={saving}
-              >
-                {saving
-                  ? "提交中…"
-                  : tradeMode === "add"
-                    ? "确认补仓"
-                    : "确认减仓"}
-              </button>
-            </div>
+            <button
+              className="btn btn-block"
+              type="submit"
+              form="trade-holding-form"
+              disabled={saving}
+            >
+              {saving
+                ? "提交中…"
+                : tradeMode === "add"
+                  ? "确认补仓"
+                  : "确认减仓"}
+            </button>
           )
         }
       >
-        {detail && (
+        {detail && detailPage === "overview" ? (
           <div className="portfolio-detail">
-            <div className="market-detail-quote">
-              <div className="market-detail-code">
-                <span className="market-detail-mkt">{detail.market}</span>
-                <span className="market-detail-sym">{detail.symbol}</span>
-              </div>
-              <div className={`market-detail-price ${pnlClass(detail.change_pct)}`}>
-                {formatMoney(detail.last_price)}
-              </div>
-              <div className={`market-detail-chg ${pnlClass(detail.change_pct)}`}>
-                <span className="pnl-arrow">{pnlArrow(detail.change_pct)}</span>
-                {formatPct(detail.change_pct)}
-              </div>
-            </div>
+            {(() => {
+              const bias = shortBiasByKey[`${detail.market}:${detail.symbol}`];
+              const lastFlow = depthFlow?.flow_days?.length
+                ? depthFlow.flow_days[depthFlow.flow_days.length - 1]
+                : null;
+              const bid1 = depthFlow?.book?.bids?.[0];
+              const ask1 = depthFlow?.book?.asks?.[0];
+              const quoteTone = pnlTone(
+                detail.change_pct,
+                detail.last_price,
+                detail.prev_close,
+              );
+              const dayTone =
+                (detail.day_pnl ?? 0) > 0
+                  ? "up"
+                  : (detail.day_pnl ?? 0) < 0
+                    ? "down"
+                    : "flat";
+              const totalTone =
+                (detail.pnl ?? 0) > 0 ? "up" : (detail.pnl ?? 0) < 0 ? "down" : "flat";
+              return (
+                <>
+                  <div className="portfolio-detail-quote">
+                    <div className="portfolio-detail-quote-main">
+                      <span className="portfolio-detail-code">
+                        {detail.market} · {detail.symbol}
+                      </span>
+                      <span className={`portfolio-detail-last ${quoteTone}`}>
+                        {formatMoney(detail.last_price)}
+                      </span>
+                    </div>
+                    <div className="portfolio-detail-quote-side">
+                      <span className={`portfolio-detail-quote-badge ${quoteTone}`}>
+                        <span className="portfolio-detail-quote-tag">行情</span>
+                        {formatPct(detail.change_pct)}
+                      </span>
+                      {bias &&
+                      !(bias.bias === "na" && !bias.label.includes("陈旧")) ? (
+                        <span
+                          className={biasChipClass(bias, detail.market, detail.symbol)}
+                          title={biasChipTitle(bias, detail.market, detail.symbol)}
+                        >
+                          {biasChipText(bias, detail.market, detail.symbol)}
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
 
-            <div className="portfolio-detail-stats portfolio-detail-stats-4">
-              <div>
-                <div className="portfolio-meta-label">今日盈亏</div>
-                <div className={`portfolio-meta-value ${pnlClass(detail.day_pnl)}`}>
-                  {formatSignedMoney(detail.day_pnl)}
-                </div>
-              </div>
-              <div>
-                <div className="portfolio-meta-label">累计盈亏</div>
-                <div className={`portfolio-meta-value ${pnlClass(detail.pnl)}`}>
-                  {formatSignedMoney(detail.pnl)}
-                </div>
-              </div>
-              <div>
-                <div className="portfolio-meta-label">持仓 / 成本</div>
-                <div className="portfolio-meta-value">
-                  {detail.shares} · {formatMoney(detail.cost)}
-                </div>
-              </div>
-              <div>
-                <div className="portfolio-meta-label">市值 / 占比</div>
-                <div className="portfolio-meta-value">
-                  {formatMoney(detail.market_value)} · {(detail.weight ?? 0).toFixed(1)}%
-                </div>
-              </div>
-            </div>
-            <p className="portfolio-bought-meta">
-              买入日 {detail.bought_at?.trim() || boughtAt || "—"}
-            </p>
+                  <div className="portfolio-detail-pnl" role="group" aria-label="盈亏">
+                    <div className="portfolio-detail-pnl-cell" data-tone={dayTone}>
+                      <div className="portfolio-detail-pnl-label">今日</div>
+                      <div className={`portfolio-detail-pnl-amt ${pnlClass(detail.day_pnl)}`}>
+                        {formatSignedMoney(detail.day_pnl)}
+                      </div>
+                      <div className={`portfolio-detail-pnl-pct ${pnlClass(detail.day_pnl_pct)}`}>
+                        {formatPct(detail.day_pnl_pct)}
+                      </div>
+                    </div>
+                    <div className="portfolio-detail-pnl-cell" data-tone={totalTone}>
+                      <div className="portfolio-detail-pnl-label">累计</div>
+                      <div className={`portfolio-detail-pnl-amt ${pnlClass(detail.pnl)}`}>
+                        {formatSignedMoney(detail.pnl)}
+                      </div>
+                      <div className={`portfolio-detail-pnl-pct ${pnlClass(detail.pnl_pct)}`}>
+                        {formatPct(detail.pnl_pct)}
+                      </div>
+                    </div>
+                  </div>
 
-            <div className="portfolio-trade-tabs" role="tablist" aria-label="仓位操作">
-              <button
-                type="button"
-                role="tab"
-                data-active={tradeMode === "add" ? "1" : "0"}
-                onClick={() => {
-                  haptics.tap();
-                  setTradeMode("add");
-                  setTradePrice(
-                    detail.last_price != null && detail.last_price > 0
-                      ? String(detail.last_price)
-                      : String(detail.cost),
-                  );
-                }}
-              >
+                  <div className="portfolio-detail-facts" aria-label="持仓概况">
+                    <div>
+                      <span>{detail.market === "JD" ? "克数" : "份额"}</span>
+                      <b>{detail.shares}</b>
+                    </div>
+                    <div>
+                      <span>成本</span>
+                      <b>{formatMoney(detail.cost)}</b>
+                    </div>
+                    <div>
+                      <span>市值</span>
+                      <b>{formatMoney(detail.market_value)}</b>
+                    </div>
+                    <div>
+                      <span>仓位</span>
+                      <b>{(detail.weight ?? 0).toFixed(1)}%</b>
+                    </div>
+                    <div className="portfolio-detail-facts-wide">
+                      <span>买入日</span>
+                      <b>{detail.bought_at?.trim() || boughtAt || "—"}</b>
+                    </div>
+                  </div>
+
+                  <section className="portfolio-depth-flow portfolio-depth-flow--sheet" aria-label="盘口与资金">
+                    <button
+                      type="button"
+                      className="portfolio-depth-toggle"
+                      onClick={() => {
+                        haptics.tap();
+                        setDepthExpanded((v) => !v);
+                      }}
+                    >
+                      <span className="portfolio-depth-toggle-main">
+                        {(() => {
+                          if (depthFlowLoading && !depthFlow) return "资金加载中…";
+                          if (detail.market === "JD") {
+                            return depthFlow?.flow_label || "积存金无场内资金";
+                          }
+                          const flowBit = lastFlow
+                            ? `${depthFlow?.flow_label || "资金"} ${formatFlowYi(lastFlow.main_net)}`
+                            : "资金暂无";
+                          if (depthFlow?.book_live && bid1 && ask1) {
+                            return `${flowBit} · 买${bid1.price.toFixed(2)}/卖${ask1.price.toFixed(2)}`;
+                          }
+                          if (depthFlow && !depthFlow.book_live) {
+                            const bookHint = isGoldBiasKey(detail.market, detail.symbol)
+                              ? " · 场内已收无盘口"
+                              : " · 已收盘无盘口";
+                            return `${flowBit}${bookHint}`;
+                          }
+                          return flowBit;
+                        })()}
+                      </span>
+                      <span className="portfolio-depth-toggle-chevron" data-open={depthExpanded ? "1" : "0"}>
+                        {depthExpanded
+                          ? "收起"
+                          : detail.market === "JD"
+                            ? "说明"
+                            : depthFlow?.book_live
+                              ? "盘口"
+                              : "明细"}
+                      </span>
+                    </button>
+                    {depthExpanded ? (
+                      <div className="portfolio-depth-panel">
+                        {detail.market === "JD" ? (
+                          <p className="text-mute portfolio-depth-flow-empty">
+                            {depthFlow?.note ||
+                              "积存金为场外金价，无交易所五档与主力资金；请看实时金价与仓位盈亏。"}
+                          </p>
+                        ) : (
+                          <>
+                            {lastFlow ? (
+                              <p className="text-mute portfolio-flow-mini">
+                                超大 {formatFlowYi(lastFlow.super_net)} · 大{" "}
+                                {formatFlowYi(lastFlow.large_net)} · 中{" "}
+                                {formatFlowYi(lastFlow.mid_net)} · 小{" "}
+                                {formatFlowYi(lastFlow.small_net)}
+                              </p>
+                            ) : null}
+                            {depthFlow?.book_live &&
+                            depthFlow.book &&
+                            (depthFlow.book.bids.length > 0 || depthFlow.book.asks.length > 0) ? (
+                              <div className="portfolio-book-grid" aria-label="买卖五档">
+                                <div className="portfolio-book-col is-ask">
+                                  <span className="portfolio-book-col-label">卖</span>
+                                  {[...depthFlow.book.asks].reverse().map((lv, i) => (
+                                    <div key={`a-${i}`} className="portfolio-book-row">
+                                      <span>{lv.price > 0 ? lv.price.toFixed(2) : "—"}</span>
+                                      <span>{lv.volume > 0 ? Math.round(lv.volume) : "—"}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                                <div className="portfolio-book-col is-bid">
+                                  <span className="portfolio-book-col-label">买</span>
+                                  {depthFlow.book.bids.map((lv, i) => (
+                                    <div key={`b-${i}`} className="portfolio-book-row">
+                                      <span>{lv.price > 0 ? lv.price.toFixed(2) : "—"}</span>
+                                      <span>{lv.volume > 0 ? Math.round(lv.volume) : "—"}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            ) : (
+                              <p className="text-mute portfolio-depth-flow-empty">
+                                {depthFlow?.session_state === "trading"
+                                  ? "五档暂无挂单"
+                                  : isGoldBiasKey(detail.market, detail.symbol)
+                                    ? "黄金ETF场内已收盘，无实时五档；上方资金为日频统计"
+                                    : "非交易时段，无实时买卖五档"}
+                              </p>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    ) : null}
+                  </section>
+                </>
+              );
+            })()}
+
+            <div className="portfolio-trade-tabs" role="navigation" aria-label="仓位操作">
+              <button type="button" onClick={() => openTradePage("add")}>
                 <Plus size={14} strokeWidth={2.25} absoluteStrokeWidth />
                 补仓
               </button>
-              <button
-                type="button"
-                role="tab"
-                data-active={tradeMode === "reduce" ? "1" : "0"}
-                onClick={() => {
-                  haptics.tap();
-                  setTradeMode("reduce");
-                }}
-              >
+              <button type="button" onClick={() => openTradePage("reduce")}>
                 <Minus size={14} strokeWidth={2.25} absoluteStrokeWidth />
                 减仓
               </button>
-              <button
-                type="button"
-                role="tab"
-                data-active={tradeMode === "edit" ? "1" : "0"}
-                onClick={() => {
-                  haptics.tap();
-                  setTradeMode("edit");
-                  setShares(String(detail.shares));
-                  setCost(String(detail.cost));
-                  setBoughtAt(detail.bought_at?.trim() || todayIsoDate());
-                }}
-              >
+              <button type="button" onClick={() => openTradePage("edit")}>
                 改成本
               </button>
-              <button
-                type="button"
-                className="portfolio-trade-flat"
-                onClick={() => {
-                  haptics.tap();
-                  setDeleteId(detail.id);
-                }}
-              >
-                <CircleOff size={14} strokeWidth={2} absoluteStrokeWidth />
-                空仓
-              </button>
             </div>
+          </div>
+        ) : null}
 
+        {detail && detailPage === "trade" ? (
+          <div className="portfolio-detail portfolio-detail--trade">
+            <p className="portfolio-trade-context">
+              {detail.name || detail.symbol} · {detail.shares}
+              {detail.market === "JD" ? "克" : "份"} · 成本 {formatMoney(detail.cost)} · 现价{" "}
+              {formatMoney(detail.last_price)}
+            </p>
             {tradeMode === "edit" ? (
-              <form id="edit-holding-form" className="form-grid" onSubmit={onSaveDetail}>
-                <input
-                  value={shares}
-                  onChange={(e) => setShares(e.target.value)}
-                  type="number"
-                  min="0"
-                  step="1"
-                  placeholder="份额"
-                  required
-                />
-                <input
-                  value={cost}
-                  onChange={(e) => setCost(e.target.value)}
-                  type="number"
-                  min="0"
-                  step="0.001"
-                  placeholder="成本价"
-                  required
-                />
+              <form id="edit-holding-form" className="form-grid portfolio-detail-form" onSubmit={onSaveDetail}>
+                <label className="portfolio-field">
+                  <span>份额</span>
+                  <input
+                    value={shares}
+                    onChange={(e) => setShares(e.target.value)}
+                    type="number"
+                    min="0"
+                    step="1"
+                    placeholder="份额"
+                    required
+                    data-autofocus
+                  />
+                </label>
+                <label className="portfolio-field">
+                  <span>成本价</span>
+                  <input
+                    value={cost}
+                    onChange={(e) => setCost(e.target.value)}
+                    type="number"
+                    min="0"
+                    step="0.001"
+                    placeholder="成本价"
+                    required
+                  />
+                </label>
                 <label className="full portfolio-date-field">
                   <span>买入日</span>
                   <input
@@ -1364,37 +1718,83 @@ export default function PortfolioScreen() {
                 </label>
               </form>
             ) : (
-              <form id="trade-holding-form" className="form-grid" onSubmit={onTrade}>
-                <input
-                  value={tradeQty}
-                  onChange={(e) => setTradeQty(e.target.value)}
-                  type="number"
-                  min="1"
-                  step="1"
-                  placeholder={tradeMode === "add" ? "补仓份额" : "减仓份额"}
-                  required
-                />
-                {tradeMode === "add" ? (
+              <form id="trade-holding-form" className="form-grid portfolio-detail-form" onSubmit={onTrade}>
+                <label className="portfolio-field">
+                  <span className="portfolio-field-head">
+                    <span>{tradeMode === "add" ? "补仓份额" : "减仓份额"}</span>
+                    {tradeMode === "reduce" && (
+                      <span className="portfolio-qty-presets" role="group" aria-label="快捷份额">
+                        <button
+                          type="button"
+                          className="portfolio-qty-chip"
+                          onClick={() => {
+                            haptics.tap();
+                            setTradeQty(String(Math.floor(detail.shares / 2) || 1));
+                          }}
+                        >
+                          ½
+                        </button>
+                        <button
+                          type="button"
+                          className="portfolio-qty-chip"
+                          onClick={() => {
+                            haptics.tap();
+                            setTradeQty(String(Math.floor(detail.shares) || 1));
+                          }}
+                        >
+                          全部
+                        </button>
+                      </span>
+                    )}
+                  </span>
                   <input
-                    value={tradePrice}
-                    onChange={(e) => setTradePrice(e.target.value)}
+                    value={tradeQty}
+                    onChange={(e) => setTradeQty(e.target.value)}
                     type="number"
-                    min="0"
-                    step="0.001"
-                    placeholder="买入价"
+                    min="1"
+                    step="1"
+                    placeholder={tradeMode === "add" ? "补仓份额" : "减仓份额"}
                     required
+                    data-autofocus
                   />
+                </label>
+                {tradeMode === "add" ? (
+                  <>
+                    <label className="portfolio-field">
+                      <span>买入价</span>
+                      <input
+                        value={tradePrice}
+                        onChange={(e) => setTradePrice(e.target.value)}
+                        type="number"
+                        min="0"
+                        step="0.001"
+                        placeholder="买入价"
+                        required
+                      />
+                    </label>
+                    <label className="full portfolio-date-field">
+                      <span>买入日</span>
+                      <input
+                        type="date"
+                        value={tradeDate}
+                        onChange={(e) => setTradeDate(e.target.value || todayIsoDate())}
+                        required
+                      />
+                    </label>
+                  </>
                 ) : (
-                  <button
-                    type="button"
-                    className="btn btn-ghost portfolio-trade-half"
-                    onClick={() => {
-                      haptics.tap();
-                      setTradeQty(String(Math.floor(detail.shares / 2) || 1));
-                    }}
-                  >
-                    减半
-                  </button>
+                  <label className="portfolio-field">
+                    <span>卖出价</span>
+                    <input
+                      value={tradePrice}
+                      onChange={(e) => setTradePrice(e.target.value)}
+                      type="number"
+                      min="0"
+                      step="0.001"
+                      placeholder="卖出价"
+                      required
+                    />
+                  </label>
                 )}
                 {tradePreview && (
                   <p className="portfolio-trade-preview full">
@@ -1404,15 +1804,10 @@ export default function PortfolioScreen() {
                       : ""}
                   </p>
                 )}
-                <p className="portfolio-trade-hint full">
-                  {tradeMode === "add"
-                    ? "补仓按买入价加权平均成本"
-                    : "减仓不改剩余成本价；减完全部即空仓"}
-                </p>
               </form>
             )}
           </div>
-        )}
+        ) : null}
       </CenterModal>
 
       <CenterModal

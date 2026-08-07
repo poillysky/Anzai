@@ -1,0 +1,129 @@
+{% extends "admin_base.html" %}
+{% block title %}知识库 · 安崽{% endblock %}
+{% block badge %}/admin/knowledge{% endblock %}
+{% block content %}
+<h2 class="page-title">知识库卡片</h2>
+<p class="page-lead">
+  人工录入经验纪律卡（白名单内容）。保存时写入 Postgres 并生成向量。
+  连接与 Embedding 在 <a href="/admin/embedding">向量模型</a>。
+</p>
+
+{% if not db_ok %}
+<div class="card">
+  <p class="hint" style="margin:0">
+    未配置或连不上知识库 Postgres。请先到
+    <a href="/admin/embedding">向量模型</a>
+    填主机并测试。
+    {% if db_error %}<br />{{ db_error }}{% endif %}
+  </p>
+</div>
+{% else %}
+
+<div class="card">
+  <div class="toolbar" style="margin:0 0 12px;justify-content:space-between;flex-wrap:wrap;gap:8px">
+    <div>
+      <span class="key-badge key-badge--ok">已连通</span>
+      卡片 {{ total }} · 已向量化 {{ with_embedding }}
+    </div>
+    <form method="post" action="/admin/knowledge/import-md" class="inline-form" style="margin:0">
+      <button type="submit" class="btn-ghost">从 Markdown 导入/补种</button>
+    </form>
+  </div>
+
+  <h3 style="margin:0 0 8px;font-size:1rem">
+    {% if edit %}编辑 · {{ edit.id }}{% else %}新建卡片{% endif %}
+  </h3>
+  <form method="post" action="/admin/knowledge/save">
+    <label>ID（可选，空则按标题生成）</label>
+    <input
+      type="text"
+      name="card_id"
+      value="{{ edit.id if edit else '' }}"
+      placeholder="chase-high"
+      {% if edit %}readonly{% endif %}
+      autocomplete="off"
+    />
+
+    <label>标题</label>
+    <input type="text" name="title" value="{{ edit.title if edit else '' }}" required placeholder="已经拉一截还要不要追" />
+
+    <label>标签（逗号分隔）</label>
+    <input
+      type="text"
+      name="tags"
+      value="{% if edit %}{{ edit.tags | join(', ') }}{% endif %}"
+      placeholder="追高,纪律,买卖"
+    />
+
+    <div class="row" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
+      <div style="flex:1;min-width:160px">
+        <label>来源</label>
+        <input type="text" name="source" value="{{ edit.source if edit else '安崽经验库' }}" placeholder="安崽经验库" />
+      </div>
+      <div style="flex:1;min-width:140px">
+        <label>日期</label>
+        <input type="text" name="card_date" value="{{ edit.date if edit else '' }}" placeholder="2026-08-06" />
+      </div>
+    </div>
+
+    <label>正文</label>
+    <textarea name="body" rows="8" required placeholder="口语短文，不要荐股清单…">{% if edit %}{{ edit.body }}{% endif %}</textarea>
+
+    <div class="row">
+      <button type="submit">{% if edit %}保存修改{% else %}创建并向量化{% endif %}</button>
+      {% if edit %}
+      <a class="btn-ghost" href="/admin/knowledge" style="display:inline-flex;align-items:center;padding:8px 12px;text-decoration:none">取消编辑</a>
+      {% endif %}
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <table class="users">
+    <thead>
+      <tr>
+        <th>卡片</th>
+        <th>标签</th>
+        <th>向量</th>
+        <th>操作</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in cards %}
+      <tr>
+        <td>
+          <div><strong>{{ c.title }}</strong></div>
+          <div class="hint" style="margin:2px 0 0">{{ c.id }} · {{ c.source }}{% if c.date %} · {{ c.date }}{% endif %}</div>
+        </td>
+        <td class="hint">{{ c.tags | join(' · ') if c.tags else '—' }}</td>
+        <td>
+          {% if c.has_embedding %}
+          <span class="pill">已嵌</span>
+          {% else %}
+          <span class="pill pill-off">无</span>
+          {% endif %}
+        </td>
+        <td>
+          <div class="inline-form">
+            <a class="btn-ghost" href="/admin/knowledge?id={{ c.id }}" style="display:inline-flex;align-items:center;padding:6px 10px;text-decoration:none">编辑</a>
+            <form method="post" action="/admin/knowledge/reembed">
+              <input type="hidden" name="card_id" value="{{ c.id }}" />
+              <button type="submit" class="btn-ghost">重嵌</button>
+            </form>
+            <form method="post" action="/admin/knowledge/delete" onsubmit="return confirm('删除「{{ c.title }}」？');">
+              <input type="hidden" name="card_id" value="{{ c.id }}" />
+              <button type="submit" class="btn-danger">删除</button>
+            </form>
+          </div>
+        </td>
+      </tr>
+      {% else %}
+      <tr>
+        <td colspan="4" class="hint">暂无卡片。可点上方「从 Markdown 导入/补种」，或直接新建。</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endblock %}

@@ -47,7 +47,14 @@ _ADVICE_HINTS = (
     "买卖建议",
     "操作建议",
     "能买吗",
+    "能买吧",
     "能卖吗",
+    "买吗",
+    "卖吗",
+    "追买",
+    "追吗",
+    "今天买",
+    "现在买",
     "要不要减",
     "要不要加",
 )
@@ -82,14 +89,12 @@ class TurnScene:
 
     @property
     def include_portfolio(self) -> bool:
-        # 宏观-only 绝不带仓；盘面/仓位/个股+明确问仓才带
+        # 仅明确仓位语义才塞仓库；纯盘面/指数不再默默注入持仓
         if "macro" in self.flags and self.flags.isdisjoint(
             {"portfolio", "stock", "market"}
         ):
             return False
         if "portfolio" in self.flags:
-            return True
-        if "market" in self.flags and "macro" not in self.flags:
             return True
         return False
 
@@ -174,7 +179,12 @@ class TurnScene:
         if self.primary == "chat":
             return "篇幅：两三句人话即可，别只回两三个字。"
         if self.primary == "macro":
-            return "篇幅：把今天金价/商品说清楚（可三四句），别只丢一个短词就停。"
+            if self.wants_advice:
+                return (
+                    "篇幅：先一句买卖倾向，再用工具里的价嵌进两三句人话，收一句风险；"
+                    "禁止小标题、分点清单、编造未查品种。"
+                )
+            return "篇幅：把今天金价/商品说清楚（可三四句），别只丢一个短词就停，也别写成行情看板。"
         if self.primary == "news":
             return "篇幅：一两句要点，说清就行。"
         if self.primary == "leaders":
@@ -214,7 +224,18 @@ def detect_turn_scene(user_text: str) -> TurnScene:
     if macro_topics:
         flags.add("macro")
 
-    if any(h in text for h in tools._PORTFOLIO_HINTS):
+    if any(h in text for h in tools._PORTFOLIO_HINTS) or any(
+        h in text
+        for h in (
+            "亏了吗",
+            "赚了吗",
+            "账户",
+            "咱们今天",
+            "今天咋样",
+            "今天怎么样",
+            "今天怎样",
+        )
+    ):
         flags.add("portfolio")
     if any(h in text for h in tools._PULSE_HINTS) or any(
         h in text for h in tools._INDEX_HINTS
@@ -288,7 +309,11 @@ def scene_hint(scene: TurnScene) -> str:
         bits.append("闲聊：正常人回话，几乎不提行情和仓库。")
     elif scene.primary == "macro":
         bits.append(
-            "只答商品/宏观一两句人话；零提账户、持仓、分散、ETF配置。"
+            "只答商品/宏观；零提账户、持仓、分散、ETF配置。"
+            "数字只引用本轮宏观工具里的品种（黄金问 AU9999/积存金/纽约金·伦敦金/金ETF；"
+            "其它如螺纹/铁矿/汇率等），"
+            "禁止补编美元指数、美债、COMEX、沪金连续等未查项；别列行情看板。"
+            "若本轮有相关新闻：优先「今日」，旧闻只当背景一句带过。"
             + calendar_clock_line()
         )
     elif scene.primary == "market":
@@ -306,17 +331,23 @@ def scene_hint(scene: TurnScene) -> str:
     elif scene.primary == "leaders":
         bits.append("榜单：用查询结果白话说谁强谁弱，别扯个人仓位。")
     elif scene.primary == "analysis":
-        bits.append("分析结论：引用报告摘要，别假装刚开完专家会。")
+        bits.append(
+            "分析：先分清进行中还是已完成；进行中别编结论；"
+            "已完成可带一句报告摘要，别假装这轮刚开完专家会。"
+        )
     elif scene.primary == "news":
-        bits.append("新闻：一两句要点，别借机推销调仓。")
+        bits.append(
+            "新闻：一两句要点；点明新旧（今日/几天前）；别借机推销调仓。"
+        )
 
     if "macro" in scene.flags and "portfolio" in scene.flags:
         bits.append("同时问了宏观和仓：先行情，仓位一句带过即可。")
     if scene.wants_advice:
         bits.append(
-            "【建议】对方在问买卖/操作：给倾向性建议（观望/可轻仓/宜减不宜加等）"
-            "+一句依据+一句风险；用「可以考虑」；"
-            "禁止保证赚钱、立刻全仓、必须卖掉、假装已下单。"
+            "【建议】对方在问买卖/操作：先一句倾向（观望/可轻仓/宜减不宜加/别追），"
+            "依据必须来自本轮工具数字，再用一两句人话带出，最后一句风险；用「可以考虑」。"
+            "禁止保证赚钱、立刻全仓、必须卖掉、假装已下单；"
+            "禁止「操作建议」编号清单和研报四段体。"
         )
     elif scene.primary in {"stock", "portfolio", "analysis", "market"}:
         bits.append(
@@ -328,16 +359,36 @@ def scene_hint(scene: TurnScene) -> str:
 
 def tool_hint_for_scene(scene: TurnScene) -> str:
     """Slim tool reminder — only name tools relevant to this scene."""
+    from app.providers.macro import calendar_clock_line
+
     base = "【工具】数字只引自【本轮实时查询】或工具；没有就说没有，禁止编造。"
     by: dict[str, str] = {
         "chat": "闲聊一般不用工具。",
-        "macro": "宏观用 get_macro；看清日期标签。",
-        "market": "盘面用 get_indices；账户用 get_portfolio。",
-        "stock": "没代码先 search_symbol；再 get_quote / get_intraday / get_kline / get_sector / get_news。",
-        "portfolio": "仓库用 get_portfolio。",
-        "leaders": "榜单用 get_leaders。",
-        "analysis": "报告用 get_analysis_snapshot。",
-        "news": "新闻用 get_news。",
+        "macro": (
+            "宏观用 get_macro（总览可传 overview；黄金=App 黄金页同款品种）；"
+            "相关消息用 get_news keyword=中文主题（黄金/原油等）；"
+            "问追不追可用 search_knowledge；"
+            "看清日期标签；结论只引用返回里的品种与数字，勿补 DXY/美债/沪金连续。"
+        ),
+        "market": (
+            "盘面：指数用 get_indices（含恒生/纳斯达克与开盘状态）；"
+            "榜单用 get_leaders（可指定港股/美股）；账户最多一句体感；别念持仓清单。"
+            + calendar_clock_line()
+        ),
+        "stock": (
+            "没代码先 search_symbol；再 get_quote / get_intraday / get_kline / get_sector / get_news；"
+            "港股五位代码（如 00700）可查报价/分时/日K，不进仓库、不开 start_analysis；"
+            "问盘口、挂单、资金流入流出、主力用 get_depth_flow（主力=金额分档，禁止说庄家；港股无此分档）；"
+            "买卖纪律可 search_knowledge。"
+        ),
+        "portfolio": "仓库用 get_portfolio；分散/过重可 search_knowledge + draft_rebalance_plan。",
+        "leaders": "榜单用 get_leaders（board=沪/深/创业/恒生/纳斯达克）。",
+        "analysis": (
+            "读结论用 get_analysis_snapshot；"
+            "明确开跑：仓库→start_analysis(portfolio)；"
+            "个股「帮我分析XX」→start_analysis(symbol,标准档)。"
+        ),
+        "news": "新闻用 get_news（可指定 board=tech/energy/finance 等；keyword 用中文）。",
     }
     extra = by.get(scene.primary, "")
     # multi-flag extras
@@ -354,6 +405,7 @@ def tool_hint_for_scene(scene: TurnScene) -> str:
 
 
 def build_scene_context(db: Session, user_id: int, scene: TurnScene) -> str:
+    from app.services import analysis as analysis_svc
     from app.services.agent_context import (
         analysis_context,
         silent_portfolio_context,
@@ -364,10 +416,21 @@ def build_scene_context(db: Session, user_id: int, scene: TurnScene) -> str:
         parts.append(silent_portfolio_context(db, user_id))
     if scene.include_analysis:
         parts.append(analysis_context(db, user_id))
+    elif scene.primary != "chat":
+        # 非闲聊：若有进行中或刚完成的分析，后面对话自动带上（不阻塞）
+        try:
+            if (
+                analysis_svc.running_job(db, user_id) is not None
+                or analysis_svc.latest_job(db, user_id) is not None
+            ):
+                parts.append(analysis_context(db, user_id))
+        except Exception:
+            pass
     if not scene.include_portfolio and not scene.include_analysis:
-        parts.append(
-            "【数据说明】本轮以【本轮实时查询】为准；未附仓库/报告，勿自行编造账户数字。"
-        )
+        if len(parts) == 1:
+            parts.append(
+                "【数据说明】本轮以【本轮实时查询】为准；未附仓库/报告，勿自行编造账户数字。"
+            )
     return "\n\n".join(parts)
 
 

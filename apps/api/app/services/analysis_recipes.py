@@ -31,7 +31,7 @@ def list_modes() -> list[dict[str, Any]]:
 
 
 def list_recipes(mode: str | None = None) -> list[dict[str, Any]]:
-    """Expose the three tiers as recipes for catalog / admin preview."""
+    """Expose tiers as recipes for catalog / admin preview."""
     del mode
     items = []
     for d in list_degrees():

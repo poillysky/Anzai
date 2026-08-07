@@ -505,6 +505,64 @@ def list_market_boards() -> list[dict[str, str]]:
     return [{"id": b["id"], "label": b["label"]} for b in MARKET_BOARDS]
 
 
+def news_age_label(published_at: object) -> str:
+    """今日 / N天前 — Agent 与分析席共用，避免把旧闻当突发。"""
+    raw = str(published_at or "").strip()
+    if not raw:
+        return "时间未知"
+    from datetime import date
+
+    from app.providers.cn_calendar import parse_as_of_date, shanghai_today
+
+    d = parse_as_of_date(raw)
+    if d is None:
+        m = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", raw)
+        if m:
+            try:
+                d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            except ValueError:
+                d = None
+    if d is None:
+        return "时间未知"
+    delta = (shanghai_today() - d).days
+    if delta <= 0:
+        return "今日"
+    if delta == 1:
+        return "1天前"
+    return f"{delta}天前"
+
+
+def format_news_digest(
+    items: list[NewsItem],
+    *,
+    title: str,
+    limit: int = 8,
+) -> str:
+    """Compact Chinese digest for Agent tools (title + age + related)."""
+    lim = max(1, min(int(limit or 5), 12))
+    lines = [
+        f"【{title}】",
+        "引用规则：优先「今日」；≥3天前只当背景，勿当今天突发驱动；无条目就说没有。",
+    ]
+    if not items:
+        lines.append("（暂无条目）")
+        return "\n".join(lines)
+    for it in items[:lim]:
+        age = news_age_label(it.published_at)
+        src = (it.source or "").strip()
+        summary = (it.summary or "").strip().replace("\n", " ")[:100]
+        syms = ",".join((it.symbols or [])[:4])
+        bit = f"- [{age}] {it.title or '（无标题）'}"
+        if src:
+            bit += f" · {src}"
+        if syms:
+            bit += f" · 关联 {syms}"
+        if summary:
+            bit += f" — {summary}"
+        lines.append(bit)
+    return "\n".join(lines)
+
+
 def _fmt_unix(ts: object) -> str:
     try:
         t = int(float(str(ts)))
