@@ -1,13 +1,30 @@
 "use client";
 
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { History, MessageSquare, Mic, MicOff, Plus, Settings } from "@/components/ui/icons";
+import {
+  History,
+  MessageSquare,
+  Mic,
+  MicOff,
+  Plus,
+  RefreshCw,
+  Settings,
+} from "@/components/ui/icons";
 import { useOverlay } from "@/components/overlay/OverlayContext";
 import { api } from "@/lib/api";
 import { haptics } from "@/lib/haptics";
 import { useSpeechDictation } from "@/hooks/useSpeechDictation";
-import { useTabActive } from "@/hooks/useTabActive";
-import { cacheDelete, cachePeek, cacheSet, cacheSWR, PrefetchKeys, PrefetchTtl } from "@/lib/prefetch";
+import { usePullToRefresh } from "@/hooks/usePullToRefresh";
+import { useForegroundEpoch, useTabActive } from "@/hooks/useTabActive";
+import {
+  cacheDelete,
+  cacheForceFetch,
+  cachePeek,
+  cacheSet,
+  cacheSWR,
+  PrefetchKeys,
+  PrefetchTtl,
+} from "@/lib/prefetch";
 import { notifyAnalysisJob } from "@/lib/analysisEvents";
 import { useShellStack } from "@/hooks/useShellStack";
 import { ShellBase, ShellLayer, ShellRoot } from "@/components/layout/ShellStack";
@@ -71,14 +88,14 @@ function runningAnalysisCard(cards: AgentCard[] | undefined): Extract<AgentCard,
 const AGENT_QUICK_CHIPS = [
   { label: "分析仓库", send: "帮我分析下仓库" },
   { label: "今天大盘", send: "今天大盘怎么样" },
-  { label: "我的仓位", send: "看看我的仓位" },
-  { label: "黄金现价", send: "黄金现在什么价" },
+  { label: "分析黄金", send: "分析黄金" },
 ] as const;
 
 /** 安崽真人对话：多会话 + 气泡线程 + Push 设置 */
 export default function AgentScreen() {
   const { toast } = useOverlay();
   const tabActive = useTabActive("/agent");
+  const fgEpoch = useForegroundEpoch();
   const { page, overlayOpen, push, pop, popSoft, reset } = useShellStack<StackPage>({
     root: "chat",
   });
@@ -154,7 +171,10 @@ export default function AgentScreen() {
     lang: "zh-CN",
     onTranscript: onVoiceTranscript,
     onUnsupported: () => {
-      toast("当前环境不支持网页语音，可用系统键盘上的麦克风", "warning");
+      toast(
+        "当前环境不支持网页语音（iOS 常见）。请用系统键盘上的麦克风，或电脑 Chrome + 代理",
+        "warning",
+      );
     },
     onError: (msg) => toast(msg, "warning"),
   });
@@ -217,14 +237,27 @@ export default function AgentScreen() {
 
   const loadSession = useCallback(
     async (cid?: number | null, opts?: { force?: boolean }) => {
+      const target =
+        cid != null && cid > 0
+          ? cid
+          : conversationIdRef.current != null && conversationIdRef.current > 0
+            ? conversationIdRef.current
+            : null;
       try {
-        if (cid != null && cid > 0) {
-          const s = await api.getAgentSession(cid);
-          applySessionPayload(s, opts?.force);
+        if (target != null) {
+          // Always bind the open thread — bare getAgentSession() can race the wrong chat
+          const s = opts?.force
+            ? await cacheForceFetch(PrefetchKeys.agentSession, () =>
+                api.getAgentSession(target),
+              )
+            : await api.getAgentSession(target);
+          applySessionPayload(s, opts?.force ?? false);
           return;
         }
         if (opts?.force) {
-          const s = await api.getAgentSession();
+          const s = await cacheForceFetch(PrefetchKeys.agentSession, () =>
+            api.getAgentSession(),
+          );
           applySessionPayload(s, true);
           return;
         }
@@ -235,6 +268,7 @@ export default function AgentScreen() {
           (s) => applySessionPayload(s, false),
         );
       } catch {
+        // Tab resume / flaky network: keep local thread; never toast raw "Load failed"
         try {
           const id = await api.getIdentity();
           setIdentity(id);
@@ -246,12 +280,25 @@ export default function AgentScreen() {
     [applySessionPayload],
   );
 
-  // 进入安崽 tab 时 SWR 拉会话；TabCache 保活，勿在 streaming 中重绑 abort
+  // 进入安崽 tab / 从后台回来：强制拉会话。
+  // 切走时 abort 流式；必须清掉 streaming，否则回来会被挡死、只能冷启动才刷新。
+  // fgEpoch：iOS 常冻定时器且 visibility 不变，单靠 tabActive 不会重跑。
   useEffect(() => {
-    if (!tabActive) return;
-    void loadSession();
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- tab focus only
-  }, [tabActive]);
+    haltVoice();
+    if (!tabActive) {
+      if (streamingRef.current || abortRef.current) {
+        abortRef.current?.abort();
+        abortRef.current = null;
+        streamingRef.current = false;
+        setStreaming(false);
+      }
+      return;
+    }
+    streamingRef.current = false;
+    setStreaming(false);
+    void loadSession(conversationIdRef.current, { force: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- resume / tab focus only
+  }, [tabActive, fgEpoch, haltVoice]);
 
   // 仅真正卸载时中断（登录页卸掉 TabCache）。Tab 切换由 TabCache 保活，不应走到这里。
   useEffect(() => {
@@ -370,6 +417,7 @@ export default function AgentScreen() {
       let assembled = "";
       let sawError = false;
       let sawDone = false;
+      let aborted = false;
       let liveCid = conversationId;
 
       const applyAssistant = (
@@ -548,28 +596,53 @@ export default function AgentScreen() {
           toast("模型没有返回内容", "warning");
         }
       } catch (e) {
-        if ((e as Error).name !== "AbortError") {
-          const msg = e instanceof Error ? e.message : "发送失败";
+        const name = (e as Error)?.name || "";
+        if (name === "AbortError") {
+          aborted = true;
+          // Tab switch / user leave — keep whatever streamed; no scary toast
+          if (assembled.trim()) {
+            applyAssistant(assembled, {
+              toolNote: "",
+              toolSteps: [],
+              cards: cards.length ? [...cards] : undefined,
+            });
+          } else {
+            setMessages((prev) => prev.filter((m) => m.id !== assistantId));
+          }
+        } else {
+          const raw = e instanceof Error ? e.message : "";
+          const network =
+            !raw ||
+            /load failed|failed to fetch|networkerror|network request failed|econnreset|offline/i.test(
+              raw,
+            );
+          const msg = network
+            ? assembled.trim()
+              ? "连接中断，已保留已收到的内容"
+              : "网络中断，请再发一次"
+            : raw || "发送失败";
           toast(msg, "warning");
-          if (!assembled) applyAssistant(`（出错）${msg}`);
+          if (!assembled.trim()) applyAssistant(`（出错）${msg}`);
+          else applyAssistant(assembled);
         }
       } finally {
-        if (!sawDone && !assembled && !sawError) {
-          /* aborted */
-        }
         setStreaming(false);
         const cid = liveCid ?? conversationIdRef.current;
-        const fallbackBody =
-          assembled.trim() ||
-          (sawError
-            ? "（出错）"
-            : "（没有收到模型内容，请稍后重试或检查 /admin/llm 连接）");
+        const body = assembled.trim();
+        let content = body;
+        if (!content) {
+          if (aborted) content = "";
+          else if (sawError) content = "（出错）";
+          else if (!sawDone) {
+            content = "（没有收到模型内容，请稍后重试或检查 /admin/llm 连接）";
+          }
+        }
         const snapshot: ChatMsg[] = [
           ...next,
           {
             id: assistantId,
             role: "assistant",
-            content: assembled.trim() ? assembled : sawError || !sawDone ? fallbackBody : "",
+            content,
             ...(cards.length ? { cards: [...cards] } : {}),
           },
         ];
@@ -590,6 +663,15 @@ export default function AgentScreen() {
 
   const settingsOpen = page === "settings" || page === "account" || page === "identity" || page === "notify";
   const historyOpen = page === "history";
+  const ptrBarRef = useRef<HTMLDivElement>(null);
+  const {
+    refreshing: ptrRefreshing,
+    ready: ptrReady,
+  } = usePullToRefresh(threadRef, ptrBarRef, {
+    onRefresh: () => loadSession(conversationIdRef.current, { force: true }),
+    disabled: overlayOpen || streaming,
+    onArmed: () => haptics.selection(),
+  });
 
   return (
     <ShellRoot className="agent-screen" pushed={overlayOpen}>
@@ -638,7 +720,30 @@ export default function AgentScreen() {
 
         <div className="agent-kb-lift">
           <section className="agent-thread" aria-label="对话">
-            <div className="agent-thread-body" ref={threadRef}>
+            <div
+              className="agent-thread-body"
+              ref={threadRef}
+              data-ptr={ptrRefreshing ? "1" : "0"}
+            >
+              <div
+                ref={ptrBarRef}
+                className="news-ptr"
+                data-ready={ptrReady ? "1" : "0"}
+                data-refreshing={ptrRefreshing ? "1" : "0"}
+                aria-hidden
+              >
+                <div className="news-ptr-inner">
+                  <RefreshCw
+                    className="news-ptr-icon"
+                    size={14}
+                    strokeWidth={2.2}
+                    absoluteStrokeWidth
+                  />
+                  <span className="news-ptr-label">
+                    {ptrRefreshing ? "刷新中" : ptrReady ? "松开刷新" : "下拉刷新"}
+                  </span>
+                </div>
+              </div>
               {messages.length === 0 ? (
                 <div className="agent-thread-empty">
                   <MessageSquare size={22} strokeWidth={1.75} absoluteStrokeWidth aria-hidden />

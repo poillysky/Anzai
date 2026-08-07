@@ -1,4 +1,4 @@
-# Anzai NAS deploy - single image poillysky/anzai:1.0.3
+# Anzai NAS deploy - single image poillysky/anzai:1.0.4
 # Host path: /vol1/1000/Docker/anzai
 #
 #   docker compose pull && docker compose up -d
@@ -11,7 +11,7 @@
 
 services:
   anzai:
-    image: poillysky/anzai:1.0.3
+    image: poillysky/anzai:1.0.4
     container_name: anzai
     restart: always
     ports:

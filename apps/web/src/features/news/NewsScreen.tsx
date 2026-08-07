@@ -6,11 +6,18 @@ import { CenterModal } from "@/components/overlay/CenterModal";
 import { Briefcase, ChevronLeft, ChevronRight, Globe, Inbox, Newspaper, Plus, RefreshCw, Sparkles, Warehouse, X } from "@/components/ui/icons";
 import { api } from "@/lib/api";
 import { haptics } from "@/lib/haptics";
-import { useTabActive } from "@/hooks/useTabActive";
+import { useForegroundEpoch, useTabActive } from "@/hooks/useTabActive";
 import { useShellStack } from "@/hooks/useShellStack";
 import { ShellBase, ShellLayer, ShellRoot } from "@/components/layout/ShellStack";
 import { OfflineBanner } from "@/components/layout/OfflineBanner";
-import { cachePeek, cacheSet, cacheSWR, PrefetchKeys, PrefetchTtl } from "@/lib/prefetch";
+import {
+  cacheForceFetch,
+  cachePeek,
+  cacheSet,
+  cacheSWR,
+  PrefetchKeys,
+  PrefetchTtl,
+} from "@/lib/prefetch";
 import { usePullToRefresh } from "@/hooks/usePullToRefresh";
 import type {
   NewsArticle,
@@ -105,6 +112,8 @@ function cleanReaderBody(raw: string): string {
 
 export default function NewsScreen() {
   const tabActive = useTabActive("/news");
+  const fgEpoch = useForegroundEpoch();
+  const resumeEpochRef = useRef(0);
   const { page: shellPage, overlayOpen, push, pop, popSoft } = useShellStack<"list" | "reader">({
     root: "list",
   });
@@ -170,7 +179,11 @@ export default function NewsScreen() {
     };
     try {
       if (force) {
-        apply(await api.getNewsMacroPulse());
+        apply(
+          await cacheForceFetch(PrefetchKeys.newsMacroPulse, () =>
+            api.getNewsMacroPulse(),
+          ),
+        );
         return;
       }
       await cacheSWR(
@@ -203,7 +216,11 @@ export default function NewsScreen() {
       setMarketByBoard((prev) => ({ ...prev, [boardId]: feed }));
     };
     if (force) {
-      apply(await api.getMarketNews(100, boardId));
+      apply(
+        await cacheForceFetch(PrefetchKeys.newsMarket(boardId), () =>
+          api.getMarketNews(100, boardId),
+        ),
+      );
       return;
     }
     await cacheSWR(
@@ -217,11 +234,11 @@ export default function NewsScreen() {
   const loadHoldings = useCallback(async (force = false) => {
     if (force) {
       const [feed, portfolio] = await Promise.all([
-        api.getHoldingsNews(100),
-        api.getPortfolio().catch(() => null),
+        cacheForceFetch(PrefetchKeys.newsHoldings, () => api.getHoldingsNews(100)),
+        cacheForceFetch(PrefetchKeys.portfolio, () => api.getPortfolio()).catch(
+          () => null,
+        ),
       ]);
-      cacheSet(PrefetchKeys.newsHoldings, feed);
-      if (portfolio) cacheSet(PrefetchKeys.portfolio, portfolio);
       setHoldings(feed);
       setHoldingCount(portfolio?.holdings?.length ?? 0);
       return;
@@ -253,8 +270,10 @@ export default function NewsScreen() {
     setInterestsFeed(feed);
   }, [loadInterestsList]);
 
+  const refreshGen = useRef(0);
   const refresh = useCallback(
     async (kind: NewsTab, boardId: string, soft = false, force = false) => {
+      const gen = ++refreshGen.current;
       if (!soft) setLoading(true);
       setError(null);
       try {
@@ -266,11 +285,13 @@ export default function NewsScreen() {
           ]);
         } else if (kind === "holdings") await loadHoldings(netForce);
         else await loadInterests();
+        if (gen !== refreshGen.current) return;
       } catch (e) {
+        if (gen !== refreshGen.current) return;
         setError(e instanceof Error ? e.message : "加载失败");
         if (!soft && kind === "interests") setInterestsFeed(null);
       } finally {
-        if (!soft) setLoading(false);
+        if (!soft && gen === refreshGen.current) setLoading(false);
       }
     },
     [loadMarket, loadMacroPulse, loadHoldings, loadInterests],
@@ -283,17 +304,27 @@ export default function NewsScreen() {
 
   useEffect(() => {
     if (!tabActive) return;
+    const fromResume = fgEpoch !== resumeEpochRef.current;
+    if (fromResume) resumeEpochRef.current = fgEpoch;
+    if (fromResume) {
+      void cacheForceFetch(PrefetchKeys.newsBoards, () => api.getNewsBoards())
+        .then((res) => {
+          if (res.items?.length) setBoards(res.items);
+        })
+        .catch(() => {});
+    }
     const hasBoardFeed =
       tab !== "market" ||
       Boolean(marketByBoardRef.current[board] || cachePeek(PrefetchKeys.newsMarket(board)));
     const hasHoldings =
       tab !== "holdings" || Boolean(cachePeek(PrefetchKeys.newsHoldings));
     const soft =
-      bootedRef.current ||
-      (tab === "market" ? hasBoardFeed : tab === "holdings" ? hasHoldings : false);
+      !fromResume &&
+      (bootedRef.current ||
+        (tab === "market" ? hasBoardFeed : tab === "holdings" ? hasHoldings : false));
     bootedRef.current = true;
-    void refresh(tab, board, soft);
-  }, [tabActive, tab, board, refresh]);
+    void refresh(tab, board, soft, fromResume);
+  }, [tabActive, fgEpoch, tab, board, refresh]);
 
   /** Warm other board feeds so chip + list switch together next time */
   useEffect(() => {
@@ -355,6 +386,11 @@ export default function NewsScreen() {
   }, []);
 
   const pullRefresh = useCallback(async () => {
+    void cacheForceFetch(PrefetchKeys.newsBoards, () => api.getNewsBoards())
+      .then((res) => {
+        if (res.items?.length) setBoards(res.items);
+      })
+      .catch(() => {});
     await refresh(tab, board, true, true);
   }, [refresh, tab, board]);
 
@@ -379,7 +415,12 @@ export default function NewsScreen() {
     let nextArticle: NewsArticle | null = null;
     let nextError: string | null = null;
     try {
-      nextArticle = await api.getNewsArticle(key);
+      nextArticle = await Promise.race([
+        api.getNewsArticle(key),
+        new Promise<never>((_, reject) => {
+          window.setTimeout(() => reject(new Error("timeout")), 12_000);
+        }),
+      ]);
     } catch {
       nextError = "正文暂不可用，已显示摘要";
     }
@@ -390,6 +431,12 @@ export default function NewsScreen() {
     setOpeningKey(null);
     push("reader");
   }, [push]);
+
+  // Resume / leave: never leave a row stuck on「打开中」
+  useEffect(() => {
+    openGen.current += 1;
+    setOpeningKey(null);
+  }, [fgEpoch, tabActive]);
 
   const closeReader = useCallback(() => {
     openGen.current += 1;
@@ -700,7 +747,7 @@ export default function NewsScreen() {
             <ul className="news-list" key={`news-${tab}-${board}`}>
               {items.map((row, idx) => (
                 <NewsRow
-                  key={`${row.id}-${row.url}`}
+                  key={`${row.id || "n"}-${row.url || "u"}-${idx}`}
                   item={row}
                   index={idx}
                   showSymbols={tab === "holdings" || tab === "interests"}

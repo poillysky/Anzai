@@ -9,6 +9,8 @@ type Options = {
   maxPull?: number;
   /** Kept visible at least this long so spinner doesn't flash */
   minSpinMs?: number;
+  /** Cap hung refresh so PTR cannot stick forever after iOS freeze */
+  maxRefreshMs?: number;
   onArmed?: () => void;
 };
 
@@ -25,6 +27,7 @@ export function usePullToRefresh(
     threshold = 68,
     maxPull = 108,
     minSpinMs = 480,
+    maxRefreshMs = 12_000,
     onArmed,
   }: Options,
 ) {
@@ -37,12 +40,34 @@ export function usePullToRefresh(
   const refreshingRef = useRef(false);
   const onRefreshRef = useRef(onRefresh);
   const onArmedRef = useRef(onArmed);
+  const resetBarRef = useRef<(animate: boolean) => void>(() => undefined);
   onRefreshRef.current = onRefresh;
   onArmedRef.current = onArmed;
 
   useEffect(() => {
     refreshingRef.current = refreshing;
   }, [refreshing]);
+
+  /** Resume / hang: never leave PTR stuck in refreshing */
+  useEffect(() => {
+    const unlock = () => {
+      if (!refreshingRef.current) return;
+      refreshingRef.current = false;
+      setRefreshing(false);
+      setReady(false);
+      pullRef.current = 0;
+      armedFired.current = false;
+      resetBarRef.current(true);
+    };
+    window.addEventListener("pageshow", unlock);
+    window.addEventListener("focus", unlock);
+    document.addEventListener("visibilitychange", unlock);
+    return () => {
+      window.removeEventListener("pageshow", unlock);
+      window.removeEventListener("focus", unlock);
+      document.removeEventListener("visibilitychange", unlock);
+    };
+  }, []);
 
   useEffect(() => {
     const el = scrollerRef.current;
@@ -60,6 +85,7 @@ export function usePullToRefresh(
       setReady(false);
       setBarHeight(0, animate);
     };
+    resetBarRef.current = resetPull;
 
     const onStart = (e: TouchEvent) => {
       if (refreshingRef.current) return;
@@ -116,18 +142,24 @@ export function usePullToRefresh(
         setReady(true);
         setBarHeight(48, true);
         const started = Date.now();
+        let finished = false;
+        const done = () => {
+          if (finished) return;
+          finished = true;
+          window.clearTimeout(watchdog);
+          const wait = Math.max(0, minSpinMs - (Date.now() - started));
+          window.setTimeout(() => {
+            refreshingRef.current = false;
+            setRefreshing(false);
+            resetPull(true);
+          }, wait);
+        };
+        const watchdog = window.setTimeout(done, maxRefreshMs);
         void Promise.resolve(onRefreshRef.current())
           .catch(() => {
             /* caller handles errors */
           })
-          .finally(() => {
-            const wait = Math.max(0, minSpinMs - (Date.now() - started));
-            window.setTimeout(() => {
-              refreshingRef.current = false;
-              setRefreshing(false);
-              resetPull(true);
-            }, wait);
-          });
+          .finally(done);
       } else {
         resetPull(true);
       }
@@ -143,7 +175,7 @@ export function usePullToRefresh(
       el.removeEventListener("touchend", onEnd);
       el.removeEventListener("touchcancel", onEnd);
     };
-  }, [scrollerRef, indicatorRef, disabled, threshold, maxPull, minSpinMs]);
+  }, [scrollerRef, indicatorRef, disabled, threshold, maxPull, minSpinMs, maxRefreshMs]);
 
   return { refreshing, ready };
 }

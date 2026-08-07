@@ -39,8 +39,9 @@ import {
 } from "@/lib/format";
 import { haptics } from "@/lib/haptics";
 import { goldGramsFromAmount, otcSharesFromAmount } from "@/lib/otcFund";
-import { useTabActive } from "@/hooks/useTabActive";
+import { useForegroundEpoch, useTabActive } from "@/hooks/useTabActive";
 import {
+  cacheForceFetch,
   cachePeek,
   cacheSet,
   cacheSWR,
@@ -465,11 +466,16 @@ export default function MarketScreen() {
   const router = useRouter();
   const { toast } = useOverlay();
   const tabActive = useTabActive("/market");
+  const fgEpoch = useForegroundEpoch();
   const [indices, setIndices] = useState<IndexQuote[]>(
     () => cachePeek<IndexQuote[]>(PrefetchKeys.indices) ?? [],
   );
   const [selectedKey, setSelectedKey] = useState("sh-composite");
   const [boardKind, setBoardKind] = useState<BoardKind>("up");
+  const selectedKeyRef = useRef(selectedKey);
+  const boardKindRef = useRef(boardKind);
+  selectedKeyRef.current = selectedKey;
+  boardKindRef.current = boardKind;
   const [intraday, setIntraday] = useState<IntradaySeries | null>(
     () => cachePeek<IntradaySeries>(PrefetchKeys.intraday(DEFAULT_INDEX)),
   );
@@ -726,9 +732,7 @@ export default function MarketScreen() {
 
   const loadIndices = useCallback(async (force = false) => {
     if (force) {
-      const data = await api.getIndices();
-      cacheSet(PrefetchKeys.indices, data);
-      setIndices(data);
+      setIndices(await cacheForceFetch(PrefetchKeys.indices, () => api.getIndices()));
       return;
     }
     await cacheSWR(
@@ -742,10 +746,14 @@ export default function MarketScreen() {
   const loadIntraday = useCallback(async (key: string, force = false) => {
     const apply = (data: IntradaySeries) => {
       cacheSet(PrefetchKeys.intraday(key), data);
+      // Drop stale responses after user switched index
+      if (selectedKeyRef.current !== key) return;
       setIntraday(data);
     };
     if (force) {
-      apply(await api.getIntraday(key));
+      apply(
+        await cacheForceFetch(PrefetchKeys.intraday(key), () => api.getIntraday(key)),
+      );
       return;
     }
     await cacheSWR(
@@ -759,10 +767,15 @@ export default function MarketScreen() {
   const loadLeaders = useCallback(async (key: string, kind: BoardKind, force = false) => {
     const apply = (data: LeadersBoard) => {
       cacheSet(PrefetchKeys.leaders(key, kind), data);
+      if (selectedKeyRef.current !== key || boardKindRef.current !== kind) return;
       setLeaders(data);
     };
     if (force) {
-      apply(await api.getLeaders(key, kind));
+      apply(
+        await cacheForceFetch(PrefetchKeys.leaders(key, kind), () =>
+          api.getLeaders(key, kind),
+        ),
+      );
       return;
     }
     await cacheSWR(
@@ -776,10 +789,13 @@ export default function MarketScreen() {
   const loadSession = useCallback(async (key: string, force = false) => {
     const apply = (data: MarketSession) => {
       cacheSet(PrefetchKeys.session(key), data);
+      if (selectedKeyRef.current !== key) return;
       setSession(data);
     };
     if (force) {
-      apply(await api.getSession(key));
+      apply(
+        await cacheForceFetch(PrefetchKeys.session(key), () => api.getSession(key)),
+      );
       return;
     }
     await cacheSWR(
@@ -793,7 +809,9 @@ export default function MarketScreen() {
   const loadGold = useCallback(
     async (force = false) => {
       if (force) {
-        applyGoldBoard(await api.getGoldBoard());
+        applyGoldBoard(
+          await cacheForceFetch(PrefetchKeys.goldBoard, () => api.getGoldBoard()),
+        );
         return;
       }
       await cacheSWR(
@@ -837,7 +855,9 @@ export default function MarketScreen() {
   const loadFund = useCallback(
     async (force = false) => {
       if (force) {
-        applyFundBoard(await api.getFundBoard());
+        applyFundBoard(
+          await cacheForceFetch(PrefetchKeys.fundBoard, () => api.getFundBoard()),
+        );
         return;
       }
       await cacheSWR(
@@ -850,26 +870,38 @@ export default function MarketScreen() {
     [applyFundBoard],
   );
 
-  const loadGoldIntraday = useCallback(async (symbol: string, market: string) => {
-    await cacheSWR(
-      PrefetchKeys.symbolIntraday(market, symbol),
-      () => api.getSymbolIntraday(symbol, market),
-      PrefetchTtl.symbolIntraday,
-      setGoldIntraday,
-    );
-  }, []);
+  const loadGoldIntraday = useCallback(
+    async (symbol: string, market: string, force = false) => {
+      const key = PrefetchKeys.symbolIntraday(market, symbol);
+      const apply = (data: IntradaySeries) => {
+        cacheSet(key, data);
+        setGoldIntraday(data);
+      };
+      if (force) {
+        apply(await cacheForceFetch(key, () => api.getSymbolIntraday(symbol, market)));
+        return;
+      }
+      await cacheSWR(
+        key,
+        () => api.getSymbolIntraday(symbol, market),
+        PrefetchTtl.symbolIntraday,
+        apply,
+      );
+    },
+    [],
+  );
 
   const refreshMarket = useCallback(
-    async (key = selectedKey, kind = boardKind) => {
+    async (key = selectedKey, kind = boardKind, force = false) => {
       try {
         setError(null);
         await Promise.all([
-          loadIndices(),
-          loadIntraday(key),
-          loadLeaders(key, kind),
-          loadSession(key),
-          loadGold().catch(() => {}),
-          loadFund().catch(() => {}),
+          loadIndices(force),
+          loadIntraday(key, force),
+          loadLeaders(key, kind, force),
+          loadSession(key, force),
+          loadGold(force).catch(() => {}),
+          loadFund(force).catch(() => {}),
         ]);
         setUpdatedAt(new Date());
         setPollFailed(false);
@@ -889,18 +921,76 @@ export default function MarketScreen() {
     ],
   );
 
+  const pullRefresh = useCallback(async () => {
+    await refreshMarket(selectedKey, boardKind, true);
+    const extra: Promise<unknown>[] = [];
+    if (marketScope === "stock" && activeLeader?.symbol && activeLeader.market) {
+      const { symbol, market } = activeLeader;
+      extra.push(
+        api
+          .getSymbolIntraday(symbol, market)
+          .then((series) => setLeaderIntraday(series.points?.length ? series : null))
+          .catch(() => setLeaderIntraday(null)),
+      );
+    }
+    if (
+      marketScope === "gold" &&
+      useEtfChart &&
+      selectedGoldItem?.symbol &&
+      selectedGoldItem.market
+    ) {
+      extra.push(
+        loadGoldIntraday(selectedGoldItem.symbol, selectedGoldItem.market, true).catch(
+          () => setGoldIntraday(null),
+        ),
+      );
+    }
+    if (marketScope === "fund" && selectedFundItem?.symbol) {
+      const code = selectedFundItem.symbol;
+      const mkt = selectedFundItem.market || "OF";
+      if (!isOtcFund && selectedFundItem.market) {
+        const key = PrefetchKeys.symbolIntraday(selectedFundItem.market, code);
+        extra.push(
+          cacheForceFetch(key, () => api.getSymbolIntraday(code, selectedFundItem.market!))
+            .then((series) => setFundIntraday(series.points?.length ? series : null))
+            .catch(() => setFundIntraday(null)),
+        );
+      }
+      extra.push(
+        cacheForceFetch(PrefetchKeys.fundNav(mkt, code), () =>
+          api.getFundNavHistory(code, 30, mkt),
+        )
+          .then((hist) => setFundNavSeries(fundNavToSeries(hist, selectedFundItem)))
+          .catch(() => {}),
+      );
+    }
+    if (extra.length) await Promise.all(extra);
+  }, [
+    refreshMarket,
+    selectedKey,
+    boardKind,
+    marketScope,
+    activeLeader,
+    useEtfChart,
+    selectedGoldItem,
+    selectedFundItem,
+    isOtcFund,
+    loadGoldIntraday,
+  ]);
+
   const {
     refreshing: ptrRefreshing,
     ready: ptrReady,
   } = usePullToRefresh(leadersBodyRef, ptrBarRef, {
-    onRefresh: () => refreshMarket(selectedKey, boardKind),
+    onRefresh: pullRefresh,
     disabled: detail != null,
     onArmed: () => haptics.selection(),
   });
 
   useEffect(() => {
     if (!tabActive) return;
-    void refreshMarket(selectedKey, boardKind);
+    // force: resume / remount must not serve TTL-fresh stale cache after iOS freeze
+    void refreshMarket(selectedKey, boardKind, true);
     const iTimer = setInterval(
       () =>
         void loadIndices(true)
@@ -941,6 +1031,7 @@ export default function MarketScreen() {
     };
   }, [
     tabActive,
+    fgEpoch,
     refreshMarket,
     loadIndices,
     loadIntraday,
@@ -965,13 +1056,14 @@ export default function MarketScreen() {
     }
     const symbol = item.symbol;
     const market = item.market;
-    void loadGoldIntraday(symbol, market).catch(() => setGoldIntraday(null));
+    void loadGoldIntraday(symbol, market, true).catch(() => setGoldIntraday(null));
     const timer = setInterval(() => {
-      void loadGoldIntraday(symbol, market).catch(() => {});
+      void loadGoldIntraday(symbol, market, true).catch(() => {});
     }, INTRADAY_POLL_MS);
     return () => clearInterval(timer);
   }, [
     tabActive,
+    fgEpoch,
     marketScope,
     useEtfChart,
     selectedGoldItem?.symbol,
@@ -997,31 +1089,42 @@ export default function MarketScreen() {
     else setFundIntraday(null);
 
     let cancelled = false;
-    const load = () =>
-      cacheSWR(
+    const load = (force = false) => {
+      const apply = (series: IntradaySeries) => {
+        if (cancelled) return;
+        cacheSet(key, series);
+        setFundIntraday(series.points?.length ? series : null);
+      };
+      if (force) {
+        return cacheForceFetch(key, () => api.getSymbolIntraday(symbol, market))
+          .then(apply)
+          .catch(() => {
+            if (!cancelled) setFundIntraday(null);
+          });
+      }
+      return cacheSWR(
         key,
         () => api.getSymbolIntraday(symbol, market),
         PrefetchTtl.symbolIntraday,
-        (series) => {
-          if (cancelled) return;
-          setFundIntraday(series.points?.length ? series : null);
-        },
+        apply,
       ).catch(() => {
         if (!cancelled) setFundIntraday(null);
       });
-    void load();
+    };
+    void load(true);
     if (fundSparkMode !== "intraday") {
       return () => {
         cancelled = true;
       };
     }
-    const timer = setInterval(() => void load(), INTRADAY_POLL_MS);
+    const timer = setInterval(() => void load(true), INTRADAY_POLL_MS);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
   }, [
     tabActive,
+    fgEpoch,
     marketScope,
     isOtcFund,
     fundSparkMode,
@@ -1050,28 +1153,28 @@ export default function MarketScreen() {
     }
 
     let cancelled = false;
-    void cacheSWR(
-      cacheKey,
-      () => api.getFundNavHistory(code, 30, market),
-      PrefetchTtl.fundNav,
-      (hist) => {
-        if (cancelled) return;
-        setFundNavSeries(
-          fundNavToSeries(hist, {
-            symbol: code,
-            name: selectedFundItem?.name || code,
-            market,
-          }),
-        );
-      },
-    ).catch(() => {
-      if (!cancelled && !cached) setFundNavSeries(null);
-    });
+    const applyHist = (hist: FundNavHistory) => {
+      if (cancelled) return;
+      cacheSet(cacheKey, hist);
+      setFundNavSeries(
+        fundNavToSeries(hist, {
+          symbol: code,
+          name: selectedFundItem?.name || code,
+          market,
+        }),
+      );
+    };
+    void cacheForceFetch(cacheKey, () => api.getFundNavHistory(code, 30, market))
+      .then(applyHist)
+      .catch(() => {
+        if (!cancelled && !cached) setFundNavSeries(null);
+      });
     return () => {
       cancelled = true;
     };
   }, [
     tabActive,
+    fgEpoch,
     marketScope,
     selectedFundItem?.kind,
     selectedFundItem?.symbol,
@@ -1154,6 +1257,7 @@ export default function MarketScreen() {
     };
   }, [
     tabActive,
+    fgEpoch,
     marketScope,
     activeLeader?.symbol,
     activeLeader?.market,
@@ -1264,7 +1368,7 @@ export default function MarketScreen() {
   }
 
   useEffect(() => {
-    if (marketScope !== "gold" || !goldBoard) return;
+    if (!tabActive || marketScope !== "gold" || !goldBoard) return;
     const keys = goldSectionBiasKeys(goldBoard, goldSection);
     if (keys.length === 0) {
       setGoldBiasByKey({});
@@ -1275,19 +1379,16 @@ export default function MarketScreen() {
     if (cached) setGoldBiasByKey(shortBiasMap(cached));
 
     let cancelled = false;
-    void cacheSWR(
-      cacheKey,
-      () => api.getShortBias(keys),
-      PrefetchTtl.shortBias,
-      (batch) => {
+    void cacheForceFetch(cacheKey, () => api.getShortBias(keys))
+      .then((batch) => {
         if (cancelled) return;
         setGoldBiasByKey(shortBiasMap(batch));
-      },
-    ).catch(() => {});
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [marketScope, goldSection, goldBoard]);
+  }, [tabActive, fgEpoch, marketScope, goldSection, goldBoard]);
 
   function selectBoard(kind: BoardKind) {
     if (kind === boardKind) return;

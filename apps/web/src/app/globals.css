@@ -6929,6 +6929,16 @@ select:focus {
   list-style: none;
   margin: 0;
   padding: 0;
+  /* Desktop Chromium: never let the list become a stretch flex column */
+  display: block;
+  height: auto;
+  flex: 0 0 auto;
+}
+
+.news-list > li {
+  display: block;
+  height: auto;
+  flex: none;
 }
 
 .news-row {
@@ -6938,6 +6948,7 @@ select:focus {
   gap: 10px;
   width: 100%;
   max-width: 100%;
+  height: auto;
   margin: 0;
   padding: 11px 12px;
   min-height: 52px;
@@ -6967,6 +6978,8 @@ select:focus {
   min-width: 0;
   max-width: 100%;
   overflow: hidden;
+  /* Avoid stretch-to-aside / flex height inflation on desktop Chromium */
+  align-self: flex-start;
 }
 
 .news-row-aside {
@@ -7033,10 +7046,14 @@ select:focus {
   line-height: 1.35;
   letter-spacing: -0.015em;
   color: rgba(245, 245, 247, 0.96);
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
   overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  /* Chromium + flex + -webkit-box can inflate row height on desktop preview;
+     Safari/iOS is fine — cap to 2 lines so simulator matches phone. */
+  max-height: calc(1.35em * 2);
 }
 
 .news-row[data-fresh="1"] .news-row-title {

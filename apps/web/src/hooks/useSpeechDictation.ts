@@ -45,7 +45,9 @@ type Options = {
 
 /**
  * Mobile-friendly dictation via Web Speech API (Chrome Android / desktop).
- * iOS Safari / 主屏幕 PWA 通常不可用 → onUnsupported，引导用系统键盘麦克风。
+ * Chrome sends audio to Google speech servers — mainland CN often fails with
+ * network / TLS unless system proxy can reach Google.
+ * iOS Safari / home-screen PWA usually unsupported → onUnsupported.
  */
 export function useSpeechDictation({
   lang = "zh-CN",
@@ -94,11 +96,18 @@ export function useSpeechDictation({
       onUnsupported?.();
       return;
     }
+    if (typeof window !== "undefined" && !window.isSecureContext) {
+      onErrorRef.current?.(
+        "当前是 HTTP 访问，浏览器不开放麦克风。请用 https 打开，或用系统键盘上的麦克风",
+      );
+      return;
+    }
     stop();
     wantRef.current = true;
     const rec = new Ctor();
     rec.lang = lang;
-    rec.continuous = true;
+    // One utterance per start — fewer Google reconnects (TLS) on CN networks
+    rec.continuous = false;
     rec.interimResults = true;
     rec.maxAlternatives = 1;
 
@@ -127,8 +136,10 @@ export function useSpeechDictation({
       if (code === "aborted" || code === "no-speech") return;
       if (code === "not-allowed") {
         onErrorRef.current?.("麦克风权限被拒绝，请在系统设置里允许");
-      } else if (code === "network") {
-        onErrorRef.current?.("语音识别需要网络");
+      } else if (code === "network" || code === "service-not-allowed") {
+        onErrorRef.current?.(
+          "语音识别连不上 Google（常见 TLS/网络限制）。可开系统代理后再试，或长按键盘麦克风输入",
+        );
       } else if (code) {
         onErrorRef.current?.(`语音识别失败（${code}）`);
       }
@@ -137,7 +148,6 @@ export function useSpeechDictation({
     };
 
     rec.onend = () => {
-      // Some engines end between phrases; restart while user still wants listen
       if (wantRef.current) {
         try {
           rec.start();

@@ -7,12 +7,14 @@ export {
   cacheAge,
   cacheSize,
   cacheFetch,
+  cacheForceFetch,
   cacheSWR,
 } from "./memoryCache";
 export {
   PrefetchKeys,
   PrefetchTtl,
   clearPrefetchCache,
+  resetWarmCooldowns,
   warmTabRoutes,
   warmTabChunks,
   warmTabData,

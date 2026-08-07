@@ -7,6 +7,18 @@ const store = new Map<string, Entry>();
 /** Soft cap — drop oldest entries when over (personal PWA RAM insurance). */
 const MAX_KEYS = 120;
 
+/**
+ * Write generation per key. Bumped on delete / force-fetch so a slower in-flight
+ * warm/SWR cannot overwrite a fresher manual refresh.
+ */
+const writeEpoch = new Map<string, number>();
+
+function bumpEpoch(key: string): number {
+  const n = (writeEpoch.get(key) ?? 0) + 1;
+  writeEpoch.set(key, n);
+  return n;
+}
+
 /** Fresh within ttl — does NOT delete stale entries (keep for peek / SWR). */
 export function cacheGet<T>(key: string, ttlMs: number): T | null {
   const hit = store.get(key);
@@ -51,11 +63,13 @@ export function cacheSet<T>(key: string, value: T): void {
 export function cacheDelete(key: string): void {
   store.delete(key);
   inflight.delete(key);
+  bumpEpoch(key);
 }
 
 export function cacheClear(): void {
   store.clear();
   inflight.clear();
+  writeEpoch.clear();
 }
 
 /** Test / diagnostics */
@@ -69,13 +83,16 @@ function sharedFetch<T>(key: string, fetcher: () => Promise<T>): Promise<T> {
   const pending = inflight.get(key) as Promise<T> | undefined;
   if (pending) return pending;
 
+  const epoch = writeEpoch.get(key) ?? 0;
   const run = (async () => {
     try {
       const value = await fetcher();
-      cacheSet(key, value);
+      if ((writeEpoch.get(key) ?? 0) === epoch) {
+        cacheSet(key, value);
+      }
       return value;
     } finally {
-      inflight.delete(key);
+      if (inflight.get(key) === run) inflight.delete(key);
     }
   })();
 
@@ -92,6 +109,24 @@ export async function cacheFetch<T>(
   const cached = cacheGet<T>(key, ttlMs);
   if (cached !== null) return cached;
   return sharedFetch(key, fetcher);
+}
+
+/**
+ * Always hit the network. Wins over in-flight warm/SWR for the same key
+ * (pull-to-refresh / resume force paths).
+ */
+export async function cacheForceFetch<T>(
+  key: string,
+  fetcher: () => Promise<T>,
+): Promise<T> {
+  const epoch = bumpEpoch(key);
+  store.delete(key);
+  inflight.delete(key);
+  const value = await fetcher();
+  if ((writeEpoch.get(key) ?? 0) === epoch) {
+    cacheSet(key, value);
+  }
+  return value;
 }
 
 /**

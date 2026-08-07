@@ -19,8 +19,17 @@ import {
   type AnalysisJobEventDetail,
 } from "@/lib/analysisEvents";
 import { haptics } from "@/lib/haptics";
-import { useTabActive } from "@/hooks/useTabActive";
-import { cacheDelete, cachePeek, cacheSet, cacheSWR, PrefetchKeys, PrefetchTtl } from "@/lib/prefetch";
+import { useForegroundEpoch, useTabActive } from "@/hooks/useTabActive";
+import { usePullToRefresh } from "@/hooks/usePullToRefresh";
+import {
+  cacheDelete,
+  cacheForceFetch,
+  cachePeek,
+  cacheSet,
+  cacheSWR,
+  PrefetchKeys,
+  PrefetchTtl,
+} from "@/lib/prefetch";
 import { OfflineBanner } from "@/components/layout/OfflineBanner";
 import type {
   AnalysisAgentStep,
@@ -350,6 +359,7 @@ function TierPicker({
 
 export default function AnalysisScreen() {
   const tabActive = useTabActive("/analysis");
+  const fgEpoch = useForegroundEpoch();
   const [tab, setTab] = useState<SubPage>("portfolio");
   const [profile, setProfile] = useState<AnalysisProfile | null>(
     () => cachePeek<AnalysisProfile>(PrefetchKeys.analysisProfile),
@@ -389,7 +399,10 @@ export default function AnalysisScreen() {
 
   busyRef.current = busy;
 
-  const loadBootstrap = useCallback(async () => {
+  const bootstrapGen = useRef(0);
+  const loadBootstrap = useCallback(async (opts?: { force?: boolean }) => {
+    const force = opts?.force === true;
+    const gen = ++bootstrapGen.current;
     setError(null);
     try {
       // Prefer live / running job — never let stale「latest done」overwrite in-flight UI
@@ -399,6 +412,8 @@ export default function AnalysisScreen() {
       } catch {
         running = null;
       }
+      if (gen !== bootstrapGen.current) return;
+
       const runningScope =
         running && (running.scope === "portfolio" || running.scope === "symbol")
           ? (running.scope as SubPage)
@@ -423,39 +438,56 @@ export default function AnalysisScreen() {
         runningScope === "symbol" || liveBusy === "symbol" || attaching;
 
       const [catalog, prof, latestPort, latestSym] = await Promise.all([
-        cacheSWR(
-          PrefetchKeys.analysisCatalog,
-          () => api.getAnalysisCatalog(),
-          PrefetchTtl.analysis,
-          (c) => {
-            setDegrees(c.degrees);
-          },
-        ),
-        cacheSWR(
-          PrefetchKeys.analysisProfile,
-          () => api.getAnalysisProfile(),
-          PrefetchTtl.analysis,
-          setProfile,
-        ),
+        force
+          ? cacheForceFetch(PrefetchKeys.analysisCatalog, () => api.getAnalysisCatalog())
+          : cacheSWR(
+              PrefetchKeys.analysisCatalog,
+              () => api.getAnalysisCatalog(),
+              PrefetchTtl.analysis,
+              (c) => {
+                if (gen !== bootstrapGen.current) return;
+                setDegrees(c.degrees);
+              },
+            ),
+        force
+          ? cacheForceFetch(PrefetchKeys.analysisProfile, () => api.getAnalysisProfile())
+          : cacheSWR(
+              PrefetchKeys.analysisProfile,
+              () => api.getAnalysisProfile(),
+              PrefetchTtl.analysis,
+              (p) => {
+                if (gen !== bootstrapGen.current) return;
+                setProfile(p);
+              },
+            ),
         skipPortLatest
           ? Promise.resolve(undefined)
-          : api
-              .getLatestAnalysis("portfolio")
-              .then((j) => {
-                cacheSet(PrefetchKeys.analysisLatest("portfolio"), j);
-                return j;
-              })
-              .catch(() => null),
+          : (force
+              ? cacheForceFetch(PrefetchKeys.analysisLatest("portfolio"), () =>
+                  api.getLatestAnalysis("portfolio"),
+                )
+              : api
+                  .getLatestAnalysis("portfolio")
+                  .then((j) => {
+                    cacheSet(PrefetchKeys.analysisLatest("portfolio"), j);
+                    return j;
+                  })
+            ).catch(() => null),
         skipSymLatest
           ? Promise.resolve(undefined)
-          : api
-              .getLatestAnalysis("symbol")
-              .then((j) => {
-                cacheSet(PrefetchKeys.analysisLatest("symbol"), j);
-                return j;
-              })
-              .catch(() => null),
+          : (force
+              ? cacheForceFetch(PrefetchKeys.analysisLatest("symbol"), () =>
+                  api.getLatestAnalysis("symbol"),
+                )
+              : api
+                  .getLatestAnalysis("symbol")
+                  .then((j) => {
+                    cacheSet(PrefetchKeys.analysisLatest("symbol"), j);
+                    return j;
+                  })
+            ).catch(() => null),
       ]);
+      if (gen !== bootstrapGen.current) return;
       cacheSet(PrefetchKeys.analysisCatalog, catalog);
       cacheSet(PrefetchKeys.analysisProfile, prof);
       setDegrees(catalog.degrees);
@@ -476,18 +508,52 @@ export default function AnalysisScreen() {
         setSymbolJob(latestSym);
       }
     } catch (e) {
+      if (gen !== bootstrapGen.current) return;
       setError(e instanceof Error ? e.message : "加载失败");
     }
   }, []);
 
+  /** Leave / resume: abort hung SSE like Agent — frozen busy otherwise blocks buttons + bootstrap. */
   useEffect(() => {
-    if (!tabActive) return;
-    void loadBootstrap();
+    const clearLive = () => {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      remoteJobIdRef.current = null;
+      busyRef.current = null;
+      setBusy(null);
+      setRemoteRunning(null);
+      setProgressLabel(null);
+      setProgressPct(0);
+      setLiveAgents([]);
+    };
+
+    if (!tabActive) {
+      clearLive();
+      return;
+    }
+
+    clearLive();
+    void loadBootstrap({ force: true });
     void api
       .getPortfolio()
       .then((pf) => setHoldings(pf.holdings || []))
       .catch(() => setHoldings([]));
-  }, [tabActive, loadBootstrap]);
+  }, [tabActive, fgEpoch, loadBootstrap]);
+
+  const analysisScrollRef = useRef<HTMLDivElement>(null);
+  const ptrBarRef = useRef<HTMLDivElement>(null);
+  const {
+    refreshing: ptrRefreshing,
+    ready: ptrReady,
+  } = usePullToRefresh(analysisScrollRef, ptrBarRef, {
+    onRefresh: async () => {
+      await loadBootstrap({ force: true });
+      const pf = await api.getPortfolio().catch(() => null);
+      if (pf) setHoldings(pf.holdings || []);
+    },
+    disabled: searchOpen,
+    onArmed: () => haptics.selection(),
+  });
 
   useEffect(() => {
     if (!searchOpen) return;
@@ -710,7 +776,7 @@ export default function AnalysisScreen() {
         setBusy(null);
         setProgressLabel(null);
         setProgressPct(0);
-        void loadBootstrap();
+        void loadBootstrap({ force: true });
       }
     },
     [applyStreamEvent, busy, loadBootstrap],
@@ -796,7 +862,7 @@ export default function AnalysisScreen() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [tabActive, busy, followRemoteJob]);
+  }, [tabActive, fgEpoch, busy, followRemoteJob]);
 
   const runPortfolio = () =>
     void runStream("portfolio", { scope: "portfolio", degree: "standard" });
@@ -946,9 +1012,30 @@ export default function AnalysisScreen() {
 
       <div
         className="analysis-scroll"
+        ref={analysisScrollRef}
+        data-ptr={ptrRefreshing ? "1" : "0"}
         role="tabpanel"
         aria-label={tab === "portfolio" ? "仓库分析" : "单条分析"}
       >
+        <div
+          ref={ptrBarRef}
+          className="news-ptr"
+          data-ready={ptrReady ? "1" : "0"}
+          data-refreshing={ptrRefreshing ? "1" : "0"}
+          aria-hidden
+        >
+          <div className="news-ptr-inner">
+            <RefreshCw
+              className="news-ptr-icon"
+              size={14}
+              strokeWidth={2.2}
+              absoluteStrokeWidth
+            />
+            <span className="news-ptr-label">
+              {ptrRefreshing ? "刷新中" : ptrReady ? "松开刷新" : "下拉刷新"}
+            </span>
+          </div>
+        </div>
         <div className="analysis-report-wrap">
           {tab === "portfolio" ? (
             <AnalysisReportBlocks

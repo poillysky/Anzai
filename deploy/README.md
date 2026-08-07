@@ -1,6 +1,6 @@
 # Anzai NAS deploy
 
-Single image: `poillysky/anzai:1.0.3` (API + Web)
+Single image: `poillysky/anzai:1.0.4` (API + Web)
 
 Path: `/vol1/1000/Docker/anzai`  
 Restart policy: always

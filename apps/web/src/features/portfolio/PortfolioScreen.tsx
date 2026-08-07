@@ -34,9 +34,17 @@ import {
 } from "@/lib/format";
 import { haptics } from "@/lib/haptics";
 import { goldGramsFromAmount, otcSharesFromAmount } from "@/lib/otcFund";
-import { useTabActive } from "@/hooks/useTabActive";
+import { useForegroundEpoch, useTabActive } from "@/hooks/useTabActive";
 import { usePullToRefresh } from "@/hooks/usePullToRefresh";
-import { cacheFetch, cachePeek, cacheSet, cacheSWR, PrefetchKeys, PrefetchTtl } from "@/lib/prefetch";
+import {
+  cacheFetch,
+  cacheForceFetch,
+  cachePeek,
+  cacheSet,
+  cacheSWR,
+  PrefetchKeys,
+  PrefetchTtl,
+} from "@/lib/prefetch";
 import type {
   DepthFlow,
   Holding,
@@ -403,6 +411,7 @@ function ReturnsCalEntry({
 export default function PortfolioScreen() {
   const { toast } = useOverlay();
   const tabActive = useTabActive("/");
+  const fgEpoch = useForegroundEpoch();
   const [data, setData] = useState<PortfolioSummary | null>(
     () => cachePeek<PortfolioSummary>(PrefetchKeys.portfolio),
   );
@@ -463,20 +472,30 @@ export default function PortfolioScreen() {
   const resolveGen = useRef(0);
   const symbolComposing = useRef(false);
 
-  const warmReturnsCache = useCallback(() => {
+  const loadGen = useRef(0);
+
+  const warmReturnsCache = useCallback((force = false) => {
     for (const dim of ["day", "month", "year"] as const) {
-      void cacheFetch(
-        PrefetchKeys.portfolioReturns(dim),
-        () => api.getPortfolioReturns(dim),
-        PrefetchTtl.portfolioReturns,
-      ).then((res) => {
-        if (dim === "day") setReturnsData((prev) => prev ?? res);
+      const key = PrefetchKeys.portfolioReturns(dim);
+      const run = force
+        ? cacheForceFetch(key, () => api.getPortfolioReturns(dim))
+        : cacheFetch(key, () => api.getPortfolioReturns(dim), PrefetchTtl.portfolioReturns);
+      void run.then((res) => {
+        if (dim === "day") {
+          setReturnsData((prev) => (force ? res : prev ?? res));
+        }
       });
     }
   }, []);
 
   const applyPortfolio = useCallback(
-    async (portfolio: PortfolioSummary) => {
+    async (
+      portfolio: PortfolioSummary,
+      opts?: { forceSide?: boolean; gen?: number },
+    ) => {
+      const forceSide = opts?.forceSide === true;
+      const gen = opts?.gen;
+      if (gen != null && gen !== loadGen.current) return;
       cacheSet(PrefetchKeys.portfolio, portfolio);
       setData(portfolio);
       setUpdatedAt(new Date());
@@ -485,13 +504,18 @@ export default function PortfolioScreen() {
         if (!prev) return prev;
         return portfolio.holdings.find((h) => h.id === prev.id) ?? null;
       });
-      warmReturnsCache();
+      warmReturnsCache(forceSide);
       const keys = [
         ...new Set(portfolio.holdings.map((h) => `${h.market}:${h.symbol}`)),
       ];
       if (keys.length > 0) {
         try {
-          const batch = await api.getShortBias(keys);
+          const batch = forceSide
+            ? await cacheForceFetch(PrefetchKeys.shortBias(keys), () =>
+                api.getShortBias(keys),
+              )
+            : await api.getShortBias(keys);
+          if (gen != null && gen !== loadGen.current) return;
           const next: Record<string, ShortBias> = {};
           for (const item of batch.items) {
             next[`${item.market}:${item.symbol}`] = item;
@@ -503,6 +527,7 @@ export default function PortfolioScreen() {
       } else {
         setShortBiasByKey({});
       }
+      if (gen != null && gen !== loadGen.current) return;
       setLoading(false);
     },
     [warmReturnsCache],
@@ -510,11 +535,15 @@ export default function PortfolioScreen() {
 
   const load = useCallback(
     async (opts?: { force?: boolean }) => {
+      const gen = ++loadGen.current;
       try {
         setError(null);
         if (opts?.force) {
-          const portfolio = await api.getPortfolio();
-          await applyPortfolio(portfolio);
+          const portfolio = await cacheForceFetch(PrefetchKeys.portfolio, () =>
+            api.getPortfolio(),
+          );
+          if (gen !== loadGen.current) return;
+          await applyPortfolio(portfolio, { forceSide: true, gen });
           return;
         }
         await cacheSWR(
@@ -522,10 +551,12 @@ export default function PortfolioScreen() {
           () => api.getPortfolio(),
           PrefetchTtl.portfolio,
           (portfolio) => {
-            void applyPortfolio(portfolio);
+            if (gen !== loadGen.current) return;
+            void applyPortfolio(portfolio, { gen });
           },
         );
       } catch (e) {
+        if (gen !== loadGen.current) return;
         const msg = e instanceof Error ? e.message : "加载失败";
         setError(msg);
         setPollFailed(true);
@@ -548,28 +579,31 @@ export default function PortfolioScreen() {
 
   useEffect(() => {
     if (!tabActive) return;
-    void load();
+    void load({ force: true });
     const timer = setInterval(() => void load({ force: true }), POLL_MS);
     return () => clearInterval(timer);
-  }, [tabActive, load]);
+  }, [tabActive, fgEpoch, load]);
 
   /** Fetch returns; when openAfter, only open modal after payload ready (news-reader pattern). */
   const fetchReturns = useCallback(
     async (
       dim: PortfolioReturnsDim,
       ref?: string,
-      opts?: { openAfter?: boolean; silent?: boolean },
+      opts?: { openAfter?: boolean; silent?: boolean; force?: boolean },
     ) => {
       const gen = ++returnsOpenGen.current;
       const key = PrefetchKeys.portfolioReturns(dim, ref);
       if (!opts?.silent) setReturnsLoading(true);
       setReturnsError(null);
       try {
-        const res = await cacheFetch(
-          key,
-          () => api.getPortfolioReturns(dim, ref),
-          PrefetchTtl.portfolioReturns,
-        );
+        const res =
+          opts?.force !== false
+            ? await cacheForceFetch(key, () => api.getPortfolioReturns(dim, ref))
+            : await cacheFetch(
+                key,
+                () => api.getPortfolioReturns(dim, ref),
+                PrefetchTtl.portfolioReturns,
+              );
         if (gen !== returnsOpenGen.current) return null;
         setReturnsDim(dim);
         setReturnsRef(ref);
@@ -924,7 +958,10 @@ export default function PortfolioScreen() {
     closeDetail();
     setData((prev) => {
       if (!prev) return prev;
-      return summarizeHoldings(prev.holdings.filter((h) => !idSet.has(h.id)));
+      const next = summarizeHoldings(prev.holdings.filter((h) => !idSet.has(h.id)));
+      // Keep warm cache in sync — plain load() would SWR-restore the deleted row
+      cacheSet(PrefetchKeys.portfolio, next);
+      return next;
     });
     setUpdatedAt(new Date());
 
@@ -933,10 +970,10 @@ export default function PortfolioScreen() {
         await api.deleteHolding(id);
       }
       toast(fromSwipe ? "已删除" : "已空仓", "success");
-      void load();
+      void load({ force: true });
     } catch {
       toast(fromSwipe ? "删除失败" : "空仓失败", "warning");
-      await load();
+      await load({ force: true });
     }
   }
 
