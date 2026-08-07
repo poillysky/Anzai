@@ -113,6 +113,7 @@ export default function AgentScreen() {
   const greetingRef = useRef(greeting);
   greetingRef.current = greeting;
   const voiceBaseRef = useRef("");
+  const voiceLiveRef = useRef(false);
 
   /** Keep prefetch cache aligned with live thread so tab re-focus SWR cannot wipe chat. */
   const writebackSessionCache = useCallback((msgs: ChatMsg[], cid: number | null) => {
@@ -139,6 +140,7 @@ export default function AgentScreen() {
   }, []);
 
   const onVoiceTranscript = useCallback((text: string) => {
+    if (!voiceLiveRef.current) return;
     const base = voiceBaseRef.current;
     const joined = !base ? text : /[\s\u3000]$/.test(base) ? `${base}${text}` : `${base} ${text}`;
     setInput(joined);
@@ -157,16 +159,23 @@ export default function AgentScreen() {
     onError: (msg) => toast(msg, "warning"),
   });
 
+  const haltVoice = useCallback(() => {
+    voiceLiveRef.current = false;
+    voiceBaseRef.current = "";
+    stopVoice();
+  }, [stopVoice]);
+
   const onMicClick = useCallback(() => {
     if (streaming) return;
     haptics.tap();
     if (voiceListening) {
-      stopVoice();
+      haltVoice();
       return;
     }
     voiceBaseRef.current = input;
+    voiceLiveRef.current = true;
     toggleVoice();
-  }, [input, streaming, stopVoice, toggleVoice, voiceListening]);
+  }, [haltVoice, input, streaming, toggleVoice, voiceListening]);
 
   const applySessionMessages = useCallback(
     (saved: ChatMsg[], greet: string, force = false) => {
@@ -340,9 +349,11 @@ export default function AgentScreen() {
       const assistantId = `a-${Date.now()}`;
       const next = [...messages.filter((m) => m.id !== "greet" || messages.length > 1), userMsg];
       setMessages([...next, { id: assistantId, role: "assistant", content: "" }]);
+      // Stop voice first and ignore late transcripts, then clear — otherwise
+      // a trailing SpeechRecognition onresult refills the box after send.
+      haltVoice();
       setInput("");
       setStreaming(true);
-      stopVoice();
       haptics.tap();
 
       const history = [...next]
@@ -569,12 +580,11 @@ export default function AgentScreen() {
         );
       }
     },
-    [conversationId, identity, messages, push, stopVoice, streaming, toast, writebackSessionCache],
+    [conversationId, haltVoice, identity, messages, push, streaming, toast, writebackSessionCache],
   );
 
   const onSubmit = (e: FormEvent) => {
     e.preventDefault();
-    stopVoice();
     void send(input);
   };
 
@@ -738,7 +748,7 @@ export default function AgentScreen() {
                 className="agent-composer-input"
                 value={input}
                 onChange={(e) => {
-                  if (voiceListening) stopVoice();
+                  if (voiceListening) haltVoice();
                   setInput(e.target.value);
                 }}
                 onFocus={() => {

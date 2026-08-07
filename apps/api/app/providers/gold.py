@@ -795,8 +795,11 @@ def format_gold_board_text(hint: str = "") -> str:
     )
     want_intl = any(k in h for k in ("纽约", "伦敦", "国际", "外盘", "盎司", "美元"))
     want_shop = any(k in h for k in ("门店", "金店", "首饰", "周大福", "老凤祥", "回收"))
-    # 泛问「黄金/金价」：只给锚点价，不展开全页
-    general = not (want_jd or want_etf or want_intl or want_shop)
+    want_au = any(k in h for k in ("AU9999", "au9999", "现货", "上金所"))
+    # 泛问「黄金/金价」：默认积存金（产品约定），不展开 ETF/国际/门店
+    general = not (want_jd or want_etf or want_intl or want_shop or want_au)
+    if general:
+        want_jd = True
 
     by_id: dict[str, object] = {}
     by_sec: dict[str, list] = {}
@@ -836,33 +839,33 @@ def format_gold_board_text(hint: str = "") -> str:
                 f"{direction}约 {abs(change_pct):.2f}%"
             )
 
-    # 锚点：国内 AU9999 几乎总带（积存/ETF/门店专问时可仍带一句对照）
-    au = by_id.get("au9999")
-    if au is not None:
-        _add(au)
-
+    # 积存金优先；仅点名现货/ETF 时再带 AU9999
     if want_jd:
         for it in by_sec.get("domestic") or []:
             if getattr(it, "id", None) != "au9999" and "积存" in (getattr(it, "name", "") or ""):
                 _add(it)
                 if len(picks) >= 3:
                     break
+    if want_au or want_etf or want_shop:
+        au = by_id.get("au9999")
+        if au is not None:
+            _add(au)
+
     if want_etf:
         for it in by_sec.get("domestic") or []:
             name = getattr(it, "name", "") or ""
             iid = str(getattr(it, "id", "") or "")
             if "ETF" in name.upper() or iid in {"159937", "518660"}:
                 _add(it)
-    if want_intl or general:
+    if want_intl:
         intl = by_sec.get("international") or []
-        # 泛问只要纽约金一个；点名伦敦再加
         for it in intl:
             name = getattr(it, "name", "") or ""
             iid = str(getattr(it, "id", "") or "")
             if "纽约" in name or iid in {"xau", "gc"}:
                 _add(it)
                 break
-        if want_intl and "伦敦" in h:
+        if "伦敦" in h:
             for it in intl:
                 if "伦敦" in (getattr(it, "name", "") or ""):
                     _add(it)
@@ -890,11 +893,13 @@ def format_gold_board_text(hint: str = "") -> str:
     if spoken:
         lines.append("口语参考：" + "。".join(spoken) + "。")
     if general:
-        lines.append("用户在泛问金价：优先只说 AU9999，最多再带一句纽约金对照。")
+        lines.append("用户在泛问金价：默认按积存金答（可提工行/浙商/民生里有报价的），不要先讲 AU9999/ETF。")
     elif want_jd:
-        lines.append("用户在问积存金：AU9999 + 对应银行积存即可。")
+        lines.append("用户在问积存金：只说积存金报价即可。")
     elif want_etf:
         lines.append("用户在问黄金 ETF：AU9999 + 点名的 ETF 即可。")
+    elif want_au:
+        lines.append("用户在问现货 AU9999：只说 AU9999。")
     elif want_shop:
         lines.append("用户在问门店/首饰：点名门店价，并提醒溢价与回收差，勿荐买。")
     return "\n".join(lines)

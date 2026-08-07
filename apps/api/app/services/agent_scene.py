@@ -311,8 +311,8 @@ def scene_hint(scene: TurnScene) -> str:
         bits.append(
             "只答商品/宏观；零提账户、持仓、分散、ETF配置。"
             "数字只引用本轮宏观工具里的品种；"
-            "黄金：若用户已点名积存金/ETF/现货等，只答点名的；"
-            "若只说「黄金/金价」且本轮有【先问清楚】，先反问再答，不要默认念 AU9999 整板；"
+            "黄金：没点名时默认积存金（工行/浙商/民生），不要反问 ETF/AU9999；"
+            "已点名积存金/ETF/现货则只答点名的；不要默认念 AU9999 整板；"
             "禁止补编美元指数、美债、COMEX、沪金连续等未查项；别列行情看板。"
             "两三句说完；若本轮有相关新闻：优先「今日」，旧闻只当背景一句带过。"
             + calendar_clock_line()
@@ -523,6 +523,16 @@ def assemble_turn(
     if clarify:
         openai_msgs.append(
             {"role": "system", "content": clarify_svc.format_clarify_block(clarify)}
+        )
+    elif clarify_svc.detect_gold_default_jicun(last_user):
+        openai_msgs.append(
+            {
+                "role": "system",
+                "content": (
+                    "【本轮·黄金默认积存金】用户只说了黄金/金价，未点名品种。"
+                    "按积存金（工行/浙商/民生）回答，不要反问 ETF 或 AU9999，不要念全板。"
+                ),
+            }
         )
 
     memory_summary = ""

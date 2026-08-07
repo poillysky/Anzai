@@ -197,13 +197,8 @@ def detect_clarify_need(
         return None
 
     if _gold_ambiguous(text):
-        return ClarifyNeed(
-            kind="gold",
-            ask=(
-                "黄金啊——你是想看积存金、黄金 ETF，还是上金所现货价（AU9999）？"
-                "说一下你关心哪头，安崽再按那个答。"
-            ),
-        )
+        # 未点名时默认积存金，不再反问 ETF / AU9999
+        return None
     if _portfolio_ambiguous(text):
         return ClarifyNeed(
             kind="portfolio",
@@ -216,6 +211,11 @@ def detect_clarify_need(
             ask=f"{name}啊——你是想先看现价走势，还是想听该不该买、怎么看？",
         )
     return None
+
+
+def detect_gold_default_jicun(user_text: str) -> bool:
+    """True when user said bare 黄金/金价 — answer as 积存金 unless they named another type."""
+    return _gold_ambiguous(user_text)
 
 
 def format_clarify_block(need: ClarifyNeed) -> str:

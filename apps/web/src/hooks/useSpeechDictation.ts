@@ -70,10 +70,20 @@ export function useSpeechDictation({
     wantRef.current = false;
     const rec = recRef.current;
     recRef.current = null;
-    try {
-      rec?.stop();
-    } catch {
-      /* already stopped */
+    if (rec) {
+      // Detach first so late onresult/onend cannot refill the input after send.
+      rec.onresult = null;
+      rec.onerror = null;
+      rec.onend = null;
+      try {
+        rec.abort();
+      } catch {
+        try {
+          rec.stop();
+        } catch {
+          /* already stopped */
+        }
+      }
     }
     setListening(false);
   }, []);
@@ -95,6 +105,7 @@ export function useSpeechDictation({
     let committed = "";
 
     rec.onresult = (ev) => {
+      if (!wantRef.current) return;
       let interim = "";
       for (let i = ev.resultIndex; i < ev.results.length; i++) {
         const row = ev.results[i];
@@ -107,6 +118,7 @@ export function useSpeechDictation({
         }
       }
       const out = interim ? (committed ? `${committed}${interim}` : interim) : committed;
+      if (!wantRef.current) return;
       onTranscriptRef.current(out, !interim && Boolean(committed));
     };
 

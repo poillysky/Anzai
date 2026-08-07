@@ -1036,7 +1036,7 @@ def format_prefetch_block(
     ):
         parts.append(
             "宏观/黄金：优先讲标了「今日」的品种；非今日=昨收，说清即可。"
-            "黄金泛问只说 AU9999（最多再带一句纽约金）；用户没点名的积存/ETF/门店别提。"
+            "黄金泛问默认积存金；用户没点名的 ETF/门店/纽约金别提。"
         )
     for it in items:
         parts.append(it["text"])
