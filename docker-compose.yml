@@ -1,3 +1,4 @@
+# 本地开发专用（挂源码 + --reload）。NAS / 生产请用 deploy/docker-compose.yml。
 services:
   api:
     build: ./apps/api

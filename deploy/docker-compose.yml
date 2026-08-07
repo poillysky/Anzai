@@ -1,0 +1,32 @@
+# 安崽 NAS — 单镜像（API + Web）poillysky/anzai:1.0.1
+# 目录：/vol1/1000/Docker/anzai
+# 只要 SQLite + 配置；不要知识库
+#
+#   docker compose pull && docker compose up -d
+# 访问：http://<nas>:3515  （/backend → 容器内 8515）
+# 管理：http://<nas>:8515/admin
+
+services:
+  anzai:
+    image: poillysky/anzai:1.0.1
+    container_name: anzai
+    restart: always
+    ports:
+      - "3515:3515"
+      - "8515:8515"
+    env_file:
+      - /vol1/1000/Docker/anzai/.env
+    environment:
+      DATABASE_URL: sqlite:////app/data/anzai.db
+      KNOWLEDGE_DATABASE_URL: ""
+      API_PROXY_TARGET: http://127.0.0.1:8515
+      NEXT_PUBLIC_API_BASE: /backend
+    volumes:
+      - /vol1/1000/Docker/anzai/data:/app/data
+      - /vol1/1000/Docker/anzai/.env:/app/api/.env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3515/', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s

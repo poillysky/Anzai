@@ -19,3 +19,5 @@ apps/api/data/
 apps/web/.env.local
 .cursor/
 *.sqlite3
+deploy/dist/
+deploy/.env
