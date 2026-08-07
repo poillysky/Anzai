@@ -6,7 +6,9 @@ import {
   Activity,
   CandlestickChart,
   CircleDollarSign,
+  Landmark,
   Layers,
+  RefreshCw,
   Search,
   TrendingDown,
   TrendingUp,
@@ -21,7 +23,11 @@ import {
   getIntradayLevelBubbles,
   IndexSparkline,
 } from "@/features/market/IndexSparkline";
+import { MarketRow } from "@/features/market/MarketRow";
 import { api } from "@/lib/api";
+import "./market.css";
+import { OfflineBanner } from "@/components/layout/OfflineBanner";
+import { usePullToRefresh } from "@/hooks/usePullToRefresh";
 import {
   formatAmount,
   formatChange,
@@ -32,8 +38,26 @@ import {
   pnlTone,
 } from "@/lib/format";
 import { haptics } from "@/lib/haptics";
-import { cachePeek, cacheSet, PrefetchKeys } from "@/lib/prefetch";
+import { goldGramsFromAmount, otcSharesFromAmount } from "@/lib/otcFund";
+import { useTabActive } from "@/hooks/useTabActive";
+import {
+  cachePeek,
+  cacheSet,
+  cacheSWR,
+  PrefetchKeys,
+  PrefetchTtl,
+  fundNavToSeries,
+  goldSectionBiasKeys,
+  scheduleWarmMarketScope,
+  shortBiasMap,
+  warmFundHero,
+  warmGoldHero,
+} from "@/lib/prefetch";
 import type {
+  FundBoard,
+  FundBoardItem,
+  FundNavHistory,
+  FundSearchHit,
   GoldBoard,
   GoldBoardItem,
   IndexQuote,
@@ -43,11 +67,10 @@ import type {
   MarketSession,
   SearchHit,
   ShortBias,
+  ShortBiasBatch,
 } from "@/lib/types";
+import { BiasMid } from "@/features/market/BiasMid";
 import {
-  biasChipClass,
-  biasChipText,
-  biasChipTitle,
   goldBiasKey,
 } from "@/lib/shortBiasChip";
 
@@ -58,10 +81,18 @@ const SESSION_POLL_MS = 60000;
 const SEARCH_DEBOUNCE_MS = 280;
 const DEFAULT_INDEX = "sh-composite";
 
-type MarketScope = "stock" | "gold";
+type MarketScope = "stock" | "fund" | "gold";
 type GoldSectionId = "domestic" | "international" | "shop";
+type FundSectionId = "broad" | "sector" | "theme" | "otc";
+type FundChartMode = "intraday" | "daily";
 type BoardKind = "up" | "down" | "amount" | "turnover" | "etf";
-type DetailChartStatus = "idle" | "loading" | "ready" | "empty";
+
+const FUND_SECTION_TABS: { id: FundSectionId; short: string }[] = [
+  { id: "broad", short: "宽基" },
+  { id: "sector", short: "行业" },
+  { id: "theme", short: "跨境" },
+  { id: "otc", short: "场外" },
+];
 
 const INDEX_META: Record<string, { short: string; tone: string }> = {
   "sh-composite": { short: "上证", tone: "sh" },
@@ -87,10 +118,14 @@ const KIND_LABEL: Record<string, string> = {
   index: "指数",
   hk: "港股",
   us: "美股",
+  ipo: "新股",
 };
 
-function canAddHolding(market: string): boolean {
-  return market === "SH" || market === "SZ" || market === "JD";
+function canAddHolding(market: string, kind?: string | null, note?: string | null): boolean {
+  if (kind === "ipo" || (note || "").includes("待上市") || (note || "").includes("新股")) {
+    return false;
+  }
+  return market === "SH" || market === "SZ" || market === "JD" || market === "OF";
 }
 
 /** Shanghai calendar date YYYY-MM-DD (A-share session day). */
@@ -103,8 +138,10 @@ function shanghaiTodayIso(): string {
   }).format(new Date());
 }
 
+/** 北京时间时钟（与会话状态对齐，不跟本机时区跑偏） */
 function formatClock(d: Date): string {
   return d.toLocaleTimeString("zh-CN", {
+    timeZone: "Asia/Shanghai",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
@@ -112,12 +149,11 @@ function formatClock(d: Date): string {
   });
 }
 
-function formatClockShort(d: Date): string {
-  return d.toLocaleTimeString("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
+/** 统一 kicker：状态文案 · 更新时间 */
+function formatKickerLine(label: string, updatedAt: Date | null): string {
+  const text = (label || "").trim() || "—";
+  if (!updatedAt) return text;
+  return `${text} · ${formatClock(updatedAt)}`;
 }
 
 function hitToLeader(hit: SearchHit): LeaderStock {
@@ -127,6 +163,8 @@ function hitToLeader(hit: SearchHit): LeaderStock {
     market: hit.market,
     price: hit.price ?? 0,
     change_pct: hit.change_pct,
+    kind: hit.kind,
+    note: hit.note,
   };
 }
 
@@ -138,6 +176,49 @@ function goldBoardToLeader(row: GoldBoardItem): LeaderStock | null {
     market: row.market,
     price: row.price ?? 0,
     change_pct: row.change_pct,
+  };
+}
+
+function fundBoardToLeader(row: FundBoardItem): LeaderStock | null {
+  if (!row.symbol || !row.market) return null;
+  if (row.holdable === false) return null;
+  return {
+    symbol: row.symbol,
+    name: row.name,
+    market: row.market,
+    price: row.price ?? 0,
+    change_pct: row.change_pct,
+  };
+}
+
+function fundSearchHitToItem(hit: FundSearchHit): FundBoardItem {
+  const isOtc = hit.kind === "otc" || hit.market === "OF";
+  const market = isOtc ? "OF" : hit.market || "SH";
+  const price = hit.price ?? undefined;
+  const change_pct = hit.change_pct ?? undefined;
+  let prev: number | undefined;
+  if (price != null && price > 0 && change_pct != null && change_pct > -100) {
+    const denom = 1 + change_pct / 100;
+    if (denom > 0) prev = price / denom;
+  }
+  return {
+    id: isOtc ? `OF-${hit.symbol}` : `${market}-${hit.symbol}`,
+    name: hit.name,
+    section: isOtc ? "otc" : "broad",
+    price,
+    change_pct,
+    prev,
+    unit: isOtc ? "净值" : "元",
+    freshness: hit.as_of || "",
+    note: isOtc
+      ? hit.as_of
+        ? `日净值 · ${hit.as_of}`
+        : "日净值 · 非实时"
+      : `${market}${hit.symbol}`,
+    holdable: true,
+    symbol: hit.symbol,
+    market,
+    kind: isOtc ? "otc" : "etf",
   };
 }
 
@@ -244,29 +325,37 @@ function heroKicker(
 ): { live: boolean; text: string } {
   if (pollFailed) return { live: false, text: "更新失败" };
   const state = session?.state;
-  if (state === "closed" || state === "weekend") {
-    const label = session?.label ?? "已收盘";
+  if (state === "closed" || state === "weekend" || state === "holiday") {
     return {
       live: false,
-      text: updatedAt ? `${label} · ${formatClockShort(updatedAt)}` : label,
+      text: formatKickerLine(session?.label ?? "已收盘", updatedAt),
     };
   }
   if (state === "lunch") {
     return {
       live: false,
-      text: updatedAt ? `午休 · ${formatClockShort(updatedAt)}` : "午间休市",
+      text: formatKickerLine(session?.label ?? "午间休市", updatedAt),
+    };
+  }
+  if (state === "auction") {
+    return {
+      live: true,
+      text: formatKickerLine(session?.label ?? "集合竞价", updatedAt),
     };
   }
   if (state === "pre") {
     return {
       live: false,
-      text: updatedAt ? `未开盘 · ${formatClockShort(updatedAt)}` : (session?.label ?? "未开盘"),
+      text: formatKickerLine(session?.label ?? "未开盘", updatedAt),
     };
   }
   if (state === "trading") {
-    return { live: true, text: updatedAt ? formatClock(updatedAt) : "交易中" };
+    return {
+      live: true,
+      text: formatKickerLine(session?.label ?? "交易中", updatedAt),
+    };
   }
-  return { live: false, text: updatedAt ? formatClock(updatedAt) : "—" };
+  return { live: false, text: formatKickerLine("—", updatedAt) };
 }
 
 /** Shanghai weekday short: Mon…Sun (en-US). */
@@ -318,21 +407,12 @@ function goldHeroKicker(
 ): { live: boolean; text: string } {
   if (pollFailed) return { live: false, text: "更新失败" };
   if (!item) {
-    return {
-      live: false,
-      text: updatedAt ? `参考 · ${formatClockShort(updatedAt)}` : "金价参考",
-    };
+    return { live: false, text: formatKickerLine("金价参考", updatedAt) };
   }
 
   const live = isGoldItemLive(item, aShareSession);
   const status = goldKickerStatus(item, aShareSession, live);
-  if (live) {
-    return { live: true, text: updatedAt ? formatClock(updatedAt) : status };
-  }
-  return {
-    live: false,
-    text: updatedAt ? `${status} · ${formatClockShort(updatedAt)}` : status,
-  };
+  return { live, text: formatKickerLine(status, updatedAt) };
 }
 
 function goldKickerStatus(
@@ -348,8 +428,11 @@ function goldKickerStatus(
   if (isGoldEtfItem(item)) {
     if (live) return "场内ETF";
     const state = aShare?.state;
-    if (state === "closed" || state === "weekend") return "金ETF收盘";
+    if (state === "closed" || state === "weekend" || state === "holiday") {
+      return state === "holiday" ? "金ETF休市" : "金ETF收盘";
+    }
     if (state === "lunch") return "午休";
+    if (state === "auction") return aShare?.label ?? "集合竞价";
     if (state === "pre") return "未开盘";
     return aShare?.label ?? "场内ETF";
   }
@@ -369,7 +452,7 @@ function isGoldItemLive(item: GoldBoardItem, aShare: MarketSession | null): bool
   // 积存金近全天报价，不跟 A 股时段
   if (item.market === "JD" || (item.freshness || "").includes("实时")) return true;
   if (isGoldEtfItem(item)) {
-    return aShare?.state === "trading";
+    return aShare?.state === "trading" || aShare?.state === "auction";
   }
   if (item.section === "international") {
     const day = shanghaiWeekdayShort();
@@ -381,6 +464,7 @@ function isGoldItemLive(item: GoldBoardItem, aShare: MarketSession | null): bool
 export default function MarketScreen() {
   const router = useRouter();
   const { toast } = useOverlay();
+  const tabActive = useTabActive("/market");
   const [indices, setIndices] = useState<IndexQuote[]>(
     () => cachePeek<IndexQuote[]>(PrefetchKeys.indices) ?? [],
   );
@@ -398,35 +482,93 @@ export default function MarketScreen() {
   const [error, setError] = useState<string | null>(null);
   const [pollFailed, setPollFailed] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
+  const leadersBodyRef = useRef<HTMLDivElement>(null);
+  const ptrBarRef = useRef<HTMLDivElement>(null);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [searchHits, setSearchHits] = useState<SearchHit[] | null>(null);
+  const [fundSearchHits, setFundSearchHits] = useState<FundSearchHit[] | null>(null);
   const [searchLoading, setSearchLoading] = useState(false);
   const searchSeq = useRef(0);
+  const [fundNavSeries, setFundNavSeries] = useState<IntradaySeries | null>(() => {
+    const board = cachePeek<FundBoard>(PrefetchKeys.fundBoard);
+    const sec = board?.sections.find((s) => s.id === "broad") ?? board?.sections[0];
+    const item = sec?.items?.[0];
+    if (!item?.symbol) return null;
+    const market = item.market || "OF";
+    const hist = cachePeek<FundNavHistory>(PrefetchKeys.fundNav(market, item.symbol));
+    return hist ? fundNavToSeries(hist, item) : null;
+  });
 
   const [detail, setDetail] = useState<LeaderStock | null>(null);
-  const [detailIntra, setDetailIntra] = useState<IntradaySeries | null>(null);
-  const [detailChart, setDetailChart] = useState<DetailChartStatus>("idle");
   const [shares, setShares] = useState("1000");
   const [cost, setCost] = useState("");
   const [boughtAt, setBoughtAt] = useState(() => shanghaiTodayIso());
   const [saving, setSaving] = useState(false);
   const [marketScope, setMarketScope] = useState<MarketScope>("stock");
-  const [goldBoard, setGoldBoard] = useState<GoldBoard | null>(null);
+  const [goldBoard, setGoldBoard] = useState<GoldBoard | null>(
+    () => cachePeek<GoldBoard>(PrefetchKeys.goldBoard),
+  );
+  const [fundBoard, setFundBoard] = useState<FundBoard | null>(
+    () => cachePeek<FundBoard>(PrefetchKeys.fundBoard),
+  );
   const [goldSection, setGoldSection] = useState<GoldSectionId>("domestic");
+  const [fundSection, setFundSection] = useState<FundSectionId>("broad");
+  /** 场内 ETF：分时 / 日K；场外固定日净值 */
+  const [fundChartMode, setFundChartMode] = useState<FundChartMode>("daily");
+  const [fundIntraday, setFundIntraday] = useState<IntradaySeries | null>(() => {
+    const board = cachePeek<FundBoard>(PrefetchKeys.fundBoard);
+    const sec = board?.sections.find((s) => s.id === "broad") ?? board?.sections[0];
+    const item = sec?.items?.[0];
+    if (!item?.symbol || !item.market || item.kind === "otc") return null;
+    return cachePeek<IntradaySeries>(PrefetchKeys.symbolIntraday(item.market, item.symbol));
+  });
+  /** 行业二级板块：煤炭 / 贵金属 / 电子… */
+  const [fundIndustryId, setFundIndustryId] = useState<string>("");
   const [selectedGoldId, setSelectedGoldId] = useState<string>("");
+  const [selectedFundId, setSelectedFundId] = useState<string>("");
+  /** 搜索选中：不切分类，英雄区仍展示该基金 */
+  const [fundSearchPick, setFundSearchPick] = useState<FundBoardItem | null>(null);
   const [selectedLeaderKey, setSelectedLeaderKey] = useState<string>("");
-  const [goldIntraday, setGoldIntraday] = useState<IntradaySeries | null>(null);
-  const [goldBiasByKey, setGoldBiasByKey] = useState<Record<string, ShortBias>>({});
+  /** 榜单 / 搜索选中的个股（存对象，清空搜索后仍可看图） */
+  const [selectedLeader, setSelectedLeader] = useState<LeaderStock | null>(null);
+  const [leaderIntraday, setLeaderIntraday] = useState<IntradaySeries | null>(null);
+  const [goldIntraday, setGoldIntraday] = useState<IntradaySeries | null>(() => {
+    const board = cachePeek<GoldBoard>(PrefetchKeys.goldBoard);
+    const sec = board?.sections.find((s) => s.id === "domestic") ?? board?.sections[0];
+    const item = sec?.items?.[0];
+    if (!item?.holdable || !item.symbol || !item.market) return null;
+    return cachePeek<IntradaySeries>(PrefetchKeys.symbolIntraday(item.market, item.symbol));
+  });
+  const [goldBiasByKey, setGoldBiasByKey] = useState<Record<string, ShortBias>>(() => {
+    const board = cachePeek<GoldBoard>(PrefetchKeys.goldBoard);
+    const keys = goldSectionBiasKeys(board, "domestic");
+    if (!keys.length) return {};
+    const batch = cachePeek<ShortBiasBatch>(PrefetchKeys.shortBias(keys));
+    return batch ? shortBiasMap(batch) : {};
+  });
 
   const searching = searchQuery.trim().length > 0;
   const selected = indices.find((i) => i.key === selectedKey) ?? null;
   const goldSectionData =
     goldBoard?.sections.find((s) => s.id === goldSection) ?? goldBoard?.sections[0] ?? null;
+  const fundSectionData =
+    fundBoard?.sections.find((s) => s.id === fundSection) ?? fundBoard?.sections[0] ?? null;
+  const fundIndustryGroups = fundSection === "sector" ? fundSectionData?.groups ?? [] : [];
+  const fundIndustryGroup =
+    fundIndustryGroups.find((g) => g.id === fundIndustryId) ?? fundIndustryGroups[0] ?? null;
+  const fundListItems =
+    fundSection === "sector" && fundIndustryGroup
+      ? fundIndustryGroup.items
+      : (fundSectionData?.items ?? []);
   const selectedGoldItem =
     goldSectionData?.items.find((i) => i.id === selectedGoldId) ??
     goldSectionData?.items[0] ??
     null;
+  const selectedFundItem =
+    fundSearchPick && fundSearchPick.id === selectedFundId
+      ? fundSearchPick
+      : fundListItems.find((i) => i.id === selectedFundId) ?? fundListItems[0] ?? null;
   /** Keep 5 slots always — filtering empties collapsed the grid and shoved hero down on load */
   const grid = INDEX_ORDER.map((key) => ({
     key,
@@ -439,51 +581,126 @@ export default function MarketScreen() {
     selectedGoldItem?.chart_slots,
     selectedGoldItem?.chart_times,
   );
+  const isOtcFund = marketScope === "fund" && selectedFundItem?.kind === "otc";
+  const fundSparkMode: FundChartMode = isOtcFund ? "daily" : fundChartMode;
   const useEtfChart =
     marketScope === "gold" &&
     Boolean(selectedGoldItem?.holdable && selectedGoldItem.symbol) &&
     goldChartPoints.length < 2;
+  const activeLeader = (() => {
+    if (marketScope !== "stock" || !selectedLeaderKey) return null;
+    const fromBoard = leaders?.items.find(
+      (r) => `${r.market}-${r.symbol}` === selectedLeaderKey,
+    );
+    if (fromBoard) return fromBoard;
+    if (
+      selectedLeader &&
+      `${selectedLeader.market}-${selectedLeader.symbol}` === selectedLeaderKey
+    ) {
+      return selectedLeader;
+    }
+    const hit = searchHits?.find((h) => `${h.market}-${h.symbol}` === selectedLeaderKey);
+    return hit ? hitToLeader(hit) : null;
+  })();
+  const leaderPrevClose =
+    activeLeader && activeLeader.change_pct != null && activeLeader.price > 0
+      ? activeLeader.price / (1 + activeLeader.change_pct / 100)
+      : undefined;
+  const fundPrevClose = (() => {
+    if (!selectedFundItem) return undefined;
+    if (selectedFundItem.prev != null && selectedFundItem.prev > 0) {
+      return selectedFundItem.prev;
+    }
+    const px = selectedFundItem.price;
+    const chg = selectedFundItem.change_pct;
+    if (px != null && px > 0 && chg != null && chg > -100) {
+      const denom = 1 + chg / 100;
+      if (denom > 0) return px / denom;
+    }
+    // 日K 已加载时用倒数第二点作昨净值
+    const pts = fundNavSeries?.points;
+    if (pts && pts.length >= 2) return pts[pts.length - 2]?.price;
+    return undefined;
+  })();
   const heroQuote =
-    marketScope === "gold"
+    marketScope === "fund"
       ? {
-          name: selectedGoldItem?.name ?? "黄金",
-          price: selectedGoldItem?.price ?? undefined,
-          change_pct: selectedGoldItem?.change_pct,
-          prev_close: selectedGoldItem?.prev ?? undefined,
-          market: selectedGoldItem?.market || "SH",
-          unit: selectedGoldItem?.unit,
+          name: selectedFundItem?.name ?? "基金",
+          price: selectedFundItem?.price ?? undefined,
+          change_pct: selectedFundItem?.change_pct,
+          prev_close: fundPrevClose,
+          market: selectedFundItem?.market || "SH",
+          unit: isOtcFund ? "净值" : (undefined as string | undefined),
         }
-      : {
-          name: selected?.name ?? INDEX_META[selectedKey]?.short ?? "上证指数",
-          price: selected?.price,
-          change_pct: selected?.change_pct,
-          prev_close: selected?.prev_close,
-          market: selected?.market ?? "SH",
-          unit: undefined as string | undefined,
-        };
+      : marketScope === "gold"
+        ? {
+            name: selectedGoldItem?.name ?? "黄金",
+            price: selectedGoldItem?.price ?? undefined,
+            change_pct: selectedGoldItem?.change_pct,
+            prev_close: selectedGoldItem?.prev ?? undefined,
+            market: selectedGoldItem?.market || "SH",
+            unit: selectedGoldItem?.unit,
+          }
+        : activeLeader
+          ? {
+              name: activeLeader.name,
+              price: activeLeader.price,
+              change_pct: activeLeader.change_pct,
+              prev_close: leaderPrevClose,
+              market: activeLeader.market,
+              unit: undefined as string | undefined,
+            }
+          : {
+              name: selected?.name ?? INDEX_META[selectedKey]?.short ?? "上证指数",
+              price: selected?.price,
+              change_pct: selected?.change_pct,
+              prev_close: selected?.prev_close,
+              market: selected?.market ?? "SH",
+              unit: undefined as string | undefined,
+            };
   const activeIntraday =
-    marketScope === "gold"
-      ? useEtfChart
-        ? goldIntraday
-        : goldChartPoints.length
-          ? ({
-              key: selectedGoldItem?.id || "gold",
-              symbol: selectedGoldItem?.id || "gold",
-              name: selectedGoldItem?.name || "黄金",
-              market: selectedGoldItem?.market || "SH",
-              prev_close: selectedGoldItem?.prev ?? goldChartPoints[0]?.price,
-              session: goldSparkSess,
-              points: goldChartPoints,
-            } satisfies IntradaySeries)
-          : null
-      : intraday;
+    marketScope === "fund"
+      ? fundSparkMode === "daily"
+        ? fundNavSeries
+        : fundIntraday
+      : marketScope === "gold"
+        ? useEtfChart
+          ? goldIntraday
+          : goldChartPoints.length
+            ? ({
+                key: selectedGoldItem?.id || "gold",
+                symbol: selectedGoldItem?.id || "gold",
+                name: selectedGoldItem?.name || "黄金",
+                market: selectedGoldItem?.market || "SH",
+                prev_close: selectedGoldItem?.prev ?? goldChartPoints[0]?.price,
+                session: goldSparkSess,
+                points: goldChartPoints,
+              } satisfies IntradaySeries)
+            : null
+        : activeLeader
+          ? leaderIntraday
+          : intraday;
   const toneClass = pnlTone(heroQuote.change_pct, heroQuote.price, heroQuote.prev_close);
   const heroTone =
     toneClass === "text-up" ? "up" : toneClass === "text-down" ? "down" : "flat";
   const kicker =
     marketScope === "gold"
       ? goldHeroKicker(selectedGoldItem, updatedAt, pollFailed, session)
-      : heroKicker(session, updatedAt, pollFailed);
+      : marketScope === "fund"
+        ? isOtcFund
+          ? {
+              text: selectedFundItem?.freshness
+                ? `日净值 · ${selectedFundItem.freshness}`
+                : formatKickerLine("日净值 · 非实时", updatedAt),
+              live: false,
+            }
+          : pollFailed
+            ? { text: "更新失败", live: false }
+            : {
+                text: formatKickerLine("场内 ETF", updatedAt),
+                live: Boolean(selectedFundItem?.price),
+              }
+        : heroKicker(session, updatedAt, pollFailed);
   const levelBubbles = useMemo(
     () =>
       getIntradayLevelBubbles(
@@ -493,43 +710,153 @@ export default function MarketScreen() {
     [activeIntraday?.points, activeIntraday?.prev_close, heroQuote.prev_close],
   );
 
-  const loadIndices = useCallback(async () => {
-    const data = await api.getIndices();
-    cacheSet(PrefetchKeys.indices, data);
-    setIndices(data);
+  const applyGoldBoard = useCallback(
+    (board: GoldBoard) => {
+      cacheSet(PrefetchKeys.goldBoard, board);
+      setGoldBoard(board);
+      setSelectedGoldId((prev) => {
+        const sec = board.sections.find((s) => s.id === goldSection) ?? board.sections[0];
+        if (prev && sec?.items.some((i) => i.id === prev)) return prev;
+        return sec?.items[0]?.id || "";
+      });
+      void warmGoldHero(board).catch(() => {});
+    },
+    [goldSection],
+  );
+
+  const loadIndices = useCallback(async (force = false) => {
+    if (force) {
+      const data = await api.getIndices();
+      cacheSet(PrefetchKeys.indices, data);
+      setIndices(data);
+      return;
+    }
+    await cacheSWR(
+      PrefetchKeys.indices,
+      () => api.getIndices(),
+      PrefetchTtl.indices,
+      setIndices,
+    );
   }, []);
 
-  const loadIntraday = useCallback(async (key: string) => {
-    const data = await api.getIntraday(key);
-    cacheSet(PrefetchKeys.intraday(key), data);
-    setIntraday(data);
+  const loadIntraday = useCallback(async (key: string, force = false) => {
+    const apply = (data: IntradaySeries) => {
+      cacheSet(PrefetchKeys.intraday(key), data);
+      setIntraday(data);
+    };
+    if (force) {
+      apply(await api.getIntraday(key));
+      return;
+    }
+    await cacheSWR(
+      PrefetchKeys.intraday(key),
+      () => api.getIntraday(key),
+      PrefetchTtl.intraday,
+      apply,
+    );
   }, []);
 
-  const loadLeaders = useCallback(async (key: string, kind: BoardKind) => {
-    const data = await api.getLeaders(key, kind);
-    cacheSet(PrefetchKeys.leaders(key, kind), data);
-    setLeaders(data);
+  const loadLeaders = useCallback(async (key: string, kind: BoardKind, force = false) => {
+    const apply = (data: LeadersBoard) => {
+      cacheSet(PrefetchKeys.leaders(key, kind), data);
+      setLeaders(data);
+    };
+    if (force) {
+      apply(await api.getLeaders(key, kind));
+      return;
+    }
+    await cacheSWR(
+      PrefetchKeys.leaders(key, kind),
+      () => api.getLeaders(key, kind),
+      PrefetchTtl.leaders,
+      apply,
+    );
   }, []);
 
-  const loadSession = useCallback(async (key: string) => {
-    const data = await api.getSession(key);
-    cacheSet(PrefetchKeys.session(key), data);
-    setSession(data);
+  const loadSession = useCallback(async (key: string, force = false) => {
+    const apply = (data: MarketSession) => {
+      cacheSet(PrefetchKeys.session(key), data);
+      setSession(data);
+    };
+    if (force) {
+      apply(await api.getSession(key));
+      return;
+    }
+    await cacheSWR(
+      PrefetchKeys.session(key),
+      () => api.getSession(key),
+      PrefetchTtl.session,
+      apply,
+    );
   }, []);
 
-  const loadGold = useCallback(async () => {
-    const board = await api.getGoldBoard();
-    setGoldBoard(board);
-    setSelectedGoldId((prev) => {
-      const sec = board.sections.find((s) => s.id === goldSection) ?? board.sections[0];
-      if (prev && sec?.items.some((i) => i.id === prev)) return prev;
-      return sec?.items[0]?.id || "";
-    });
-  }, [goldSection]);
+  const loadGold = useCallback(
+    async (force = false) => {
+      if (force) {
+        applyGoldBoard(await api.getGoldBoard());
+        return;
+      }
+      await cacheSWR(
+        PrefetchKeys.goldBoard,
+        () => api.getGoldBoard(),
+        PrefetchTtl.gold,
+        applyGoldBoard,
+      );
+    },
+    [applyGoldBoard],
+  );
+
+  const applyFundBoard = useCallback(
+    (board: FundBoard) => {
+      cacheSet(PrefetchKeys.fundBoard, board);
+      setFundBoard(board);
+      setFundIndustryId((prevIndustry) => {
+        const sec = board.sections.find((s) => s.id === fundSection) ?? board.sections[0];
+        const groups = sec?.id === "sector" ? sec.groups ?? [] : [];
+        const nextIndustry =
+          groups.length === 0
+            ? ""
+            : prevIndustry && groups.some((g) => g.id === prevIndustry)
+              ? prevIndustry
+              : groups[0]?.id || "";
+        setSelectedFundId((prev) => {
+          const list =
+            sec?.id === "sector"
+              ? (groups.find((g) => g.id === nextIndustry) ?? groups[0])?.items ?? []
+              : (sec?.items ?? []);
+          if (prev && list.some((i) => i.id === prev)) return prev;
+          return list[0]?.id || "";
+        });
+        return nextIndustry;
+      });
+      void warmFundHero(board).catch(() => {});
+    },
+    [fundSection],
+  );
+
+  const loadFund = useCallback(
+    async (force = false) => {
+      if (force) {
+        applyFundBoard(await api.getFundBoard());
+        return;
+      }
+      await cacheSWR(
+        PrefetchKeys.fundBoard,
+        () => api.getFundBoard(),
+        PrefetchTtl.fund,
+        applyFundBoard,
+      );
+    },
+    [applyFundBoard],
+  );
 
   const loadGoldIntraday = useCallback(async (symbol: string, market: string) => {
-    const data = await api.getSymbolIntraday(symbol, market);
-    setGoldIntraday(data);
+    await cacheSWR(
+      PrefetchKeys.symbolIntraday(market, symbol),
+      () => api.getSymbolIntraday(symbol, market),
+      PrefetchTtl.symbolIntraday,
+      setGoldIntraday,
+    );
   }, []);
 
   const refreshMarket = useCallback(
@@ -542,6 +869,7 @@ export default function MarketScreen() {
           loadLeaders(key, kind),
           loadSession(key),
           loadGold().catch(() => {}),
+          loadFund().catch(() => {}),
         ]);
         setUpdatedAt(new Date());
         setPollFailed(false);
@@ -549,14 +877,33 @@ export default function MarketScreen() {
         setPollFailed(true);
       }
     },
-    [loadIndices, loadIntraday, loadLeaders, loadSession, loadGold, selectedKey, boardKind],
+    [
+      loadIndices,
+      loadIntraday,
+      loadLeaders,
+      loadSession,
+      loadGold,
+      loadFund,
+      selectedKey,
+      boardKind,
+    ],
   );
 
+  const {
+    refreshing: ptrRefreshing,
+    ready: ptrReady,
+  } = usePullToRefresh(leadersBodyRef, ptrBarRef, {
+    onRefresh: () => refreshMarket(selectedKey, boardKind),
+    disabled: detail != null,
+    onArmed: () => haptics.selection(),
+  });
+
   useEffect(() => {
+    if (!tabActive) return;
     void refreshMarket(selectedKey, boardKind);
     const iTimer = setInterval(
       () =>
-        void loadIndices()
+        void loadIndices(true)
           .then(() => {
             setUpdatedAt(new Date());
             setPollFailed(false);
@@ -565,12 +912,12 @@ export default function MarketScreen() {
       INDEX_POLL_MS,
     );
     const dTimer = setInterval(
-      () => void loadIntraday(selectedKey).catch(() => {}),
+      () => void loadIntraday(selectedKey, true).catch(() => {}),
       INTRADAY_POLL_MS,
     );
     const lTimer = setInterval(
       () =>
-        void loadLeaders(selectedKey, boardKind)
+        void loadLeaders(selectedKey, boardKind, true)
           .then(() => {
             setUpdatedAt(new Date());
             setPollFailed(false);
@@ -579,51 +926,195 @@ export default function MarketScreen() {
       LEADERS_POLL_MS,
     );
     const sTimer = setInterval(
-      () => void loadSession(selectedKey).catch(() => {}),
+      () => void loadSession(selectedKey, true).catch(() => {}),
       SESSION_POLL_MS,
     );
-    const gTimer = setInterval(() => void loadGold().catch(() => {}), INTRADAY_POLL_MS);
+    const gTimer = setInterval(() => void loadGold(true).catch(() => {}), INTRADAY_POLL_MS);
+    const fTimer = setInterval(() => void loadFund(true).catch(() => {}), INTRADAY_POLL_MS);
     return () => {
       clearInterval(iTimer);
       clearInterval(dTimer);
       clearInterval(lTimer);
       clearInterval(sTimer);
       clearInterval(gTimer);
+      clearInterval(fTimer);
     };
-  }, [refreshMarket, loadIndices, loadIntraday, loadLeaders, loadSession, loadGold, selectedKey, boardKind]);
+  }, [
+    tabActive,
+    refreshMarket,
+    loadIndices,
+    loadIntraday,
+    loadLeaders,
+    loadSession,
+    loadGold,
+    loadFund,
+    selectedKey,
+    boardKind,
+  ]);
 
-  // Gold hero chart — jicunjin line or holdable ETF intraday
+  // Gold ETF hero — intraday
   useEffect(() => {
-    if (marketScope !== "gold") return;
-    if (!useEtfChart || !selectedGoldItem?.symbol || !selectedGoldItem.market) {
-      if (!useEtfChart) setGoldIntraday(null);
+    if (!tabActive) return;
+    if (marketScope === "fund") {
       return;
     }
-    const symbol = selectedGoldItem.symbol;
-    const market = selectedGoldItem.market;
+    const item = marketScope === "gold" && useEtfChart ? selectedGoldItem : null;
+    if (!item?.symbol || !item.market) {
+      if (marketScope === "gold" && useEtfChart) setGoldIntraday(null);
+      return;
+    }
+    const symbol = item.symbol;
+    const market = item.market;
     void loadGoldIntraday(symbol, market).catch(() => setGoldIntraday(null));
     const timer = setInterval(() => {
       void loadGoldIntraday(symbol, market).catch(() => {});
     }, INTRADAY_POLL_MS);
     return () => clearInterval(timer);
-  }, [marketScope, useEtfChart, selectedGoldItem?.symbol, selectedGoldItem?.market, loadGoldIntraday]);
+  }, [
+    tabActive,
+    marketScope,
+    useEtfChart,
+    selectedGoldItem?.symbol,
+    selectedGoldItem?.market,
+    loadGoldIntraday,
+  ]);
+
+  // 场内基金分时（场外无实时）
+  useEffect(() => {
+    if (!tabActive || marketScope !== "fund" || isOtcFund) {
+      if (marketScope !== "fund") setFundIntraday(null);
+      return;
+    }
+    const symbol = selectedFundItem?.symbol;
+    const market = selectedFundItem?.market;
+    if (!symbol || !market) {
+      setFundIntraday(null);
+      return;
+    }
+    const key = PrefetchKeys.symbolIntraday(market, symbol);
+    const cached = cachePeek<IntradaySeries>(key);
+    if (cached?.points?.length) setFundIntraday(cached);
+    else setFundIntraday(null);
+
+    let cancelled = false;
+    const load = () =>
+      cacheSWR(
+        key,
+        () => api.getSymbolIntraday(symbol, market),
+        PrefetchTtl.symbolIntraday,
+        (series) => {
+          if (cancelled) return;
+          setFundIntraday(series.points?.length ? series : null);
+        },
+      ).catch(() => {
+        if (!cancelled) setFundIntraday(null);
+      });
+    void load();
+    if (fundSparkMode !== "intraday") {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const timer = setInterval(() => void load(), INTRADAY_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [
+    tabActive,
+    marketScope,
+    isOtcFund,
+    fundSparkMode,
+    selectedFundItem?.symbol,
+    selectedFundItem?.market,
+  ]);
+
+  // 基金日走势：场外日净值；场内日 K（切换日K 时用）
+  useEffect(() => {
+    if (!tabActive || marketScope !== "fund") {
+      if (marketScope !== "fund") setFundNavSeries(null);
+      return;
+    }
+    const code = selectedFundItem?.symbol;
+    const market = selectedFundItem?.market || "OF";
+    if (!code) {
+      setFundNavSeries(null);
+      return;
+    }
+    const cacheKey = PrefetchKeys.fundNav(market, code);
+    const cached = cachePeek<FundNavHistory>(cacheKey);
+    if (cached) {
+      setFundNavSeries(fundNavToSeries(cached, selectedFundItem!));
+    } else {
+      setFundNavSeries(null);
+    }
+
+    let cancelled = false;
+    void cacheSWR(
+      cacheKey,
+      () => api.getFundNavHistory(code, 30, market),
+      PrefetchTtl.fundNav,
+      (hist) => {
+        if (cancelled) return;
+        setFundNavSeries(
+          fundNavToSeries(hist, {
+            symbol: code,
+            name: selectedFundItem?.name || code,
+            market,
+          }),
+        );
+      },
+    ).catch(() => {
+      if (!cancelled && !cached) setFundNavSeries(null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    tabActive,
+    marketScope,
+    selectedFundItem?.kind,
+    selectedFundItem?.symbol,
+    selectedFundItem?.market,
+    selectedFundItem?.name,
+  ]);
 
   useEffect(() => {
     const q = searchQuery.trim();
     if (!q) {
       searchSeq.current += 1;
       setSearchHits(null);
+      setFundSearchHits(null);
       setSearchLoading(false);
       return;
     }
     const seq = ++searchSeq.current;
     setSearchLoading(true);
     const timer = setTimeout(() => {
+      if (marketScope === "fund") {
+        void api
+          .searchFunds(q, 20)
+          .then((res) => {
+            if (seq !== searchSeq.current) return;
+            setFundSearchHits(res.items);
+            setSearchHits(null);
+          })
+          .catch(() => {
+            if (seq !== searchSeq.current) return;
+            setFundSearchHits([]);
+          })
+          .finally(() => {
+            if (seq !== searchSeq.current) return;
+            setSearchLoading(false);
+          });
+        return;
+      }
       void api
         .searchSymbols(q)
         .then((res) => {
           if (seq !== searchSeq.current) return;
           setSearchHits(res.items);
+          setFundSearchHits(null);
         })
         .catch(() => {
           if (seq !== searchSeq.current) return;
@@ -635,69 +1126,71 @@ export default function MarketScreen() {
         });
     }, SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [searchQuery]);
+  }, [searchQuery, marketScope]);
+
+  // 股票榜 / 搜索选中个股 → 顶部英雄区切分时
+  useEffect(() => {
+    if (!tabActive || marketScope !== "stock" || !activeLeader) {
+      if (marketScope !== "stock") setLeaderIntraday(null);
+      return;
+    }
+    const { symbol, market } = activeLeader;
+    let cancelled = false;
+    const load = () =>
+      api
+        .getSymbolIntraday(symbol, market)
+        .then((series) => {
+          if (cancelled) return;
+          setLeaderIntraday(series.points?.length ? series : null);
+        })
+        .catch(() => {
+          if (!cancelled) setLeaderIntraday(null);
+        });
+    void load();
+    const timer = setInterval(() => void load(), INTRADAY_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [
+    tabActive,
+    marketScope,
+    activeLeader?.symbol,
+    activeLeader?.market,
+    selectedLeaderKey,
+  ]);
 
   useEffect(() => {
     if (!detail) {
-      setDetailIntra(null);
-      setDetailChart("idle");
       return;
     }
-    setDetailIntra(null);
     setCost(String(detail.price || ""));
-    setShares(detail.market === "JD" ? "10" : "1000");
+    // 场外/积存金按金额；股票·ETF 按数量（股/份）；默认金额 1000 元 / 数量 100（1 手）
+    setShares(
+      detail.market === "JD" || detail.market === "OF"
+        ? "1000"
+        : "100",
+    );
     setBoughtAt(shanghaiTodayIso());
-    if (!canAddHolding(detail.market)) {
-      setDetailChart("idle");
-      return;
-    }
-    if (detail.market === "JD") {
-      const item =
-        goldBoard?.sections
-          .flatMap((s) => s.items)
-          .find((i) => i.symbol === detail.symbol || i.id === detail.symbol) ?? null;
-      const sess = goldSparkSession(item);
-      const pts = chartToPoints(item?.chart, sess, item?.chart_slots, item?.chart_times);
-      if (pts.length >= 2) {
-        setDetailIntra({
-          key: detail.symbol,
-          symbol: detail.symbol,
-          name: detail.name,
-          market: "JD",
-          prev_close: item?.prev ?? null,
-          session: sess,
-          points: pts,
-        });
-        setDetailChart("ready");
-      } else {
-        setDetailIntra(null);
-        setDetailChart("empty");
+  }, [detail]);
+
+  function clearStockSelection() {
+    setSelectedLeaderKey("");
+    setSelectedLeader(null);
+    setLeaderIntraday(null);
+  }
+
+  function selectIndex(key: string) {
+    if (key === selectedKey) {
+      if (selectedLeaderKey) {
+        haptics.tap();
+        clearStockSelection();
       }
       return;
     }
-    setDetailChart("loading");
-    void api
-      .getSymbolIntraday(detail.symbol, detail.market)
-      .then((series) => {
-        if (series.points.length >= 2) {
-          setDetailIntra(series);
-          setDetailChart("ready");
-        } else {
-          setDetailIntra(null);
-          setDetailChart("empty");
-        }
-      })
-      .catch(() => {
-        setDetailIntra(null);
-        setDetailChart("empty");
-      });
-  }, [detail, goldBoard]);
-
-  function selectIndex(key: string) {
-    if (key === selectedKey) return;
     haptics.tap();
     setSelectedKey(key);
-    setSelectedLeaderKey("");
+    clearStockSelection();
     // Keep board tab sticky — only refresh quote/chart/list for the new index.
     setIntraday(cachePeek<IntradaySeries>(PrefetchKeys.intraday(key)));
     setLeaders(cachePeek<LeadersBoard>(PrefetchKeys.leaders(key, boardKind)));
@@ -713,9 +1206,14 @@ export default function MarketScreen() {
     if (scope === marketScope) return;
     haptics.tap();
     setMarketScope(scope);
-    setSelectedLeaderKey("");
+    clearStockSelection();
+    setFundSearchPick(null);
     setSearchQuery("");
     setSearchHits(null);
+    setFundSearchHits(null);
+    if (scope === "fund" || scope === "gold") {
+      scheduleWarmMarketScope(scope);
+    }
   }
 
   function selectGoldItem(id: string) {
@@ -730,34 +1228,62 @@ export default function MarketScreen() {
     setGoldSection(id);
     const sec = goldBoard?.sections.find((s) => s.id === id);
     setSelectedGoldId(sec?.items[0]?.id || "");
+    if (goldBoard) void warmGoldHero(goldBoard, id).catch(() => {});
+  }
+
+  function selectFundSection(id: FundSectionId) {
+    if (id === fundSection) return;
+    haptics.tap();
+    setFundSearchPick(null);
+    setFundSection(id);
+    const sec = fundBoard?.sections.find((s) => s.id === id);
+    if (id === "sector" && sec?.groups?.length) {
+      const g = sec.groups[0];
+      setFundIndustryId(g.id);
+      setSelectedFundId(g.items[0]?.id || "");
+      return;
+    }
+    setFundIndustryId("");
+    setSelectedFundId(sec?.items[0]?.id || "");
+  }
+
+  function selectFundIndustry(id: string) {
+    if (!id || id === fundIndustryId) return;
+    haptics.tap();
+    setFundSearchPick(null);
+    setFundIndustryId(id);
+    const g = fundSectionData?.groups?.find((x) => x.id === id);
+    setSelectedFundId(g?.items[0]?.id || "");
+  }
+
+  function selectFundItem(id: string) {
+    if (!id || id === selectedFundId) return;
+    haptics.tap();
+    setFundSearchPick(null);
+    setSelectedFundId(id);
   }
 
   useEffect(() => {
     if (marketScope !== "gold" || !goldBoard) return;
-    const sec = goldBoard.sections.find((s) => s.id === goldSection) ?? goldBoard.sections[0];
-    const keys = [
-      ...new Set(
-        (sec?.items ?? [])
-          .map((it) => goldBiasKey(it))
-          .filter((k): k is string => Boolean(k)),
-      ),
-    ];
+    const keys = goldSectionBiasKeys(goldBoard, goldSection);
     if (keys.length === 0) {
       setGoldBiasByKey({});
       return;
     }
+    const cacheKey = PrefetchKeys.shortBias(keys);
+    const cached = cachePeek<ShortBiasBatch>(cacheKey);
+    if (cached) setGoldBiasByKey(shortBiasMap(cached));
+
     let cancelled = false;
-    void api
-      .getShortBias(keys)
-      .then((batch) => {
+    void cacheSWR(
+      cacheKey,
+      () => api.getShortBias(keys),
+      PrefetchTtl.shortBias,
+      (batch) => {
         if (cancelled) return;
-        const next: Record<string, ShortBias> = {};
-        for (const item of batch.items) {
-          next[`${item.market}:${item.symbol}`] = item;
-        }
-        setGoldBiasByKey(next);
-      })
-      .catch(() => {});
+        setGoldBiasByKey(shortBiasMap(batch));
+      },
+    ).catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -767,7 +1293,7 @@ export default function MarketScreen() {
     if (kind === boardKind) return;
     haptics.tap();
     setBoardKind(kind);
-    setSelectedLeaderKey("");
+    clearStockSelection();
   }
 
   function selectLeaderRow(row: LeaderStock) {
@@ -778,12 +1304,15 @@ export default function MarketScreen() {
     }
     haptics.tap();
     setSelectedLeaderKey(key);
+    setSelectedLeader(row);
+    setLeaderIntraday(null);
   }
 
   function clearSearch() {
     haptics.tap();
     setSearchQuery("");
     setSearchHits(null);
+    setFundSearchHits(null);
   }
 
   function openDetail(row: LeaderStock) {
@@ -792,14 +1321,54 @@ export default function MarketScreen() {
   }
 
   function openSearchHit(hit: SearchHit) {
-    openDetail(hitToLeader(hit));
+    selectLeaderRow(hitToLeader(hit));
+  }
+
+  function pickFundSearchHit(hit: FundSearchHit) {
+    const item = fundSearchHitToItem(hit);
+    if (item.id === selectedFundId && fundSearchPick?.id === item.id) {
+      const leader = fundBoardToLeader(item);
+      if (leader) openDetail(leader);
+      return;
+    }
+    haptics.tap();
+    setSelectedFundId(item.id);
+    setFundSearchPick(item);
   }
 
   async function onAddHolding(e: FormEvent) {
     e.preventDefault();
     if (!detail) return;
-    if (!canAddHolding(detail.market)) {
-      toast("持仓仅支持沪深 A 股 / ETF / 积存金", "warning");
+    if (!canAddHolding(detail.market, detail.kind, detail.note)) {
+      toast(
+        detail.kind === "ipo" || (detail.note || "").includes("待上市")
+          ? "新股尚未上市，不能加入仓库"
+          : "持仓仅支持沪深 A 股 / ETF / 场外基金 / 积存金",
+        "warning",
+      );
+      return;
+    }
+    const navOrCost = Number(cost);
+    let qty = Number(shares);
+    let unitCost = navOrCost;
+    if (detail.market === "OF") {
+      const converted = otcSharesFromAmount(Number(shares), navOrCost);
+      if (converted == null) {
+        toast("请输入有效金额和确认净值", "warning");
+        return;
+      }
+      qty = converted;
+      unitCost = navOrCost;
+    } else if (detail.market === "JD") {
+      const converted = goldGramsFromAmount(Number(shares), navOrCost);
+      if (converted == null) {
+        toast("请输入有效金额和买入金价", "warning");
+        return;
+      }
+      qty = converted;
+      unitCost = navOrCost;
+    } else if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(unitCost) || unitCost <= 0) {
+      toast("请输入有效数量和成交价", "warning");
       return;
     }
     setSaving(true);
@@ -807,9 +1376,9 @@ export default function MarketScreen() {
       await api.createHolding({
         symbol: detail.symbol,
         name: detail.name,
-        market: detail.market as "SH" | "SZ" | "JD",
-        shares: Number(shares),
-        cost: Number(cost),
+        market: detail.market as "SH" | "SZ" | "JD" | "OF",
+        shares: qty,
+        cost: unitCost,
         bought_at: boughtAt.trim() || shanghaiTodayIso(),
       });
       toast("已加入仓库", "success");
@@ -824,11 +1393,13 @@ export default function MarketScreen() {
 
   return (
     <div className="market-page">
+      <OfflineBanner />
       <div className="market-page-pin">
         <div className="market-scope-tabs" role="tablist" aria-label="市场范围">
           {(
             [
               { id: "stock" as const, label: "股票", Icon: CandlestickChart },
+              { id: "fund" as const, label: "基金", Icon: Landmark },
               { id: "gold" as const, label: "黄金", Icon: CircleDollarSign },
             ] as const
           ).map((tab) => {
@@ -842,6 +1413,11 @@ export default function MarketScreen() {
                 className="market-scope-tab"
                 data-active={marketScope === tab.id ? "1" : "0"}
                 data-scope={tab.id}
+                onPointerDown={() => {
+                  if (tab.id === "fund" || tab.id === "gold") {
+                    scheduleWarmMarketScope(tab.id);
+                  }
+                }}
                 onClick={() => selectScope(tab.id)}
               >
                 <Icon
@@ -861,14 +1437,22 @@ export default function MarketScreen() {
           className="market-index-hero"
           data-tone={heroTone}
           data-live={kicker.live ? "1" : "0"}
-          aria-label={marketScope === "gold" ? "黄金走势" : "市场指数"}
+          aria-label={
+            marketScope === "gold"
+              ? "黄金走势"
+              : marketScope === "fund"
+                ? "基金走势"
+                : activeLeader
+                  ? `${activeLeader.name}走势`
+                  : "市场指数"
+          }
         >
           <div className="market-index-head">
             <div className="market-index-head-main">
               <div className="market-index-head-row">
                 <div className="market-index-head-name">{heroQuote.name}</div>
                 <div className="market-index-head-kicker" data-live={kicker.live ? "1" : "0"}>
-                  {kicker.live && <span className="market-live-dot" aria-hidden />}
+                  <span className="market-live-dot" aria-hidden />
                   {kicker.text}
                 </div>
               </div>
@@ -897,19 +1481,66 @@ export default function MarketScreen() {
           </div>
 
           <div className="market-spark-wrap">
+            {marketScope === "fund" ? (
+              <div className="market-fund-chart-seg" role="tablist" aria-label="走势周期">
+                {(
+                  [
+                    { id: "intraday" as const, label: "分时" },
+                    { id: "daily" as const, label: "日K" },
+                  ] as const
+                ).map((tab) => {
+                  const lockedDaily = isOtcFund;
+                  const active = (lockedDaily ? "daily" : fundChartMode) === tab.id;
+                  const disabled = lockedDaily && tab.id === "intraday";
+                  return (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      role="tab"
+                      aria-selected={active}
+                      aria-disabled={disabled ? "true" : undefined}
+                      disabled={disabled}
+                      title={disabled ? "场外基金仅日净值" : undefined}
+                      className="market-fund-chart-seg-tab"
+                      data-active={active ? "1" : "0"}
+                      onClick={() => {
+                        if (disabled || fundChartMode === tab.id) return;
+                        haptics.tap();
+                        setFundChartMode(tab.id);
+                      }}
+                    >
+                      {tab.label}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
             <IndexSparkline
               points={activeIntraday?.points ?? []}
               prevClose={activeIntraday?.prev_close ?? heroQuote.prev_close}
               changePct={heroQuote.change_pct}
+              fillWidth={marketScope === "fund"}
               session={
-                marketScope === "gold"
-                  ? useEtfChart
-                    ? (activeIntraday?.session ?? "cn")
-                    : goldSparkSess
-                  : activeIntraday?.session ??
-                    (heroQuote.market === "US" ? "us" : heroQuote.market === "HK" ? "hk" : "cn")
+                marketScope === "fund"
+                  ? fundSparkMode === "daily"
+                    ? "daily"
+                    : (activeIntraday?.session ?? "cn")
+                  : marketScope === "gold"
+                    ? useEtfChart
+                      ? (activeIntraday?.session ?? "cn")
+                      : goldSparkSess
+                    : activeIntraday?.session ??
+                      (heroQuote.market === "US" ? "us" : heroQuote.market === "HK" ? "hk" : "cn")
               }
-              label={`${heroQuote.name}分时走势`}
+              label={
+                marketScope === "fund"
+                  ? fundSparkMode === "daily"
+                    ? isOtcFund
+                      ? `${heroQuote.name}日净值走势`
+                      : `${heroQuote.name}近30日走势`
+                    : `${heroQuote.name}分时走势`
+                  : `${heroQuote.name}分时走势`
+              }
               interactive
             />
           </div>
@@ -957,6 +1588,30 @@ export default function MarketScreen() {
                 );
               })}
             </div>
+          ) : marketScope === "fund" ? (
+            <div
+              className="market-index-grid market-gold-grid market-fund-grid"
+              role="tablist"
+              aria-label="基金分类"
+            >
+              {FUND_SECTION_TABS.map((tab) => {
+                const active = fundSection === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={active}
+                    className="market-index-tile market-index-tile--label"
+                    data-active={active ? "1" : "0"}
+                    data-tone="fund"
+                    onClick={() => selectFundSection(tab.id)}
+                  >
+                    <span className="market-index-tile-name">{tab.short}</span>
+                  </button>
+                );
+              })}
+            </div>
           ) : (
             <div className="market-index-grid market-gold-grid" role="tablist" aria-label="金价分类">
               {(
@@ -969,7 +1624,11 @@ export default function MarketScreen() {
                 const sec = goldBoard?.sections.find((s) => s.id === tab.id);
                 const top = sec?.items[0];
                 const active = goldSection === tab.id;
-                const pctTone = pnlTone(top?.change_pct, top?.price ?? undefined, top?.prev ?? undefined);
+                const pctTone = pnlTone(
+                  top?.change_pct,
+                  top?.price ?? undefined,
+                  top?.prev ?? undefined,
+                );
                 return (
                   <button
                     key={tab.id}
@@ -992,7 +1651,7 @@ export default function MarketScreen() {
           )}
         </section>
 
-        {marketScope === "stock" && (
+        {(marketScope === "stock" || marketScope === "fund") && (
           <label className="market-search" data-active={searching ? "1" : "0"}>
             <Search size={15} strokeWidth={2.25} absoluteStrokeWidth aria-hidden />
             <input
@@ -1004,10 +1663,14 @@ export default function MarketScreen() {
               autoCapitalize="off"
               autoCorrect="off"
               spellCheck={false}
-              placeholder="代码或名称，如 510300 / 茅台"
+              placeholder={
+                marketScope === "fund"
+                  ? "基金代码或名称，如 510300 / 白酒"
+                  : "代码或名称，如 510300 / 茅台"
+              }
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              aria-label="搜索股票或 ETF"
+              aria-label={marketScope === "fund" ? "搜索基金" : "搜索股票或 ETF"}
             />
             {searching && (
               <button
@@ -1056,7 +1719,9 @@ export default function MarketScreen() {
             ? "搜索结果"
             : marketScope === "gold"
               ? goldSectionData?.title || "黄金"
-              : (leaders?.title ?? "榜单")
+              : marketScope === "fund"
+                ? fundIndustryGroup?.title || fundSectionData?.title || "基金"
+                : (leaders?.title ?? "榜单")
         }
       >
         <div className="inset-group-header market-leaders-head">
@@ -1065,24 +1730,128 @@ export default function MarketScreen() {
               ? "搜索结果"
               : marketScope === "gold"
                 ? goldSectionData?.title || "黄金"
-                : (leaders?.title ?? BOARD_TABS.find((t) => t.kind === boardKind)?.label)}
+                : marketScope === "fund"
+                  ? fundIndustryGroup?.title || fundSectionData?.title || "基金"
+                  : (leaders?.title ?? BOARD_TABS.find((t) => t.kind === boardKind)?.label)}
           </span>
           <span>
             {searching
-              ? `${searchHits?.length ?? 0} 条`
+              ? `${
+                  marketScope === "fund"
+                    ? (fundSearchHits?.length ?? 0)
+                    : (searchHits?.length ?? 0)
+                } 条`
               : marketScope === "gold"
                 ? `${goldSectionData?.items.length ?? 0} 只`
-                : `${leaders?.items.length ?? 0} 只`}
+                : marketScope === "fund"
+                  ? `${fundListItems.length} 只`
+                  : `${leaders?.items.length ?? 0} 只`}
           </span>
         </div>
-        <div className="market-leaders-body">
+        {marketScope === "fund" &&
+          fundSection === "sector" &&
+          !searching &&
+          fundIndustryGroups.length > 0 && (
+            <div className="market-fund-boards-wrap">
+              <div className="news-boards" role="tablist" aria-label="行业板块">
+                {fundIndustryGroups.map((g) => (
+                  <button
+                    key={g.id}
+                    type="button"
+                    role="tab"
+                    aria-selected={
+                      (fundIndustryGroup?.id || fundIndustryGroups[0]?.id) === g.id
+                    }
+                    className="news-board-chip"
+                    data-active={
+                      (fundIndustryGroup?.id || fundIndustryGroups[0]?.id) === g.id
+                        ? "1"
+                        : "0"
+                    }
+                    onClick={() => selectFundIndustry(g.id)}
+                  >
+                    {g.title}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        <div
+          className="market-leaders-body"
+          ref={leadersBodyRef}
+          data-ptr={ptrRefreshing ? "1" : "0"}
+        >
+          <div
+            ref={ptrBarRef}
+            className="news-ptr"
+            data-ready={ptrReady ? "1" : "0"}
+            data-refreshing={ptrRefreshing ? "1" : "0"}
+            aria-hidden
+          >
+            <div className="news-ptr-inner">
+              <RefreshCw
+                className="news-ptr-icon"
+                size={14}
+                strokeWidth={2.2}
+                absoluteStrokeWidth
+              />
+              <span className="news-ptr-label">
+                {ptrRefreshing ? "刷新中" : ptrReady ? "松开刷新" : "下拉刷新"}
+              </span>
+            </div>
+          </div>
           {error && !searching && marketScope === "stock" && (
             <p className="text-up" style={{ fontSize: 13, padding: "12px 16px" }}>
               {error}
             </p>
           )}
           {searching ? (
-            searchLoading && searchHits == null ? (
+            marketScope === "fund" ? (
+              searchLoading && fundSearchHits == null ? (
+                <div className="market-leaders-skel" aria-hidden>
+                  {Array.from({ length: 6 }).map((_, i) => (
+                    <div key={i} className="market-skel-row" />
+                  ))}
+                </div>
+              ) : !fundSearchHits || fundSearchHits.length === 0 ? (
+                <div style={{ padding: "8px 4px 16px" }}>
+                  <EmptyState title="未找到基金" hint="试试代码或简称，如 510300 / 白酒 / 沪深300" />
+                </div>
+              ) : (
+                fundSearchHits.map((hit) => (
+                  <MarketRow
+                    key={`${hit.market}-${hit.symbol}`}
+                    active={
+                      !!(
+                        fundSearchPick &&
+                        fundSearchPick.symbol === hit.symbol &&
+                        fundSearchPick.market === (hit.kind === "otc" ? "OF" : hit.market)
+                      )
+                    }
+                    onClick={() => pickFundSearchHit(hit)}
+                    leading={
+                      <span className="market-search-kind">
+                        {hit.kind === "etf" ? "场内" : "场外"}
+                      </span>
+                    }
+                    name={hit.name}
+                    meta={
+                      (hit.kind === "etf"
+                        ? `${hit.market}${hit.symbol}`
+                        : hit.as_of
+                          ? `${hit.symbol} · ${hit.as_of.slice(5)}`
+                          : hit.symbol) + (hit.fund_type ? ` · ${hit.fund_type}` : "")
+                    }
+                    price={formatMoney(hit.price)}
+                    badge={
+                      <span className={`market-row-badge ${pnlClass(hit.change_pct)}`}>
+                        {formatPct(hit.change_pct)}
+                      </span>
+                    }
+                  />
+                ))
+              )
+            ) : searchLoading && searchHits == null ? (
               <div className="market-leaders-skel" aria-hidden>
                 {Array.from({ length: 6 }).map((_, i) => (
                   <div key={i} className="market-skel-row" />
@@ -1094,30 +1863,85 @@ export default function MarketScreen() {
               </div>
             ) : (
               searchHits.map((hit) => {
-                const viewOnly = !canAddHolding(hit.market);
+                const viewOnly = !canAddHolding(hit.market, hit.kind, hit.note);
+                const rowKey = `${hit.market}-${hit.symbol}`;
                 return (
-                  <button
-                    key={`${hit.market}-${hit.symbol}`}
-                    type="button"
-                    className="holding-row market-leader-row"
+                  <MarketRow
+                    key={rowKey}
+                    active={rowKey === selectedLeaderKey}
                     onClick={() => openSearchHit(hit)}
-                  >
-                    <span className="market-search-kind">{KIND_LABEL[hit.kind] ?? "标的"}</span>
-                    <div className="market-leader-main">
-                      <div className="holding-name">{hit.name}</div>
-                      <div className="holding-meta market-leader-code">
-                        {hit.market}
-                        {hit.symbol}
-                        {viewOnly ? " · 仅查阅" : ""}
-                      </div>
-                    </div>
-                    <div className="holding-right market-leader-right">
-                      <div className="market-leader-price">{formatMoney(hit.price)}</div>
-                      <div className={`market-leader-badge market-leader-badge-solid ${pnlClass(hit.change_pct)}`}>
-                        {formatPct(hit.change_pct)}
-                      </div>
-                    </div>
-                  </button>
+                    leading={
+                      <span className="market-search-kind">
+                        {KIND_LABEL[hit.kind] ?? "标的"}
+                      </span>
+                    }
+                    name={hit.name}
+                    meta={`${hit.market}${hit.symbol}${hit.note ? ` · ${hit.note}` : ""}${viewOnly ? " · 仅查阅" : ""}`}
+                    price={hit.note && (hit.price == null || hit.change_pct == null) ? (hit.price != null ? formatMoney(hit.price) : "—") : formatMoney(hit.price)}
+                    badge={
+                      <span className={`market-row-badge ${hit.note ? "text-mute" : pnlClass(hit.change_pct)}`}>
+                        {hit.note ? "待上市" : formatPct(hit.change_pct)}
+                      </span>
+                    }
+                  />
+                );
+              })
+            )
+          ) : marketScope === "fund" ? (
+            !fundListItems.length ? (
+              fundBoard ? (
+                <div style={{ padding: "8px 4px 16px" }}>
+                  <EmptyState title="暂无标的" hint="换个板块看看" />
+                </div>
+              ) : (
+                <div className="market-leaders-skel" aria-label="加载中">
+                  {Array.from({ length: 5 }).map((_, i) => (
+                    <div key={i} className="market-skel-row" />
+                  ))}
+                </div>
+              )
+            ) : (
+              fundListItems.map((row, i) => {
+                const leader = goldBoardToLeader(row);
+                return (
+                  <MarketRow
+                    key={row.id}
+                    active={row.id === selectedFundId || row.id === selectedFundItem?.id}
+                    onClick={() => {
+                      if (row.id === selectedFundId) {
+                        if (leader) openDetail(leader);
+                        return;
+                      }
+                      selectFundItem(row.id);
+                    }}
+                    leading={
+                      <span
+                        className="market-leader-rank"
+                        data-top={i < 3 ? String(i + 1) : "0"}
+                        aria-label={`第 ${i + 1} 名`}
+                      >
+                        {i + 1}
+                      </span>
+                    }
+                    name={row.name}
+                    meta={
+                      row.kind === "otc"
+                        ? row.freshness
+                          ? `${row.symbol} · ${String(row.freshness).slice(5)}`
+                          : row.symbol
+                        : row.note || `${row.market || ""}${row.symbol || ""}`
+                    }
+                    price={formatMoney(row.price)}
+                    badge={
+                      <span
+                        className={`market-row-badge ${
+                          row.change_pct != null ? pnlClass(row.change_pct) : "text-mute"
+                        }`}
+                      >
+                        {row.change_pct != null ? formatPct(row.change_pct) : "—"}
+                      </span>
+                    }
+                  />
                 );
               })
             )
@@ -1131,12 +1955,18 @@ export default function MarketScreen() {
             ) : (
               goldSectionData.items.map((row, i) => {
                 const leader = goldBoardToLeader(row);
+                const m = (row.market || "").toUpperCase();
+                const key = goldBiasKey(row);
+                const bias = key ? goldBiasByKey[key] : null;
+                const showBias =
+                  m !== "SH" &&
+                  m !== "SZ" &&
+                  bias &&
+                  !(bias.bias === "na" && !bias.label.includes("陈旧"));
                 return (
-                  <button
+                  <MarketRow
                     key={row.id}
-                    type="button"
-                    className="holding-row market-leader-row"
-                    data-active={row.id === selectedGoldId || row.id === selectedGoldItem?.id ? "1" : "0"}
+                    active={row.id === selectedGoldId || row.id === selectedGoldItem?.id}
                     onClick={() => {
                       if (row.id === selectedGoldId) {
                         if (leader) openDetail(leader);
@@ -1144,50 +1974,36 @@ export default function MarketScreen() {
                       }
                       selectGoldItem(row.id);
                     }}
-                  >
-                    <span
-                      className="market-leader-rank"
-                      data-top={i < 3 ? String(i + 1) : "0"}
-                      aria-label={`第 ${i + 1} 名`}
-                    >
-                      {i + 1}
-                    </span>
-                    <div className="market-leader-main">
-                      <div className="holding-name market-gold-name">
-                        <span className="market-gold-name-text">{row.name}</span>
-                        {(() => {
-                          const key = goldBiasKey(row);
-                          const bias = key ? goldBiasByKey[key] : null;
-                          if (!bias) return null;
-                          if (
-                            bias.bias === "na" &&
-                            !bias.label.includes("陈旧")
-                          ) {
-                            return null;
-                          }
-                          return (
-                            <span
-                              className={biasChipClass(bias, bias.market, bias.symbol)}
-                              title={biasChipTitle(bias, bias.market, bias.symbol)}
-                            >
-                              {biasChipText(bias, bias.market, bias.symbol)}
-                            </span>
-                          );
-                        })()}
-                      </div>
-                      <div className="holding-meta market-leader-code">
-                        {row.note && goldSection === "shop"
-                          ? `${row.note}${row.freshness ? ` · ${row.freshness}` : ""}`
-                          : row.freshness || row.unit || ""}
-                      </div>
-                    </div>
-                    <div className="holding-right market-leader-right">
-                      <div className="market-leader-price">
-                        {formatGoldPrice(row.price, row.unit)}
-                      </div>
-                      <div
-                        className={`market-leader-badge market-leader-badge-solid ${
-                          row.change_pct != null ? pnlClass(row.change_pct) : ""
+                    leading={
+                      <span
+                        className="market-leader-rank"
+                        data-top={i < 3 ? String(i + 1) : "0"}
+                        aria-label={`第 ${i + 1} 名`}
+                      >
+                        {i + 1}
+                      </span>
+                    }
+                    name={row.name}
+                    meta={
+                      row.note && goldSection === "shop"
+                        ? `${row.note}${row.freshness ? ` · ${row.freshness}` : ""}`
+                        : row.freshness || row.unit || ""
+                    }
+                    mid={
+                      showBias && bias ? (
+                        <BiasMid
+                          className="market-row-bias"
+                          bias={bias}
+                          market={bias.market}
+                          symbol={bias.symbol}
+                        />
+                      ) : null
+                    }
+                    price={formatGoldPrice(row.price, row.unit)}
+                    badge={
+                      <span
+                        className={`market-row-badge ${
+                          row.change_pct != null ? pnlClass(row.change_pct) : "text-mute"
                         }`}
                       >
                         {row.change_pct != null
@@ -1195,9 +2011,9 @@ export default function MarketScreen() {
                           : goldSection === "shop"
                             ? "零售"
                             : "—"}
-                      </div>
-                    </div>
-                  </button>
+                      </span>
+                    }
+                  />
                 );
               })
             )
@@ -1214,53 +2030,48 @@ export default function MarketScreen() {
           ) : (
             leaders.items.map((row, i) => {
               const rowKey = `${row.market}-${row.symbol}`;
-              return (
-              <button
-                key={rowKey}
-                type="button"
-                className="holding-row market-leader-row"
-                data-active={rowKey === selectedLeaderKey ? "1" : "0"}
-                onClick={() => selectLeaderRow(row)}
-              >
-                <span
-                  className="market-leader-rank"
-                  data-top={i < 3 ? String(i + 1) : "0"}
-                  aria-label={`第 ${i + 1} 名`}
-                >
-                  {i + 1}
+              const pctBadge = (
+                <span className={`market-row-badge ${pnlClass(row.change_pct)}`}>
+                  {formatPct(row.change_pct)}
                 </span>
-                <div className="market-leader-main">
-                  <div className="holding-name">{row.name}</div>
-                  <div className="holding-meta market-leader-code">
-                    {row.market}
-                    {row.symbol}
-                  </div>
-                </div>
-                <div className="holding-right market-leader-right">
-                  <div className="market-leader-price">{formatMoney(row.price)}</div>
-                  {boardKind === "amount" ? (
-                    <div className="market-leader-metrics">
-                      <span className="market-leader-metric-mute">{formatAmount(row.amount)}</span>
-                      <span className={`market-leader-badge market-leader-badge-solid ${pnlClass(row.change_pct)}`}>
-                        {formatPct(row.change_pct)}
-                      </span>
-                    </div>
-                  ) : boardKind === "turnover" ? (
-                    <div className="market-leader-metrics">
-                      <span className="market-leader-metric-mute">
-                        {row.turnover != null ? `${row.turnover.toFixed(2)}%` : "--"}
-                      </span>
-                      <span className={`market-leader-badge market-leader-badge-solid ${pnlClass(row.change_pct)}`}>
-                        {formatPct(row.change_pct)}
-                      </span>
-                    </div>
-                  ) : (
-                    <div className={`market-leader-badge market-leader-badge-solid ${pnlClass(row.change_pct)}`}>
-                      {formatPct(row.change_pct)}
-                    </div>
-                  )}
-                </div>
-              </button>
+              );
+              return (
+                <MarketRow
+                  key={rowKey}
+                  active={rowKey === selectedLeaderKey}
+                  onClick={() => selectLeaderRow(row)}
+                  leading={
+                    <span
+                      className="market-leader-rank"
+                      data-top={i < 3 ? String(i + 1) : "0"}
+                      aria-label={`第 ${i + 1} 名`}
+                    >
+                      {i + 1}
+                    </span>
+                  }
+                  name={row.name}
+                  meta={`${row.market}${row.symbol}`}
+                  price={formatMoney(row.price)}
+                  badge={
+                    boardKind === "amount" ? (
+                      <div className="market-leader-metrics">
+                        <span className="market-leader-metric-mute">
+                          {formatAmount(row.amount)}
+                        </span>
+                        {pctBadge}
+                      </div>
+                    ) : boardKind === "turnover" ? (
+                      <div className="market-leader-metrics">
+                        <span className="market-leader-metric-mute">
+                          {row.turnover != null ? `${row.turnover.toFixed(2)}%` : "--"}
+                        </span>
+                        {pctBadge}
+                      </div>
+                    ) : (
+                      pctBadge
+                    )
+                  }
+                />
               );
             })
           )}
@@ -1272,7 +2083,7 @@ export default function MarketScreen() {
         title={detail?.name ?? "详情"}
         onClose={() => setDetail(null)}
         footer={
-          detail && canAddHolding(detail.market) ? (
+          detail && canAddHolding(detail.market, detail.kind, detail.note) ? (
             <button
               className="btn btn-block btn-modal-primary"
               type="submit"
@@ -1283,7 +2094,9 @@ export default function MarketScreen() {
             </button>
           ) : (
             <button className="btn btn-block btn-modal-muted" type="button" disabled>
-              仅沪深与积存金可入仓 · 外盘只查阅
+              {detail?.kind === "ipo" || (detail?.note || "").includes("待上市")
+                ? "新股待上市 · 不可入仓"
+                : "仅查阅 · 不可入仓"}
             </button>
           )
         }
@@ -1306,59 +2119,66 @@ export default function MarketScreen() {
               </div>
             </div>
 
-            <div className="market-detail-chart">
-              {!canAddHolding(detail.market) ? (
-                <p className="market-detail-hint">
-                  {detail.market === "HK"
-                    ? "港股仅查阅报价，分时与入仓未开放"
-                    : "外盘仅查阅报价，分时与入仓未开放"}
-                </p>
-              ) : detailChart === "ready" && detailIntra ? (
-                <IndexSparkline
-                  points={detailIntra.points}
-                  prevClose={detailIntra.prev_close}
-                  changePct={detail.change_pct}
-                  session={detailIntra.session ?? (detail.market === "JD" ? "day24" : "cn")}
-                  label={`${detail.name}分时`}
-                  interactive
-                  compact
-                />
-              ) : detailChart === "loading" ? (
-                <p className="market-detail-hint">分时加载中…</p>
-              ) : (
-                <p className="market-detail-hint">暂无分时数据，可稍后再试</p>
-              )}
-            </div>
-
-            {canAddHolding(detail.market) && (
+            {canAddHolding(detail.market, detail.kind, detail.note) && (
               <form id="market-add-holding" className="market-detail-form" onSubmit={onAddHolding}>
                 <p className="market-detail-form-title">加入仓库</p>
                 <label className="market-detail-field">
                   <span className="market-detail-label">
-                    {detail.market === "JD" ? "克数" : "份额"}
+                    {detail.market === "OF" || detail.market === "JD"
+                      ? "投入金额（元）"
+                      : "数量（股/份）"}
                   </span>
                   <input
                     value={shares}
                     onChange={(e) => setShares(e.target.value)}
                     inputMode="decimal"
-                    placeholder={detail.market === "JD" ? "例如 10" : "例如 1000"}
+                    placeholder={
+                      detail.market === "OF" || detail.market === "JD"
+                        ? "例如 1000"
+                        : "例如 100"
+                    }
                     required
                   />
                 </label>
                 <label className="market-detail-field">
                   <span className="market-detail-label">
-                    {detail.market === "JD" ? "成本（元/克）" : "成本价"}
+                    {detail.market === "JD"
+                      ? "买入金价（元/克）"
+                      : detail.market === "OF"
+                        ? "确认净值"
+                        : "成交价"}
                   </span>
                   <input
                     value={cost}
                     onChange={(e) => setCost(e.target.value)}
                     inputMode="decimal"
-                    placeholder="买入成本"
+                    placeholder={
+                      detail.market === "OF"
+                        ? "确认日净值"
+                        : detail.market === "JD"
+                          ? "买入金价"
+                          : "成交价"
+                    }
                     required
                   />
                 </label>
+                {(detail.market === "OF" || detail.market === "JD") &&
+                  (() => {
+                    const preview =
+                      detail.market === "OF"
+                        ? otcSharesFromAmount(Number(shares), Number(cost))
+                        : goldGramsFromAmount(Number(shares), Number(cost));
+                    return preview != null ? (
+                      <p className="market-detail-otc-preview">
+                        约 {preview}
+                        {detail.market === "OF" ? " 份" : " 克"}
+                      </p>
+                    ) : null;
+                  })()}
                 <label className="market-detail-field">
-                  <span className="market-detail-label">买入日</span>
+                  <span className="market-detail-label">
+                    {detail.market === "OF" ? "确认日" : "买入日"}
+                  </span>
                   <input
                     type="date"
                     value={boughtAt}

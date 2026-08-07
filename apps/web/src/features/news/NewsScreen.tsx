@@ -3,10 +3,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { CenterModal } from "@/components/overlay/CenterModal";
-import { Briefcase, ChevronRight, Globe, Inbox, Newspaper, Plus, RefreshCw, Sparkles, Warehouse, X } from "@/components/ui/icons";
+import { Briefcase, ChevronLeft, ChevronRight, Globe, Inbox, Newspaper, Plus, RefreshCw, Sparkles, Warehouse, X } from "@/components/ui/icons";
 import { api } from "@/lib/api";
 import { haptics } from "@/lib/haptics";
-import { cachePeek, cacheSet, PrefetchKeys } from "@/lib/prefetch";
+import { useTabActive } from "@/hooks/useTabActive";
+import { useShellStack } from "@/hooks/useShellStack";
+import { ShellBase, ShellLayer, ShellRoot } from "@/components/layout/ShellStack";
+import { OfflineBanner } from "@/components/layout/OfflineBanner";
+import { cachePeek, cacheSet, cacheSWR, PrefetchKeys, PrefetchTtl } from "@/lib/prefetch";
 import { usePullToRefresh } from "@/hooks/usePullToRefresh";
 import type {
   NewsArticle,
@@ -14,6 +18,7 @@ import type {
   NewsFeed,
   NewsInterest,
   NewsItem,
+  NewsMacroPulse,
   PortfolioSummary,
 } from "@/lib/types";
 
@@ -27,6 +32,9 @@ const TABS: { kind: NewsTab; label: string; Icon: typeof Globe }[] = [
 
 const FALLBACK_BOARDS: NewsBoard[] = [
   { id: "headline", label: "要闻" },
+  { id: "hkus", label: "港美" },
+  { id: "world", label: "国际" },
+  { id: "announce", label: "公告" },
   { id: "tech", label: "科技" },
   { id: "agri", label: "农业" },
   { id: "auto", label: "汽车" },
@@ -96,6 +104,10 @@ function cleanReaderBody(raw: string): string {
 }
 
 export default function NewsScreen() {
+  const tabActive = useTabActive("/news");
+  const { page: shellPage, overlayOpen, push, pop, popSoft } = useShellStack<"list" | "reader">({
+    root: "list",
+  });
   const [tab, setTab] = useState<NewsTab>("market");
   const [board, setBoard] = useState("headline");
   const [boards, setBoards] = useState<NewsBoard[]>(() => {
@@ -105,10 +117,13 @@ export default function NewsScreen() {
   /** Per-board feeds — list always follows selected chip, never leave previous board's rows */
   const [marketByBoard, setMarketByBoard] = useState<Record<string, NewsFeed>>(() => {
     const headline = cachePeek<NewsFeed>(PrefetchKeys.newsMarket("headline"));
-    return headline ? { headline } : {};
+    return headline ? { headline } : ({} as Record<string, NewsFeed>);
   });
   const [holdings, setHoldings] = useState<NewsFeed | null>(
     () => cachePeek<NewsFeed>(PrefetchKeys.newsHoldings),
+  );
+  const [macroPulse, setMacroPulse] = useState<NewsMacroPulse | null>(
+    () => cachePeek<NewsMacroPulse>(PrefetchKeys.newsMacroPulse),
   );
   const [interestsFeed, setInterestsFeed] = useState<NewsFeed | null>(null);
   const [interests, setInterests] = useState<NewsInterest[]>([]);
@@ -136,15 +151,44 @@ export default function NewsScreen() {
   const market = marketByBoard[board] ?? null;
 
   useEffect(() => {
-    void api
-      .getNewsBoards()
-      .then((res) => {
-        cacheSet(PrefetchKeys.newsBoards, res);
+    void cacheSWR(
+      PrefetchKeys.newsBoards,
+      () => api.getNewsBoards(),
+      PrefetchTtl.news,
+      (res) => {
         if (res.items?.length) setBoards(res.items);
-      })
-      .catch(() => {
-        /* keep fallback chips */
+      },
+    ).catch(() => {
+      /* keep fallback chips */
+    });
+  }, []);
+
+  const loadMacroPulse = useCallback(async (force = false) => {
+    const apply = (pulse: NewsMacroPulse) => {
+      cacheSet(PrefetchKeys.newsMacroPulse, pulse);
+      setMacroPulse(pulse);
+    };
+    try {
+      if (force) {
+        apply(await api.getNewsMacroPulse());
+        return;
+      }
+      await cacheSWR(
+        PrefetchKeys.newsMacroPulse,
+        () => api.getNewsMacroPulse(),
+        PrefetchTtl.news,
+        apply,
+      );
+    } catch {
+      apply({
+        as_of: "",
+        weekday: "",
+        session_hint: "",
+        calendar: "宏观速览暂不可用",
+        items: [],
+        note: "行情源暂时拉不到，下拉刷新重试",
       });
+    }
   }, []);
 
   const loadInterestsList = useCallback(async () => {
@@ -153,22 +197,51 @@ export default function NewsScreen() {
     return res.items ?? [];
   }, []);
 
-  const loadMarket = useCallback(async (boardId: string) => {
-    const feed = await api.getMarketNews(100, boardId);
-    cacheSet(PrefetchKeys.newsMarket(boardId), feed);
-    // Always store under boardId so a slow response can't paint under the wrong chip
-    setMarketByBoard((prev) => ({ ...prev, [boardId]: feed }));
+  const loadMarket = useCallback(async (boardId: string, force = false) => {
+    const apply = (feed: NewsFeed) => {
+      cacheSet(PrefetchKeys.newsMarket(boardId), feed);
+      setMarketByBoard((prev) => ({ ...prev, [boardId]: feed }));
+    };
+    if (force) {
+      apply(await api.getMarketNews(100, boardId));
+      return;
+    }
+    await cacheSWR(
+      PrefetchKeys.newsMarket(boardId),
+      () => api.getMarketNews(100, boardId),
+      PrefetchTtl.news,
+      apply,
+    );
   }, []);
 
-  const loadHoldings = useCallback(async () => {
-    const [feed, portfolio] = await Promise.all([
-      api.getHoldingsNews(100),
-      api.getPortfolio().catch(() => null),
-    ]);
-    cacheSet(PrefetchKeys.newsHoldings, feed);
-    if (portfolio) cacheSet(PrefetchKeys.portfolio, portfolio);
-    setHoldings(feed);
-    setHoldingCount(portfolio?.holdings?.length ?? 0);
+  const loadHoldings = useCallback(async (force = false) => {
+    if (force) {
+      const [feed, portfolio] = await Promise.all([
+        api.getHoldingsNews(100),
+        api.getPortfolio().catch(() => null),
+      ]);
+      cacheSet(PrefetchKeys.newsHoldings, feed);
+      if (portfolio) cacheSet(PrefetchKeys.portfolio, portfolio);
+      setHoldings(feed);
+      setHoldingCount(portfolio?.holdings?.length ?? 0);
+      return;
+    }
+    await cacheSWR(
+      PrefetchKeys.newsHoldings,
+      () => api.getHoldingsNews(100),
+      PrefetchTtl.news,
+      (feed) => {
+        setHoldings(feed);
+      },
+    );
+    void cacheSWR(
+      PrefetchKeys.portfolio,
+      () => api.getPortfolio(),
+      PrefetchTtl.portfolio,
+      (portfolio) => {
+        setHoldingCount(portfolio.holdings?.length ?? 0);
+      },
+    ).catch(() => {});
   }, []);
 
   const loadInterests = useCallback(async () => {
@@ -181,12 +254,17 @@ export default function NewsScreen() {
   }, [loadInterestsList]);
 
   const refresh = useCallback(
-    async (kind: NewsTab, boardId: string, soft = false) => {
+    async (kind: NewsTab, boardId: string, soft = false, force = false) => {
       if (!soft) setLoading(true);
       setError(null);
       try {
-        if (kind === "market") await loadMarket(boardId);
-        else if (kind === "holdings") await loadHoldings();
+        const netForce = force || !soft;
+        if (kind === "market") {
+          await Promise.all([
+            loadMarket(boardId, netForce),
+            loadMacroPulse(netForce),
+          ]);
+        } else if (kind === "holdings") await loadHoldings(netForce);
         else await loadInterests();
       } catch (e) {
         setError(e instanceof Error ? e.message : "加载失败");
@@ -195,26 +273,31 @@ export default function NewsScreen() {
         if (!soft) setLoading(false);
       }
     },
-    [loadMarket, loadHoldings, loadInterests],
+    [loadMarket, loadMacroPulse, loadHoldings, loadInterests],
   );
 
-  /** First paint may hard-load; later switches soft only when that board already has rows */
+  /** Soft when we already have rows (or warm cache); hard only on true empty first paint */
   const bootedRef = useRef(false);
   const boardRef = useRef(board);
   boardRef.current = board;
 
   useEffect(() => {
+    if (!tabActive) return;
     const hasBoardFeed =
       tab !== "market" ||
       Boolean(marketByBoardRef.current[board] || cachePeek(PrefetchKeys.newsMarket(board)));
-    const soft = bootedRef.current && hasBoardFeed;
+    const hasHoldings =
+      tab !== "holdings" || Boolean(cachePeek(PrefetchKeys.newsHoldings));
+    const soft =
+      bootedRef.current ||
+      (tab === "market" ? hasBoardFeed : tab === "holdings" ? hasHoldings : false);
     bootedRef.current = true;
     void refresh(tab, board, soft);
-  }, [tab, board, refresh]);
+  }, [tabActive, tab, board, refresh]);
 
   /** Warm other board feeds so chip + list switch together next time */
   useEffect(() => {
-    if (tab !== "market") return;
+    if (!tabActive || tab !== "market") return;
     let cancelled = false;
     const warm = async () => {
       for (const b of boards) {
@@ -248,7 +331,7 @@ export default function NewsScreen() {
         window.clearTimeout(idle as number);
       }
     };
-  }, [tab, boards]);
+  }, [tabActive, tab, boards]);
 
   const selectTab = useCallback((kind: NewsTab) => {
     setTab((prev) => {
@@ -272,7 +355,7 @@ export default function NewsScreen() {
   }, []);
 
   const pullRefresh = useCallback(async () => {
-    await refresh(tab, board, true);
+    await refresh(tab, board, true, true);
   }, [refresh, tab, board]);
 
   const ptrBarRef = useRef<HTMLDivElement>(null);
@@ -281,7 +364,7 @@ export default function NewsScreen() {
     ready: ptrReady,
   } = usePullToRefresh(feedBodyRef, ptrBarRef, {
     onRefresh: pullRefresh,
-    disabled: active != null || editOpen,
+    disabled: overlayOpen || editOpen,
     onArmed: () => haptics.selection(),
   });
 
@@ -305,7 +388,8 @@ export default function NewsScreen() {
     setArticleError(nextError);
     setActive(row);
     setOpeningKey(null);
-  }, []);
+    push("reader");
+  }, [push]);
 
   const closeReader = useCallback(() => {
     openGen.current += 1;
@@ -313,7 +397,18 @@ export default function NewsScreen() {
     setActive(null);
     setArticle(null);
     setArticleError(null);
-  }, []);
+    if (shellPage === "reader") pop();
+  }, [pop, shellPage]);
+
+  useEffect(() => {
+    if (shellPage === "list" && active) {
+      openGen.current += 1;
+      setOpeningKey(null);
+      setActive(null);
+      setArticle(null);
+      setArticleError(null);
+    }
+  }, [shellPage, active]);
 
   const openEditor = useCallback(() => {
     haptics.tap();
@@ -382,6 +477,7 @@ export default function NewsScreen() {
   const feed =
     tab === "market" ? market : tab === "holdings" ? holdings : interestsFeed;
   const items = feed?.items ?? [];
+  const feedNote = (feed?.note || "").trim();
   const emptyHoldings = tab === "holdings" && holdingCount === 0;
   const emptyInterests = tab === "interests" && interests.length === 0;
   const feedTitle =
@@ -407,8 +503,11 @@ export default function NewsScreen() {
     tab === "market" ? "多源聚合" : tab === "holdings" ? "持仓相关" : "兴趣定制";
 
   return (
-    <div className="news-page" data-kind={tab}>
-      <div className="news-page-pin">
+    <ShellRoot className={`news-page${overlayOpen ? " news-page--push" : ""}`} pushed={overlayOpen}>
+      <ShellBase className="news-shell-base" behind={overlayOpen}>
+        <div className="news-page-inner" data-kind={tab}>
+          <OfflineBanner />
+          <div className="news-page-pin">
         <div className="news-seg news-seg-3" role="tablist" aria-label="新闻分类">
           {TABS.map(({ kind, label, Icon }) => (
             <button
@@ -431,25 +530,77 @@ export default function NewsScreen() {
         </div>
 
         {tab === "market" ? (
-          <div className="news-boards" role="tablist" aria-label="市场板块">
-            {boards.map((b) => (
-              <button
-                key={b.id}
-                type="button"
-                role="tab"
-                className="news-board-chip"
-                aria-selected={board === b.id}
-                data-active={board === b.id ? "1" : "0"}
-                data-board={b.id}
-                onPointerDown={(e) => {
-                  if (e.button !== 0) return;
-                  selectBoard(b.id);
-                }}
-              >
-                {b.label}
-              </button>
-            ))}
-          </div>
+          <>
+            {macroPulse && (macroPulse.calendar || macroPulse.items.length > 0 || macroPulse.note) ? (
+              <div className="news-macro-strip" aria-label="宏观速览">
+                <div className="news-macro-strip-meta">
+                  <span className="news-macro-strip-cal">
+                    {macroPulse.calendar || "宏观速览"}
+                  </span>
+                  {macroPulse.session_hint ? (
+                    <span className="news-macro-strip-session">{macroPulse.session_hint}</span>
+                  ) : null}
+                </div>
+                {macroPulse.items.length > 0 ? (
+                  <div className="news-macro-strip-scroller" role="list">
+                    {macroPulse.items.map((it) => {
+                      const chg = it.change_pct;
+                      const tone =
+                        chg == null ? "flat" : chg > 0 ? "up" : chg < 0 ? "down" : "flat";
+                      const chgLabel =
+                        chg == null
+                          ? "—"
+                          : `${chg > 0 ? "+" : ""}${chg.toFixed(2)}%`;
+                      const priceLabel =
+                        it.price >= 100
+                          ? it.price.toFixed(2)
+                          : it.price >= 10
+                            ? it.price.toFixed(3)
+                            : it.price.toFixed(4);
+                      return (
+                        <div
+                          key={it.key}
+                          className="news-macro-chip"
+                          data-tone={tone}
+                          role="listitem"
+                        >
+                          <span className="news-macro-chip-name">{it.name}</span>
+                          <span className="news-macro-chip-price">
+                            {priceLabel}
+                            {it.unit ? (
+                              <span className="news-macro-chip-unit">{it.unit}</span>
+                            ) : null}
+                          </span>
+                          <span className="news-macro-chip-chg">{chgLabel}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : macroPulse.note ? (
+                  <p className="news-macro-strip-note">{macroPulse.note}</p>
+                ) : null}
+              </div>
+            ) : null}
+            <div className="news-boards" role="tablist" aria-label="市场板块">
+              {boards.map((b) => (
+                <button
+                  key={b.id}
+                  type="button"
+                  role="tab"
+                  className="news-board-chip"
+                  aria-selected={board === b.id}
+                  data-active={board === b.id ? "1" : "0"}
+                  data-board={b.id}
+                  onPointerDown={(e) => {
+                    if (e.button !== 0) return;
+                    selectBoard(b.id);
+                  }}
+                >
+                  {b.label}
+                </button>
+              ))}
+            </div>
+          </>
         ) : null}
 
         {tab === "interests" ? (
@@ -540,7 +691,10 @@ export default function NewsScreen() {
           ) : items.length === 0 ? (
             <div className="news-empty">
               <Inbox size={22} strokeWidth={1.75} absoluteStrokeWidth aria-hidden />
-              <p>暂无资讯</p>
+              <p>{feedNote || "暂无资讯"}</p>
+              {feedNote ? (
+                <p className="news-empty-sub">可切换板块或稍后下拉刷新</p>
+              ) : null}
             </div>
           ) : (
             <ul className="news-list" key={`news-${tab}-${board}`}>
@@ -559,54 +713,7 @@ export default function NewsScreen() {
         </div>
       </section>
 
-      <CenterModal open={active != null} title="资讯" onClose={closeReader}>
-        {active ? (
-          <div className="news-reader">
-            <div className="news-reader-head">
-              <h3 className="news-reader-title">{readerTitle}</h3>
-              <div className="news-reader-meta">
-                {active.symbols?.length ? (
-                  <span className="news-row-syms">{active.symbols.slice(0, 3).join(" · ")}</span>
-                ) : null}
-                {readerSource ? <span>{readerSource}</span> : null}
-                {readerTime ? <span>{readerTime}</span> : null}
-              </div>
-            </div>
-            <div className="news-reader-body">
-              {(() => {
-                const paras = (readerBody || "")
-                  .split(/\n+/)
-                  .map((p) => p.trim())
-                  .filter(Boolean);
-                const imgs = article?.images ?? [];
-                if (paras.length === 0 && imgs.length === 0) {
-                  return <p>暂无正文</p>;
-                }
-                return (
-                  <>
-                    {paras.map((para, i) => (
-                      <p key={i}>{para}</p>
-                    ))}
-                    {imgs.map((src) => (
-                      <img
-                        key={src}
-                        className="news-reader-img"
-                        src={src}
-                        alt=""
-                        loading="lazy"
-                        referrerPolicy="no-referrer"
-                      />
-                    ))}
-                  </>
-                );
-              })()}
-            </div>
-            {articleError ? <p className="news-reader-hint">{articleError}</p> : null}
-          </div>
-        ) : null}
-      </CenterModal>
-
-      <CenterModal
+<CenterModal
         open={editOpen}
         title="编辑兴趣"
         onClose={closeEditor}
@@ -693,7 +800,76 @@ export default function NewsScreen() {
           ) : null}
         </div>
       </CenterModal>
-    </div>
+        </div>
+      </ShellBase>
+
+      {overlayOpen && active ? (
+        <ShellLayer className="news-reader-layer" onEdgeBack={popSoft}>
+          <header className="news-reader-nav">
+            <button
+              type="button"
+              className="news-reader-nav-back"
+              onClick={closeReader}
+              aria-label="返回"
+            >
+              <ChevronLeft size={22} strokeWidth={2.25} absoluteStrokeWidth aria-hidden />
+            </button>
+            <h1 className="news-reader-nav-title">资讯</h1>
+            <span className="news-reader-nav-spacer" aria-hidden />
+          </header>
+          <div className="news-reader news-reader--page">
+            <article className="news-reader-article">
+              <header className="news-reader-head">
+                <h2 className="news-reader-title">{readerTitle}</h2>
+                <div className="news-reader-meta">
+                  {active.symbols?.length ? (
+                    <span className="news-reader-meta-syms">
+                      {active.symbols.slice(0, 3).join(" · ")}
+                    </span>
+                  ) : null}
+                  {readerSource ? (
+                    <span className="news-reader-meta-source">{readerSource}</span>
+                  ) : null}
+                  {readerTime ? (
+                    <span className="news-reader-meta-time">{readerTime}</span>
+                  ) : null}
+                </div>
+              </header>
+              <div className="news-reader-body">
+                {(() => {
+                  const paras = (readerBody || "")
+                    .split(/\n+/)
+                    .map((p) => p.trim())
+                    .filter(Boolean);
+                  const imgs = article?.images ?? [];
+                  if (paras.length === 0 && imgs.length === 0) {
+                    return <p className="news-reader-empty">暂无正文</p>;
+                  }
+                  return (
+                    <>
+                      {paras.map((para, i) => (
+                        <p key={i}>{para}</p>
+                      ))}
+                      {imgs.map((src) => (
+                        <img
+                          key={src}
+                          className="news-reader-img"
+                          src={src}
+                          alt=""
+                          loading="lazy"
+                          referrerPolicy="no-referrer"
+                        />
+                      ))}
+                    </>
+                  );
+                })()}
+              </div>
+              {articleError ? <p className="news-reader-hint">{articleError}</p> : null}
+            </article>
+          </div>
+        </ShellLayer>
+      ) : null}
+    </ShellRoot>
   );
 }
 

@@ -16,6 +16,7 @@ from app.providers.leaders import format_leaders_summary
 from app.providers.macro import format_macro_text, list_topics, news_keyword_for_topic
 from app.providers.news import (
     MARKET_BOARDS,
+    NewsItem,
     format_news_digest,
     get_holdings_news,
     get_interests_news,
@@ -209,8 +210,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "function": {
             "name": "get_news",
             "description": (
-                "查询新闻：市场版块要闻、持仓相关、或关键词检索。"
-                "聊黄金/原油等宏观时用 keyword=中文主题（黄金、原油），勿用英文 id。"
+                "查询新闻：市场版块（要闻/国际等）、持仓相关、或关键词检索；返回已按持仓相关性筛选的摘要。"
+                "聊黄金/原油等宏观时用 keyword=中文主题（黄金、原油），或 board=world；勿用英文 id。"
                 "聊科技/能源/金融等板块新闻时 kind=market 并指定 board。"
             ),
             "parameters": {
@@ -279,9 +280,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "function": {
             "name": "start_analysis",
             "description": (
-                "仅当用户明确要求立刻开跑分析时调用；仅支持 A 股与仓库。"
-                "仓库：「帮我分析今天仓库」「分析一下仓库」「仓库巡检」→ scope=portfolio。"
-                "个股：「帮我分析茅台」「分析一下600519这只股票」→ scope=symbol，并填 symbol/market/name；固定标准档。"
+                "仅当用户明确要求立刻开跑分析时调用。"
+                "仓库：「帮我分析今天仓库」「分析一下仓库」「仓库巡检」→ scope=portfolio"
+                "（含股票/场内ETF/场外基金/黄金积存，全仓）。"
+                "单票：「帮我分析茅台」「分析黄金ETF」「分析某某基金」→ scope=symbol，"
+                "填 symbol/market/name；支持 SH/SZ/OF/JD/GDS(AU9999)；固定标准档。"
                 "港股勿调本工具：用 get_quote / get_intraday / get_kline 聊天查行情即可，不进仓库、不开标准分析。"
                 "禁止：问进度/上次结论/仓位散不散/闲聊提分析 → 只用 get_analysis_snapshot。"
                 "后台执行、立即返回；已有任务在跑则提示等待。"
@@ -292,20 +295,20 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "scope": {
                         "type": "string",
                         "enum": ["portfolio", "symbol"],
-                        "description": "portfolio=仓库巡检；symbol=单只股票标准分析",
+                        "description": "portfolio=仓库全仓；symbol=单标的（股/ETF/基金/黄金）",
                     },
                     "symbol": {
                         "type": "string",
-                        "description": "六位 A 股代码，scope=symbol 时必填（可先 search_symbol）；港股不支持标准分析",
+                        "description": "代码：A股/ETF/场外基金六位，或积存金 sku；scope=symbol 必填",
                     },
                     "market": {
                         "type": "string",
-                        "enum": ["SH", "SZ"],
-                        "description": "仅 A 股；港股请用报价/分时/日K 工具",
+                        "enum": ["SH", "SZ", "OF", "JD", "GDS"],
+                        "description": "SH/SZ 场内；OF 场外基金；JD 积存金；GDS=AU9999 上金所现货",
                     },
                     "name": {
                         "type": "string",
-                        "description": "股票名称（可选，便于话术）",
+                        "description": "简称（可选，便于话术）",
                     },
                 },
                 "required": [],
@@ -363,8 +366,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "function": {
             "name": "search_knowledge",
             "description": (
-                "检索安崽经验知识库（纪律/口吻/怎么看盘的框架）。"
-                "问该不该追、仓位重不重、消息怎么用、买卖怎么说时可用。"
+                "检索安崽经验知识库（纪律/口吻/怎么看盘的框架，含基础与专业层）。"
+                "问该不该追、仓位、规则时用；问实际利率、杜邦、久期、Brinson、隐含波动率等进阶概念时"
+                "把 mode 设为 advanced。"
                 "返回非实时经验，不能当行情或新闻；点位仍须用其它行情工具。"
             ),
             "parameters": {
@@ -372,11 +376,19 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "检索词，如 追高、仓位分散、黄金还追吗、新闻新旧",
+                        "description": "检索词，如 追高、仓位分散、实际利率、杜邦分析",
                     },
                     "limit": {
                         "type": "integer",
                         "description": "条数，默认 3，最大 8",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": (
+                            "auto|basic|advanced。"
+                            "普通用户问答用 basic 或 auto；专业名词/宏观估值归因用 advanced。"
+                            "默认 auto（按问法自动切换）。"
+                        ),
                     },
                 },
                 "required": ["query"],
@@ -415,6 +427,60 @@ _KNOWLEDGE_HINTS = (
     "怎么看仓",
     "宜减不宜加",
     "可轻仓",
+    "积存金",
+    "投资金条",
+    "纸黄金",
+    "黄金ETF",
+    "适合买黄金",
+    "首饰金",
+    "黄金回收",
+    "黄金骗局",
+    "打新",
+    "T+1",
+    "融资融券",
+    "指数基金",
+    "市盈率",
+    "ST股票",
+    "荐股",
+    "除权除息",
+    "集合竞价",
+    "货币基金",
+    "纯债基金",
+    "A类C类",
+    "A类和C类",
+    "红利再投资",
+    "QDII",
+    "基金清盘",
+    "跟踪误差",
+    "场外基金",
+    "定投会不会亏",
+    "可转债",
+    "强赎",
+    "银行理财",
+    "大额存单",
+    "储蓄国债",
+    "增额寿",
+    "年金险",
+    "闲钱",
+    "资产配置",
+    "杀猪盘",
+    "保本高收益",
+    "追涨杀跌",
+    "个人养老金",
+    "实际利率",
+    "杜邦",
+    "Brinson",
+    "久期",
+    "隐含波动率",
+    "风格漂移",
+    "有效前沿",
+    "行业分析",
+    "板块轮动",
+    "港股通",
+    "美股",
+    "REITs",
+    "公募REITs",
+    "私募基金",
 )
 
 _FLOW_HINTS = (
@@ -829,15 +895,16 @@ def plan_prefetch(
 
     if any(h in text for h in _ANALYSIS_HINTS):
         add("get_analysis_snapshot", {})
+    started_analysis = False
     if any(h in text for h in _START_ANALYSIS_HINTS):
         add("start_analysis", {"scope": "portfolio"})
-        add("get_analysis_snapshot", {})
+        started_analysis = True
+        # 不预取 snapshot：本轮会等委员会跑完再注入结论
     else:
         stock_job = _explicit_symbol_analysis_target(text, db=db, user_id=user_id)
         if stock_job:
             add("start_analysis", stock_job)
-            add("get_analysis_snapshot", {})
-            # 顺带深取行情 + 盘口资金，回答时可先点一两句
+            started_analysis = True
             sym = str(stock_job.get("symbol") or "")
             mkt = str(stock_job.get("market") or "SH")
             if sym:
@@ -845,12 +912,15 @@ def plan_prefetch(
                 if (mkt or "").upper() in {"SH", "SZ"}:
                     add("get_depth_flow", {"symbol": sym, "market": mkt})
 
-    # 已有进行中的分析：每轮拉状态，方便后续对话带上
-    if db is not None and user_id is not None:
+    # 进行中 / 刚跑完：拉分析状态（本轮刚 start 的由 wait 注入，勿抢跑空结论）
+    if db is not None and user_id is not None and not started_analysis:
         try:
             from app.services import analysis as analysis_svc
+            from app.services import analysis_pending as pending_svc
 
             if analysis_svc.running_job(db, user_id) is not None:
+                add("get_analysis_snapshot", {})
+            elif pending_svc.peek_pending_job_id(user_id) is not None:
                 add("get_analysis_snapshot", {})
         except Exception:
             pass
@@ -914,6 +984,7 @@ def _infer_leaders_board(text: str) -> str:
 def _infer_news_board(text: str) -> str:
     """Map spoken board hints → MARKET_BOARDS id."""
     pairs = (
+        (("国际", "海外", "美联储", "美股", "非农", "纳斯达克", "标普", "华尔街"), "world"),
         (("科技", "芯片", "半导体", "人工智能", "AI"), "tech"),
         (("能源", "石油", "煤炭", "电力", "新能源"), "energy"),
         (("金融", "银行", "券商", "保险"), "finance"),
@@ -937,7 +1008,7 @@ def prefetch_for_turn(
     """Run heuristic tools; return [{name, label, text}]."""
     out: list[dict[str, str]] = []
     for name, args in plan_prefetch(user_text, db=db, user_id=user_id):
-        text = execute_tool(db, user_id, name, args)
+        text = execute_tool(db, user_id, name, args, user_text=user_text)
         out.append({"name": name, "label": tool_label(name), "text": text})
     return out
 
@@ -955,6 +1026,7 @@ def format_prefetch_block(
         (
             "【本轮实时查询】刚拉取的真实数据；结论与点位只许引用这里有的，没有再说没有。"
             "嵌进口语，别列清单，引用数字时不要加粗；禁止补编未出现的宏观指标。"
+            "工具里若给了多条报价：回答时最多用 1～2 个，禁止一股脑全念。"
         ),
         calendar_clock_line(),
     ]
@@ -962,7 +1034,10 @@ def format_prefetch_block(
     if scene_primary == "macro" or (
         scene_primary is None and all(it["name"] == "get_macro" for it in items)
     ):
-        parts.append("宏观数据：优先讲标了「今日」的品种；非今日=昨收，说清即可。")
+        parts.append(
+            "宏观/黄金：优先讲标了「今日」的品种；非今日=昨收，说清即可。"
+            "黄金泛问只说 AU9999（最多再带一句纽约金）；用户没点名的积存/ETF/门店别提。"
+        )
     for it in items:
         parts.append(it["text"])
     return "\n\n".join(parts)
@@ -973,6 +1048,8 @@ def execute_tool(
     user_id: int,
     name: str,
     arguments: dict[str, Any] | None,
+    *,
+    user_text: str = "",
 ) -> str:
     """Run one tool; return compact Chinese text for the model."""
     args = arguments if isinstance(arguments, dict) else {}
@@ -980,7 +1057,10 @@ def execute_tool(
         if name == "get_indices":
             return _tool_indices()
         if name == "get_macro":
-            return format_macro_text(str(args.get("topic") or ""))
+            return format_macro_text(
+                str(args.get("topic") or ""),
+                user_text=user_text or str(args.get("hint") or ""),
+            )
         if name == "get_quote":
             return _tool_quote(str(args.get("symbol") or ""), str(args.get("market") or ""))
         if name == "get_intraday":
@@ -1017,6 +1097,7 @@ def execute_tool(
             return format_search_text(
                 str(args.get("query") or ""),
                 limit=int(args.get("limit") or 3),
+                mode=str(args.get("mode") or "auto"),
             )
         if name == "search_symbol":
             return format_search_summary(
@@ -1266,58 +1347,29 @@ def portfolio_card_payload(db: Session, user_id: int) -> dict[str, Any]:
 
 def rebalance_card_payload(db: Session, user_id: int) -> dict[str, Any]:
     """Structured rebalance draft card for UI."""
+    from app.services.rebalance import draft_rebalance_from_rows
+
     consolidate_same_symbol(db, user_id)
     pf = build_portfolio(db, user_id)
     holds = list(pf.holdings or [])
-    if not holds:
-        return {
-            "kind": "rebalance",
-            "empty": True,
-            "stance": "仓库空仓，没什么可调",
-            "notes": [],
+    rows = [
+        {
+            "symbol": h.symbol,
+            "name": h.name,
+            "weight": h.weight,
+            "day_pnl": h.day_pnl,
+            "day_pnl_pct": h.day_pnl_pct,
+            "pnl_pct": h.pnl_pct,
         }
-    ranked = sorted(holds, key=lambda h: float(h.weight or 0), reverse=True)
-    notes: list[str] = []
-    head = ranked[0]
-    hw = float(head.weight or 0)
-    stance = "观望为主"
-    if hw >= 35:
-        stance = "宜减不宜加"
-        notes.append(f"{head.name or head.symbol} 约 {hw:.1f}% 偏重")
-    elif hw >= 25:
-        stance = "观望，冲高再议轻减"
-        notes.append(f"{head.name or head.symbol} 约 {hw:.1f}% 偏集中")
-    top3 = sum(float(h.weight or 0) for h in ranked[:3])
-    if top3 >= 70:
-        notes.append(f"前三合计约 {top3:.0f}%，分散偏弱")
-    by_day = sorted(
-        holds, key=lambda h: float(h.day_pnl if h.day_pnl is not None else 0)
-    )
-    drag = by_day[0]
-    if drag.day_pnl is not None and float(drag.day_pnl) < 0:
-        notes.append(
-            f"今日拖累 {drag.name or drag.symbol} "
-            f"day_pnl {_fmt_pct(drag.day_pnl_pct)}"
-        )
-    return {
-        "kind": "rebalance",
-        "empty": False,
-        "stance": stance,
-        "day_pnl_pct": (
-            round(float(pf.day_pnl_pct), 2) if pf.day_pnl_pct is not None else None
-        ),
-        "head": {
-            "symbol": head.symbol,
-            "name": (head.name or "").strip() or head.symbol,
-            "weight": round(hw, 1),
-        },
-        "notes": notes[:4],
-    }
+        for h in holds
+    ]
+    return draft_rebalance_from_rows(rows, day_pnl_pct=pf.day_pnl_pct)
 
 
 def analysis_card_payload(db: Session, user_id: int) -> dict[str, Any] | None:
-    """Compact card after start_analysis — UI shows「已经在分析」immediately."""
+    """Compact card after start_analysis — UI shows friendly wait ack immediately."""
     from app.services import analysis as analysis_svc
+    from app.services.agent_analysis_wait import estimate_eta_minutes, friendly_wait_line
 
     job = analysis_svc.running_job(db, user_id)
     if job is None:
@@ -1328,13 +1380,13 @@ def analysis_card_payload(db: Session, user_id: int) -> dict[str, Any] | None:
     scope = str(job.scope or "portfolio")
     if scope == "portfolio":
         label = "仓库巡检"
-        ack = "已经在分析仓库了，你可以继续聊；去「分析」页也能看进度。"
+        tip = "仓库"
     else:
         nm = str(s0.get("name") or s0.get("symbol") or "").strip()
         label = f"个股·{nm}" if nm else "个股分析"
-        ack = (
-            f"已经在分析{nm or '这只'}了，你可以继续聊；去「分析」页也能看进度。"
-        )
+        tip = nm or "这只"
+    lo, hi = estimate_eta_minutes(str(job.degree or "standard"))
+    ack = friendly_wait_line(label=tip, degree=str(job.degree or "standard"))
     return {
         "kind": "analysis",
         "job_id": int(job.id),
@@ -1343,6 +1395,7 @@ def analysis_card_payload(db: Session, user_id: int) -> dict[str, Any] | None:
         "title": "分析进行中",
         "label": label,
         "degree": str(job.degree or "standard"),
+        "eta_minutes": [lo, hi],
         "symbol": str(s0.get("symbol") or ""),
         "name": str(s0.get("name") or ""),
         "ack": ack,
@@ -1425,20 +1478,30 @@ def _tool_draft_rebalance(db: Session, user_id: int) -> str:
 
 def _tool_analysis_snapshot(db: Session, user_id: int) -> str:
     from app.services import analysis as analysis_svc
+    from app.services import analysis_pending as pending_svc
     from app.services.agent_context import _summarize_report
 
     lines: list[str] = ["【分析状态】"]
     running = analysis_svc.running_job(db, user_id)
+    just_ready = None if running is not None else pending_svc.consume_if_ready(db, user_id)
+
     if running is not None:
         lines.append(
             f"进行中：任务 #{running.id} · {running.scope} · {running.degree}。"
-            "结论还没出来。话术：分析还在跑，你可以先聊别的；跑完下一轮我会带上结论。"
+            "结论还没出来。话术：分析还在跑，你可以先聊别的；"
+            "跑完后你再说一句或随便聊，我会主动把结论带上。"
             "禁止编造尚未完成的专家会结论。"
+        )
+    elif just_ready is not None:
+        lines.append(
+            "【刚跑完·必须主动播报】委员会已结束。"
+            "回复第一句就必须用人话讲清结论（verdict + 倾向），"
+            "不要等用户问「分析好了吗」；可提一句去「分析」页看全文。"
         )
     else:
         lines.append("当前没有进行中的分析任务。")
 
-    job = analysis_svc.latest_job(db, user_id)
+    job = just_ready or analysis_svc.latest_job(db, user_id)
     if job is None:
         lines.append("还没有已完成的分析报告。可去「分析」页跑，或让我 start_analysis 后台巡检。")
         return "\n".join(lines)
@@ -1451,10 +1514,28 @@ def _tool_analysis_snapshot(db: Session, user_id: int) -> str:
                 report = raw
         except json.JSONDecodeError:
             report = None
+
+    if str(job.status or "") == "failed":
+        lines.append(
+            f"最近任务 #{job.id} 失败：{(job.error or '未知错误')[:200]}。"
+            "话术：老实说没跑通，可请用户再试或去分析页看。"
+        )
+        return "\n".join(lines)
+
     lines.append(
         f"最近完成：任务 #{job.id} · {job.scope} · {job.degree} · 配方 {job.recipe_id}"
-        + ("（可在对话里带一句结论）" if not running else "（旧结论；新任务还在跑）")
+        + (
+            "（刚出炉，请主动播报）"
+            if just_ready is not None
+            else ("（可在对话里带一句结论）" if not running else "（旧结论；新任务还在跑）")
+        )
     )
+    if report and report.get("template"):
+        lines.append("质量：模板兜底（委员会未完整跑通），播报时要诚实说「简化版/兜底」。")
+    elif report and report.get("degraded"):
+        fails = report.get("failed_seats") or []
+        bit = "、".join(str(x) for x in fails[:4]) if fails else "部分席位"
+        lines.append(f"质量：部分席位异常（{bit}），播报时提一句「有的席没谈成」。")
     lines.extend(_summarize_report(report))
     return "\n".join(lines)
 
@@ -1561,13 +1642,15 @@ def _tool_start_analysis(
     if scope not in {"portfolio", "symbol"}:
         return "【启动分析】scope 只支持 portfolio 或 symbol。"
 
+    from app.services import analysis_pending as pending_svc
+
     existing = analysis_svc.running_job(db, user_id)
     if existing is not None:
+        pending_svc.mark_pending(user_id, int(existing.id))
         return (
-            f"【启动分析】已有任务 #{existing.id}（{existing.scope}/{existing.degree}）在跑，"
-            "不用重复开。"
-            "话术（第一句必须）：已经在分析了 / 还在跑，先聊着；可去「分析」页看进度。"
-            "禁止编造尚未完成的结论。"
+            f"【启动分析】已有任务 #{existing.id}（{existing.scope}/{existing.degree}）在跑。"
+            "本轮对话会等待该任务结束后再带结论给你，无需用户再说一句。"
+            "在等待期间不要编造结论。"
         )
 
     symbols: list[dict[str, str]] | None = None
@@ -1596,10 +1679,13 @@ def _tool_start_analysis(
                 f"【启动分析】港股「{nm or sym}」不开标准分析、也不进仓库。"
                 "聊天里用 get_quote / get_intraday / get_kline 查报价、分时、日K 即可。"
             )
-        if (mkt or "").upper() not in {"SH", "SZ"}:
-            return "【启动分析】个股标准分析仅支持 A 股（SH/SZ）。"
+        if (mkt or "").upper() not in {"SH", "SZ", "OF", "JD", "GDS"}:
+            return (
+                "【启动分析】单票分析支持 SH/SZ（股票·ETF）、OF（场外基金）、"
+                "JD（积存金）、GDS（AU9999 上金所现货）。"
+            )
         symbols = [{"symbol": sym, "market": mkt or "SH", "name": nm or sym}]
-        label = f"个股标准分析「{nm or sym}」"
+        label = f"单票标准分析「{nm or sym}」"
 
     try:
         job = analysis_svc.start_job_background(
@@ -1614,17 +1700,17 @@ def _tool_start_analysis(
         logger.exception("start_analysis failed")
         return f"【启动分析】失败：{type(exc).__name__}"
 
+    pending_svc.mark_pending(user_id, int(job.id))
+
     target_note = ""
     if scope == "symbol" and symbols:
         s0 = symbols[0]
         target_note = f" · {s0.get('name') or s0['symbol']}（{s0['symbol']}）"
 
     return (
-        f"【启动分析】{label}已在后台开始（任务 #{job.id} · 标准档{target_note}），"
-        "不阻塞这轮对话。"
-        "话术（第一句必须立刻说）：已经在分析了（点明仓库或哪只个股），"
-        "并提一句可去「分析」页看进度；你可以继续问别的。"
-        "跑完后问「分析好了吗」或下一轮再带结论。禁止假装现在已经有新结论。"
+        f"【启动分析】{label}已在后台开始（任务 #{job.id} · 标准档{target_note}）。"
+        "本轮会等待委员会跑完，再把结论注入后回答；"
+        "先用友好等待话术安抚用户，禁止假装现在已有新结论。"
     )
 
 
@@ -1637,20 +1723,67 @@ def _tool_news(
     board: str = "headline",
     limit: int,
 ) -> str:
+    from app.services.news_relevance import news_items_to_dicts, rank_and_trim_news
+
     lim = max(1, min(int(limit or 5), 10))
     kind = (kind or "market").strip().lower()
     items: list[Any] = []
     title = "新闻"
+    filtered = False
+
+    # Light portfolio context for relevance (names + crude asset kinds)
+    hold_rows = (
+        db.query(Holding.symbol, Holding.name, Holding.market)
+        .filter(Holding.user_id == user_id)
+        .order_by(Holding.id.asc())
+        .all()
+    )
+    hold_symbols = [str(r[0]) for r in hold_rows if r and r[0]]
+    hold_names = [str(r[1]).strip() for r in hold_rows if r and str(r[1] or "").strip()]
+    hold_kinds: list[str] = []
+    for r in hold_rows:
+        mkt = str(r[2] or "SH").upper()
+        nm = str(r[1] or "")
+        if mkt == "JD" or "黄金" in nm:
+            hold_kinds.append("黄金积存" if mkt == "JD" else "黄金ETF")
+        elif mkt == "OF":
+            hold_kinds.append("场外基金")
+        else:
+            hold_kinds.append("股票")
+
+    def _trim(raw_items: list[Any], *, board_tag: str = "") -> list[NewsItem]:
+        nonlocal filtered
+        pool = news_items_to_dicts(raw_items, board=board_tag) if raw_items else []
+        # Over-fetch already done by callers; still rank to lim
+        ranked = rank_and_trim_news(
+            pool,
+            limit=lim,
+            symbols=hold_symbols,
+            names=hold_names,
+            asset_kinds=hold_kinds,
+            interest_terms=[keyword] if keyword else None,
+        )
+        filtered = True
+        out: list[NewsItem] = []
+        for d in ranked:
+            out.append(
+                NewsItem(
+                    id=str(d.get("id") or ""),
+                    title=str(d.get("title") or ""),
+                    summary=str(d.get("summary") or ""),
+                    source=str(d.get("source") or ""),
+                    published_at=str(d.get("published_at") or ""),
+                    url=str(d.get("url") or ""),
+                    symbols=list(d.get("symbols") or []),
+                    region=str(d.get("region") or "cn"),
+                )
+            )
+        return out
 
     if kind == "holdings":
-        rows = (
-            db.query(Holding.symbol)
-            .filter(Holding.user_id == user_id)
-            .order_by(Holding.id.asc())
-            .all()
-        )
-        symbols = [str(r[0]) for r in rows if r and r[0]]
-        items = get_holdings_news(symbols, limit=lim)
+        pool_lim = max(lim * 3, 20)
+        raw = get_holdings_news(hold_symbols, limit=pool_lim)
+        items = _trim(raw, board_tag="holding")
         title = "持仓相关新闻"
     elif kind == "keyword":
         kw = (keyword or "").strip()
@@ -1659,17 +1792,21 @@ def _tool_news(
         # 英文 topic id → 中文检索词（gold→黄金）
         if kw in set(list_topics()):
             kw = news_keyword_for_topic(kw)
-        items = get_interests_news([kw], limit=lim)
+        pool_lim = max(lim * 3, 24)
+        raw = get_interests_news([kw], limit=pool_lim)
+        items = _trim(raw, board_tag="keyword")
         title = f"关键词「{kw}」新闻"
     else:
         bid = (board or "headline").strip().lower()
         known = {b["id"] for b in MARKET_BOARDS}
         if bid not in known:
             bid = "headline"
-        board_title, items = get_market_news(limit=lim, board=bid)
+        pool_lim = max(lim * 4, 28)
+        board_title, raw = get_market_news(limit=pool_lim, board=bid)
+        items = _trim(raw, board_tag=bid)
         title = f"市场新闻 · {board_title}"
 
-    return format_news_digest(items, title=title, limit=lim)
+    return format_news_digest(items, title=title, limit=lim, filtered=filtered)
 
 
 def parse_tool_arguments(raw: Any) -> dict[str, Any]:

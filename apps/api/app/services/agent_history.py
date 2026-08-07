@@ -295,6 +295,8 @@ def clear_messages(db: Session, user_id: int, conversation_id: int | None = None
         if conv:
             conv.title = "新对话"
             conv.updated_at = _now()
+            conv.memory_summary = None
+            conv.memory_until_message_id = None
         db.commit()
         return int(n or 0)
 

@@ -1,6 +1,7 @@
 """Conversation preset (L1) — single catalog for 安崽真人对话; no API secrets.
 
-Identity is NOT separate presets: injected as 【关系】 prompt via compose_system_prompt.
+BrewStory-lite shape: prompts[] + prompt_order.
+Identity is NOT separate presets: relation marker filled in compose_system_prompt.
 """
 
 from __future__ import annotations
@@ -13,7 +14,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from app.services.preset_seeds import BUILTIN_PRESETS, SINGLE_PRESET_ID
+from app.services.preset_seeds import (
+    BUILTIN_PRESETS,
+    BUILTIN_PROMPTS,
+    DEFAULT_PROMPT_ORDER,
+    PROMPT_ANALYST_SKILL,
+    PROMPT_DATA_DISCIPLINE,
+    PROMPT_EXPRESSION,
+    PROMPT_MAIN,
+    PROMPT_RELATION,
+    PROMPT_REPLY_STYLE,
+    SINGLE_PRESET_ID,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +35,9 @@ AGENT_CHAT_PATH = Path(__file__).resolve().parents[2] / "data" / "agent_chat.jso
 DEFAULT_SYSTEM_PROMPT = BUILTIN_PRESETS[0]["system_prompt"]
 DEFAULT_REPLY_STYLE = BUILTIN_PRESETS[0]["reply_style"]
 DEFAULT_CHIPS = list(BUILTIN_PRESETS[0]["suggested_chips"])
+
+# Markers filled at compose time (not edited as free text in admin content)
+MARKER_IDS = frozenset({PROMPT_RELATION, PROMPT_ANALYST_SKILL})
 
 
 def _now() -> str:
@@ -66,12 +81,150 @@ def _parse_chips(raw: Any) -> list[str]:
     return chips or list(DEFAULT_CHIPS)
 
 
+def _builtin_prompt_map() -> dict[str, dict[str, Any]]:
+    return {str(p["identifier"]): dict(p) for p in BUILTIN_PROMPTS}
+
+
+def _normalize_prompt_entry(raw: dict[str, Any] | None, fallback: dict[str, Any]) -> dict[str, Any]:
+    base = dict(fallback)
+    if not isinstance(raw, dict):
+        return base
+    ident = str(raw.get("identifier") or base["identifier"]).strip() or base["identifier"]
+    base["identifier"] = ident
+    if raw.get("name"):
+        base["name"] = str(raw["name"]).strip()
+    if "role" in raw and raw["role"] in {"system", "user", "assistant"}:
+        base["role"] = raw["role"]
+    if "marker" in raw:
+        base["marker"] = bool(raw["marker"])
+    if "enabled" in raw:
+        base["enabled"] = bool(raw["enabled"])
+    if "injection_position" in raw:
+        try:
+            base["injection_position"] = int(raw["injection_position"])
+        except (TypeError, ValueError):
+            pass
+    if "wrap" in raw:
+        base["wrap"] = str(raw.get("wrap") or "") or base.get("wrap")
+    # Markers keep empty content; editable entries take content from raw when present
+    if not base.get("marker"):
+        if "content" in raw:
+            base["content"] = str(raw.get("content") or "")
+    else:
+        base["content"] = ""
+    return base
+
+
+def _normalize_prompt_order(raw: Any) -> list[dict[str, Any]]:
+    builtin_ids = [str(o["identifier"]) for o in DEFAULT_PROMPT_ORDER]
+    enabled_map = {str(o["identifier"]): bool(o.get("enabled", True)) for o in DEFAULT_PROMPT_ORDER}
+    if isinstance(raw, list) and raw:
+        seen: list[str] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            ident = str(item.get("identifier") or "").strip()
+            if not ident or ident in seen:
+                continue
+            seen.append(ident)
+            if "enabled" in item:
+                enabled_map[ident] = bool(item["enabled"])
+        # Keep known order first, then any extras
+        ordered = [i for i in seen if i in builtin_ids] or list(builtin_ids)
+        for i in builtin_ids:
+            if i not in ordered:
+                ordered.append(i)
+        for i in seen:
+            if i not in ordered:
+                ordered.append(i)
+        return [{"identifier": i, "enabled": enabled_map.get(i, True)} for i in ordered]
+    return [dict(o) for o in DEFAULT_PROMPT_ORDER]
+
+
+def _migrate_flat_to_prompts(
+    system_prompt: str,
+    reply_style: str,
+    prompts_raw: Any,
+    order_raw: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build prompts stack; fill main/reply_style from flat fields when stack missing."""
+    fmap = _builtin_prompt_map()
+    by_id: dict[str, dict[str, Any]] = {k: dict(v) for k, v in fmap.items()}
+
+    if isinstance(prompts_raw, list):
+        for item in prompts_raw:
+            if not isinstance(item, dict):
+                continue
+            ident = str(item.get("identifier") or "").strip()
+            if not ident:
+                continue
+            fallback = by_id.get(ident) or {
+                "identifier": ident,
+                "name": ident,
+                "role": "system",
+                "marker": False,
+                "enabled": True,
+                "injection_position": 0,
+                "content": "",
+            }
+            by_id[ident] = _normalize_prompt_entry(item, fallback)
+
+    # Flat → stack when prompts absent or main empty
+    main = by_id.get(PROMPT_MAIN)
+    if main is not None and not (main.get("content") or "").strip():
+        main["content"] = (system_prompt or "").strip() or DEFAULT_SYSTEM_PROMPT
+    if main is not None and (system_prompt or "").strip() and not isinstance(prompts_raw, list):
+        main["content"] = (system_prompt or "").strip()
+
+    style = by_id.get(PROMPT_REPLY_STYLE)
+    if style is not None:
+        if not isinstance(prompts_raw, list) or not (style.get("content") or "").strip():
+            style["content"] = (reply_style or "").strip() or DEFAULT_REPLY_STYLE
+
+    order = _normalize_prompt_order(order_raw)
+    # Sync enabled onto prompt entries
+    en = {o["identifier"]: bool(o.get("enabled", True)) for o in order}
+    for ident, p in by_id.items():
+        if ident in en:
+            p["enabled"] = en[ident]
+
+    prompts = []
+    for o in order:
+        ident = o["identifier"]
+        if ident in by_id:
+            prompts.append(by_id[ident])
+        elif ident in fmap:
+            prompts.append(dict(fmap[ident]))
+    # Append any custom extras not in order
+    ordered_ids = {o["identifier"] for o in order}
+    for ident, p in by_id.items():
+        if ident not in ordered_ids:
+            prompts.append(p)
+            order.append({"identifier": ident, "enabled": bool(p.get("enabled", True))})
+
+    return prompts, order
+
+
+def _flat_mirrors_from_prompts(prompts: list[dict[str, Any]]) -> tuple[str, str]:
+    main = DEFAULT_SYSTEM_PROMPT
+    style = DEFAULT_REPLY_STYLE
+    for p in prompts:
+        ident = str(p.get("identifier") or "")
+        if ident == PROMPT_MAIN:
+            main = str(p.get("content") or "").strip() or DEFAULT_SYSTEM_PROMPT
+        elif ident == PROMPT_REPLY_STYLE:
+            style = str(p.get("content") or "").strip()
+    return main, style
+
+
 def _blank_preset(
     *,
     preset_id: str,
     name: str,
     system_prompt: str = "",
     reply_style: str = "",
+    prompts: Any = None,
+    prompt_order: Any = None,
     temperature: float = 0.75,
     top_p: float = 0.95,
     frequency_penalty: float = 0.0,
@@ -81,13 +234,20 @@ def _blank_preset(
     suggested_chips: Any = None,
     model_override: str = "",
 ) -> dict[str, Any]:
-    prompt = (system_prompt or "").strip() or DEFAULT_SYSTEM_PROMPT
-    style = (reply_style or "").strip()
+    prompt_list, order = _migrate_flat_to_prompts(
+        system_prompt or "",
+        reply_style or "",
+        prompts,
+        prompt_order,
+    )
+    main, style = _flat_mirrors_from_prompts(prompt_list)
     return {
         "id": preset_id,
         "name": (name or "").strip() or "安崽真人对话",
-        "system_prompt": prompt,
+        "system_prompt": main,
         "reply_style": style,
+        "prompts": prompt_list,
+        "prompt_order": order,
         "temperature": _clamp_float(temperature, 1.0, 0.0, 2.0),
         "top_p": _clamp_float(top_p, 1.0, 0.0, 1.0),
         "frequency_penalty": _clamp_float(frequency_penalty, 0.0, -2.0, 2.0),
@@ -100,6 +260,38 @@ def _blank_preset(
     }
 
 
+def _wrap_block(entry: dict[str, Any], body: str) -> str:
+    wrap = str(entry.get("wrap") or "").strip()
+    text = (body or "").strip()
+    if not text:
+        return ""
+    if wrap:
+        return f"【{wrap}】{text}"
+    return text
+
+
+def _order_enabled(preset: dict[str, Any]) -> list[tuple[str, bool]]:
+    order = preset.get("prompt_order") or DEFAULT_PROMPT_ORDER
+    out: list[tuple[str, bool]] = []
+    for item in order:
+        if isinstance(item, dict):
+            ident = str(item.get("identifier") or "").strip()
+            if ident:
+                out.append((ident, bool(item.get("enabled", True))))
+    return out or [(str(o["identifier"]), True) for o in DEFAULT_PROMPT_ORDER]
+
+
+def _prompt_map(preset: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    m: dict[str, dict[str, Any]] = {}
+    for p in preset.get("prompts") or []:
+        if isinstance(p, dict) and p.get("identifier"):
+            m[str(p["identifier"])] = p
+    # Fill missing builtins
+    for bp in BUILTIN_PROMPTS:
+        m.setdefault(str(bp["identifier"]), dict(bp))
+    return m
+
+
 def compose_system_prompt(
     preset: dict[str, Any],
     *,
@@ -107,37 +299,93 @@ def compose_system_prompt(
     identity_label: str = "",
     include_analyst_skill: bool = False,
 ) -> str:
-    """薄人设 + 关系；分析师 Skill / 场景禁令不在这里堆，由 agent_scene 按轮注入。"""
+    """Assemble system stack from prompts + prompt_order (BrewStory-lite)."""
     from app.services import agent_analyst_skill as skill_svc
     from app.services import identity as identity_svc
 
-    main = str(preset.get("system_prompt") or DEFAULT_SYSTEM_PROMPT).strip()
-    style = str(preset.get("reply_style") or "").strip()
-    parts = [main]
-    if style:
-        parts.append(f"【口吻】{style}")
-    relation = identity_svc.relation_prompt_block(identity_role, identity_label)
-    if relation:
-        parts.append(relation)
-    else:
-        parts.append(
-            "【关系】用户尚未选择身份。用中性口语助手语气；可提醒对方在 App 里设置「你是安崽的谁」。"
+    # Ensure stack exists even on partially migrated dicts
+    if not preset.get("prompts"):
+        preset = _blank_preset(
+            preset_id=str(preset.get("id") or SINGLE_PRESET_ID),
+            name=str(preset.get("name") or "安崽真人对话"),
+            system_prompt=str(preset.get("system_prompt") or ""),
+            reply_style=str(preset.get("reply_style") or ""),
+            temperature=preset.get("temperature", 1.0),
+            top_p=preset.get("top_p", 1.0),
+            frequency_penalty=preset.get("frequency_penalty", 0.0),
+            presence_penalty=preset.get("presence_penalty", 0.0),
+            max_tokens=preset.get("max_tokens", 2048),
+            history_messages=preset.get("history_messages", 32),
+            suggested_chips=preset.get("suggested_chips"),
+            model_override=str(preset.get("model_override") or ""),
         )
-    if include_analyst_skill:
-        parts.append(skill_svc.analyst_skill_block())
-    parts.append(
-        "【数据纪律】精确数字只引用【本轮实时查询】/工具/本轮附带的仓库或分析；"
-        "没有的就说没有，禁止编造。"
-        "「今天」以【日历】或行情时间标签为准；标了非今日的是昨收，必须说清。"
-    )
-    parts.append(
-        "【表达】心里专业、嘴上白话。禁研报体。"
-        "禁止用一对星号做 Markdown 加粗（尤其包数字）；"
-        "禁止小标题/项目符号/编号操作清单；"
-        "数字写进口语句子，有判断、有依据，但不念术语清单；"
-        "没在工具结果里出现的宏观指标不许编。"
-    )
+
+    pmap = _prompt_map(preset)
+    parts: list[str] = []
+
+    for ident, enabled in _order_enabled(preset):
+        if not enabled:
+            continue
+        entry = pmap.get(ident)
+        if entry is None:
+            continue
+        if not bool(entry.get("enabled", True)):
+            continue
+
+        if ident == PROMPT_RELATION:
+            relation = identity_svc.relation_prompt_block(identity_role, identity_label)
+            if relation:
+                parts.append(relation)
+            else:
+                parts.append(
+                    "【关系】用户尚未选择身份。用中性口语助手语气；"
+                    "可提醒对方在 App 里设置「你是安崽的谁」。"
+                )
+            continue
+
+        if ident == PROMPT_ANALYST_SKILL:
+            if include_analyst_skill:
+                parts.append(skill_svc.analyst_skill_block())
+            continue
+
+        if entry.get("marker"):
+            continue
+
+        block = _wrap_block(entry, str(entry.get("content") or ""))
+        if block:
+            parts.append(block)
+
+    if not parts:
+        # Absolute fallback
+        parts.append(DEFAULT_SYSTEM_PROMPT)
     return "\n\n".join(parts)
+
+
+def list_editable_prompt_rows(preset: dict[str, Any]) -> list[dict[str, Any]]:
+    """Admin UI rows: order + editable content (markers shown read-only)."""
+    pmap = _prompt_map(preset)
+    rows: list[dict[str, Any]] = []
+    for ident, enabled in _order_enabled(preset):
+        entry = pmap.get(ident) or {}
+        rows.append(
+            {
+                "identifier": ident,
+                "name": str(entry.get("name") or ident),
+                "enabled": enabled and bool(entry.get("enabled", True)),
+                "marker": bool(entry.get("marker")) or ident in MARKER_IDS,
+                "content": "" if ident in MARKER_IDS else str(entry.get("content") or ""),
+                "wrap": str(entry.get("wrap") or ""),
+                "hint": {
+                    PROMPT_RELATION: "运行时按 PWA「你是安崽的谁」注入，此处不可编辑正文。",
+                    PROMPT_ANALYST_SKILL: "仅个股/仓位/分析等场景注入，正文来自分析师 Skill 模块。",
+                    PROMPT_MAIN: "核心人设；对应旧字段 system_prompt。",
+                    PROMPT_REPLY_STYLE: "口吻短句；对应旧字段 reply_style。",
+                    PROMPT_DATA_DISCIPLINE: "数字只能引用本轮工具/预取。",
+                    PROMPT_EXPRESSION: "排版与口语表达硬约束。",
+                }.get(ident, ""),
+            }
+        )
+    return rows
 
 
 def _normalize_preset(raw: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -148,6 +396,8 @@ def _normalize_preset(raw: dict[str, Any] | None) -> dict[str, Any] | None:
         name=str(raw.get("name") or "安崽真人对话"),
         system_prompt=str(raw.get("system_prompt") or ""),
         reply_style=str(raw.get("reply_style") or ""),
+        prompts=raw.get("prompts"),
+        prompt_order=raw.get("prompt_order"),
         temperature=raw.get("temperature", 0.75),
         top_p=raw.get("top_p", 0.95),
         frequency_penalty=raw.get("frequency_penalty", 0.0),
@@ -208,6 +458,13 @@ def save_presets(store: dict[str, Any]) -> Path:
     return PRESETS_PATH
 
 
+def _main_prompt_text(preset: dict[str, Any]) -> str:
+    for p in preset.get("prompts") or []:
+        if isinstance(p, dict) and p.get("identifier") == PROMPT_MAIN:
+            return str(p.get("content") or "")
+    return str(preset.get("system_prompt") or "")
+
+
 def load_presets() -> dict[str, Any]:
     """Load single preset; refresh builtin shell if file missing / empty."""
     data: dict[str, Any] | None = None
@@ -231,7 +488,7 @@ def load_presets() -> dict[str, Any]:
             chosen = builtin
         else:
             # Ensure core contract text present; if old stub, refresh shell from builtin
-            prompt = str(chosen.get("system_prompt") or "")
+            prompt = _main_prompt_text(chosen)
             stale = (
                 "本轮场景" not in prompt
                 or "倾向性建议" not in prompt
@@ -253,14 +510,22 @@ def load_presets() -> dict[str, Any]:
                 chosen = builtin
                 if kept_name and kept_name not in ("对话安崽", "真人对话·默认", "安崽真人对话"):
                     chosen["name"] = kept_name
-            elif "禁止固定" not in str(chosen.get("reply_style") or ""):
-                chosen["frequency_penalty"] = builtin["frequency_penalty"]
-                chosen["presence_penalty"] = builtin["presence_penalty"]
-                chosen["temperature"] = builtin["temperature"]
-                chosen["max_tokens"] = builtin["max_tokens"]
-                chosen["reply_style"] = builtin["reply_style"]
-                chosen["suggested_chips"] = builtin["suggested_chips"]
-                chosen["system_prompt"] = builtin["system_prompt"]
+            elif not chosen.get("prompts"):
+                # Flat file → stack (content already in system_prompt / reply_style)
+                chosen = _normalize_preset(chosen)
+            # If file had flat-only, ensure prompts written next save
+            if not any(
+                isinstance(p, dict) and p.get("identifier") == PROMPT_DATA_DISCIPLINE
+                for p in (chosen.get("prompts") or [])
+            ):
+                # Merge sampling from file but ensure stack completeness via normalize
+                chosen = _normalize_preset(
+                    {
+                        **chosen,
+                        "prompts": chosen.get("prompts") or builtin["prompts"],
+                        "prompt_order": chosen.get("prompt_order") or builtin["prompt_order"],
+                    }
+                )
         store = {"activePresetId": SINGLE_PRESET_ID, "presets": [chosen]}
     else:
         store = {"activePresetId": SINGLE_PRESET_ID, "presets": [_builtin_preset()]}
@@ -306,6 +571,10 @@ def update_preset(preset_id: str, fields: dict[str, Any]) -> dict[str, Any]:
         reply_style=str(
             fields.get("reply_style") if "reply_style" in fields else cur.get("reply_style") or ""
         ),
+        prompts=fields.get("prompts") if "prompts" in fields else cur.get("prompts"),
+        prompt_order=fields.get("prompt_order")
+        if "prompt_order" in fields
+        else cur.get("prompt_order"),
         temperature=fields.get("temperature", cur["temperature"]),
         top_p=fields.get("top_p", cur.get("top_p", 0.95)),
         frequency_penalty=fields.get("frequency_penalty", cur.get("frequency_penalty", 0.0)),
@@ -333,10 +602,64 @@ def delete_preset(preset_id: str) -> dict[str, Any]:
 
 
 def parse_preset_form(form: dict[str, str]) -> dict[str, Any]:
+    """Parse admin form — supports prompt_<id> / prompt_enabled_<id> stack fields."""
+    builtin = _builtin_preset()
+    prompts: list[dict[str, Any]] = []
+    order: list[dict[str, Any]] = []
+
+    # Prefer explicit order from form keys matching builtin order
+    for o in builtin.get("prompt_order") or DEFAULT_PROMPT_ORDER:
+        ident = str(o["identifier"])
+        enabled_key = f"prompt_enabled_{ident}"
+        content_key = f"prompt_{ident}"
+        # Checkbox: missing => disabled when any prompt_* field present
+        has_stack_fields = any(k.startswith("prompt_") for k in form)
+        if has_stack_fields:
+            enabled = enabled_key in form and str(form.get(enabled_key) or "") not in {
+                "",
+                "0",
+                "false",
+                "off",
+            }
+        else:
+            enabled = bool(o.get("enabled", True))
+
+        entry = next(
+            (dict(p) for p in (builtin.get("prompts") or []) if p.get("identifier") == ident),
+            {
+                "identifier": ident,
+                "name": ident,
+                "role": "system",
+                "marker": ident in MARKER_IDS,
+                "enabled": enabled,
+                "injection_position": 0,
+                "content": "",
+            },
+        )
+        entry["enabled"] = enabled
+        if ident not in MARKER_IDS and content_key in form:
+            entry["content"] = str(form.get(content_key) or "")
+            entry["marker"] = False
+        prompts.append(entry)
+        order.append({"identifier": ident, "enabled": enabled})
+
+    main = next((p for p in prompts if p.get("identifier") == PROMPT_MAIN), None)
+    style = next((p for p in prompts if p.get("identifier") == PROMPT_REPLY_STYLE), None)
+
+    # Legacy flat fields (if stack not submitted)
+    system_prompt = form.get("system_prompt")
+    reply_style = form.get("reply_style")
+    if system_prompt is not None and main is not None and f"prompt_{PROMPT_MAIN}" not in form:
+        main["content"] = system_prompt
+    if reply_style is not None and style is not None and f"prompt_{PROMPT_REPLY_STYLE}" not in form:
+        style["content"] = reply_style
+
     return {
         "name": form.get("name") or "",
-        "system_prompt": form.get("system_prompt") or "",
-        "reply_style": form.get("reply_style") or "",
+        "system_prompt": (main or {}).get("content") or form.get("system_prompt") or "",
+        "reply_style": (style or {}).get("content") or form.get("reply_style") or "",
+        "prompts": prompts,
+        "prompt_order": order,
         "temperature": form.get("temperature") or "1",
         "top_p": form.get("top_p") or "1",
         "frequency_penalty": form.get("frequency_penalty") or "0",

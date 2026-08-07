@@ -4,6 +4,13 @@ from sqlalchemy.orm import Session
 from app.core.auth import AuthUser, require_user
 from app.database import get_db
 from app.models import WatchlistItem
+from app.providers.fund import (
+    fetch_etf_daily_history,
+    fetch_otc_nav_batch,
+    fetch_otc_nav_history,
+    get_fund_board,
+    search_funds,
+)
 from app.providers.gold import get_gold_board, list_gold_etfs
 from app.providers.intraday import get_intraday
 from app.providers.leaders import get_leaders
@@ -20,6 +27,13 @@ from app.providers.depth_flow import get_depth_flow
 from app.schemas import (
     DepthFlowOut,
     BookLevelOut,
+    FundBoardGroupOut,
+    FundBoardItemOut,
+    FundBoardOut,
+    FundBoardSectionOut,
+    FundNavHistoryOut,
+    FundSearchHitOut,
+    FundSearchOut,
     GoldBoardItemOut,
     GoldBoardOut,
     GoldBoardSectionOut,
@@ -223,6 +237,139 @@ def gold_board() -> GoldBoardOut:
     )
 
 
+def _fund_item_out(it) -> FundBoardItemOut:
+    return FundBoardItemOut(
+        id=it.id,
+        name=it.name,
+        section=it.section,
+        price=it.price,
+        change_pct=it.change_pct,
+        prev=it.prev,
+        unit=it.unit,
+        freshness=it.freshness,
+        note=it.note,
+        holdable=it.holdable,
+        symbol=it.symbol,
+        market=it.market,
+        kind=it.kind,
+        chart=it.chart,
+        chart_times=it.chart_times,
+        chart_slots=it.chart_slots,
+        chart_session=it.chart_session,
+    )
+
+
+@router.get("/fund-board", response_model=FundBoardOut)
+def fund_board() -> FundBoardOut:
+    """Fund board: 场内 ETF (live) + 场外开放式 (daily NAV only)."""
+    board = get_fund_board()
+    return FundBoardOut(
+        note=board.note,
+        sections=[
+            FundBoardSectionOut(
+                id=sec.id,
+                title=sec.title,
+                subtitle=sec.subtitle,
+                items=[_fund_item_out(it) for it in sec.items],
+                groups=[
+                    FundBoardGroupOut(
+                        id=g.id,
+                        title=g.title,
+                        items=[_fund_item_out(it) for it in g.items],
+                    )
+                    for g in sec.groups
+                ],
+            )
+            for sec in board.sections
+        ],
+    )
+
+
+@router.get("/fund-search", response_model=FundSearchOut)
+def fund_search(
+    q: str = Query(..., min_length=1, max_length=40),
+    limit: int = Query(default=20, ge=1, le=30),
+) -> FundSearchOut:
+    """Search listed ETFs + OTC / open-end funds by code or name."""
+    hits = search_funds(q, limit=limit)
+    return FundSearchOut(
+        query=q.strip(),
+        items=[
+            FundSearchHitOut(
+                symbol=h.symbol,
+                name=h.name,
+                market=h.market,
+                kind=h.kind,
+                price=h.price,
+                change_pct=h.change_pct,
+                as_of=h.as_of,
+                fund_type=h.fund_type,
+            )
+            for h in hits
+        ],
+    )
+
+
+@router.get("/fund-nav/{code}", response_model=FundNavHistoryOut)
+def fund_nav_history(
+    code: str,
+    days: int = Query(default=30, ge=5, le=90),
+    market: str = Query(default="OF"),
+) -> FundNavHistoryOut:
+    """Daily series for fund hero spark: OTC NAV or ETF daily close."""
+    sym = (code or "").strip()
+    mkt = (market or "OF").strip().upper() or "OF"
+
+    if mkt != "OF":
+        name, points_raw = fetch_etf_daily_history(sym, mkt, days=days)
+        close = points_raw[-1][1] if points_raw else None
+        as_of = points_raw[-1][0] if points_raw else ""
+        prev = points_raw[-2][1] if len(points_raw) >= 2 else None
+        chg = None
+        if close is not None and prev and prev > 0:
+            chg = round((close / prev - 1.0) * 100.0, 2)
+        return FundNavHistoryOut(
+            symbol=sym,
+            name=name or sym,
+            as_of=as_of,
+            nav=close,
+            change_pct=chg,
+            points=[
+                IntradayPointOut(time=(d[5:] if len(d) >= 10 else d), price=p)
+                for d, p in points_raw
+            ],
+        )
+
+    points_raw = fetch_otc_nav_history(sym, days=days)
+    nav = points_raw[-1][1] if points_raw else None
+    as_of = points_raw[-1][0] if points_raw else ""
+    prev = points_raw[-2][1] if len(points_raw) >= 2 else None
+    chg = None
+    if nav is not None and prev and prev > 0:
+        chg = round((nav / prev - 1.0) * 100.0, 2)
+    name = sym
+    batch = fetch_otc_nav_batch([sym])
+    if sym in batch:
+        name = str(batch[sym].get("name") or sym)
+        if batch[sym].get("as_of"):
+            as_of = str(batch[sym]["as_of"])
+        if isinstance(batch[sym].get("nav"), (int, float)):
+            nav = float(batch[sym]["nav"])  # type: ignore[arg-type]
+        if isinstance(batch[sym].get("change_pct"), (int, float)):
+            chg = float(batch[sym]["change_pct"])  # type: ignore[arg-type]
+    return FundNavHistoryOut(
+        symbol=sym,
+        name=name,
+        as_of=as_of,
+        nav=nav,
+        change_pct=chg,
+        points=[
+            IntradayPointOut(time=(d[5:] if len(d) >= 10 else d), price=p)
+            for d, p in points_raw
+        ],
+    )
+
+
 @router.get("/session", response_model=SessionOut)
 def market_session(key: str = Query(default="sh-composite")) -> SessionOut:
     """Trading session strip for the selected index tab."""
@@ -316,6 +463,8 @@ def short_bias(
                 sample_n=b.sample_n,
                 roc_pct=b.roc_pct,
                 as_of=b.as_of,
+                detail=getattr(b, "detail", None),
+                summary=getattr(b, "summary", None),
             )
             for b in items
         ]
@@ -412,6 +561,7 @@ def search(
                 kind=h.kind,
                 price=h.price,
                 change_pct=h.change_pct,
+                note=h.note,
             )
             for h in hits
         ],

@@ -358,18 +358,20 @@ flowchart TB
   Main --> Toast
 ```
 
-| 能力 | 状态（2026-08-05） |
+| 能力 | 状态（2026-08-07） |
 |---|---|
-| Meta / viewport-fit / standalone | 已落地；安装引导（`navigator.standalone`） |
-| iOS 启动图 | `apple-touch-startup-image` 多机型 + 180 icon |
-| 预览外框 vs 真机壳 | `useAppViewport`；真机关假刘海 |
-| Tab | flex 贴底 + safe 四向；View Transition 渐进 |
+| Meta / viewport-fit / standalone | 已落地；安装引导（iOS + `beforeinstallprompt`）+ 设置内常驻入口 |
+| iOS 启动图 | `apple-touch-startup-image` 多机型 + 180 icon；manifest 暗色 `theme_color` |
+| 预览外框 vs 真机壳 | 宽屏改为居中限宽 App 列（无假刘海/手机框）；真机 `nativeShell` |
+| Tab | flex 贴底 + safe；子页 Push 时隐藏 TabBar（`ShellChrome`） |
 | safe-area | `calc(间距+env)` + 34px floor + 左右 inset |
 | 视口/键盘 | visualViewport、`focus` scroll-reset、blur heal |
 | 弹窗 | CenterModal / ActionSheet / Toast |
 | Tab 保活 | `TabCache` |
+| 子页 Push / 边缘返回 | `useShellStack` + `ShellLayer`（安崽设置/历史、新闻阅读） |
+| 离线壳 | `public/sw.js` 预缓存壳；API network-first；`OfflineBanner` |
 
-关键代码：`AppleSplashLinks`、`useAppViewport`、`AppShell`、`TabBar`、`TabCache`、`globals.css`、`overlay/*`。
+关键代码：`AppleSplashLinks`、`useAppViewport`、`AppShell`、`TabBar`、`TabCache`、`ShellStack`、`InstallPrompt`、`sw.js`、`globals.css`、`overlay/*`。
 
 ---
 
@@ -385,6 +387,8 @@ flowchart TB
 - [ ] 添加持仓 Modal + 键盘正常  
 - [ ] 删除 Action Sheet 正常  
 - [ ] Toast / 安装条不挡关键操作  
+- [ ] 子页 Push + 边缘返回 / 系统返回  
+- [ ] 无网可打开壳（SW）  
 - [ ] 改 meta 异常时：删图标重装  
 
 ---
@@ -394,7 +398,7 @@ flowchart TB
 | 优先级 | 项 |
 |---|---|
 | P0 | 真机跑通验收清单 |
-| P1 | 子页 Push / 边缘返回 |
+| ~~P1~~ | ~~子页 Push / 边缘返回~~ → 已落地（可继续扩到更多子页） |
 | P2 | Tab 横向 scroll-snap |
 
 ---

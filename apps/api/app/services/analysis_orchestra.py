@@ -1,4 +1,4 @@
-"""Analysis committee: trend ∥ news → risk(det) → dialectic×N → judge."""
+"""Analysis committee: trend ∥ news ∥ flow → risk(det) → dialectic×N → judge."""
 
 from __future__ import annotations
 
@@ -82,9 +82,11 @@ def holding_fact_bits(q: dict[str, Any]) -> list[str]:
 
 def holding_fact_line(q: dict[str, Any], *, with_name: bool = True) -> str:
     name = str(q.get("name") or q.get("symbol") or "").strip()
+    kind = str(q.get("asset_kind") or "").strip()
     body = " · ".join(holding_fact_bits(q))
     if with_name and name:
-        return f"{name}：{body}"
+        prefix = f"{name}[{kind}]" if kind else name
+        return f"{prefix}：{body}"
     return body
 
 
@@ -100,7 +102,12 @@ def build_holding_lines(snapshot: dict[str, Any], *, limit: int = 6) -> list[str
         key=lambda x: float(x.get("weight") or 0),
         reverse=True,
     )
-    return [holding_fact_line(q) for q in ranked[:limit]]
+    # 仓库巡检：尽量覆盖全部持仓（股票/基金/黄金）
+    if str(snapshot.get("scope") or "") == "portfolio":
+        cap = max(limit, len(ranked))
+    else:
+        cap = limit
+    return [holding_fact_line(q) for q in ranked[:cap]]
 
 
 _CLOUDY_VERDICT = (
@@ -312,6 +319,24 @@ def _news_age_label(published_at: Any) -> str:
     return news_age_label(published_at)
 
 
+def build_flow_seat_memo(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    """If no usable 资金 evidence, return deterministic 数据不足 memo (skip LLM)."""
+    rows = list(snapshot.get("depth_flow") or [])
+    usable = [r for r in rows if r.get("main_net") is not None or r.get("flow_label")]
+    if usable and any(r.get("main_net") is not None for r in usable):
+        return None
+    return {
+        "id": "flow",
+        "label": AGENT_LABELS.get("flow", "资金情绪"),
+        "status": "done",
+        "summary": "本轮无可用资金流向，勿编造主力进出",
+        "stance": "数据不足",
+        "confidence": 0.35,
+        "bullets": ["盘口资金暂缺或未覆盖头部持仓"],
+        "weight": None,
+    }
+
+
 def format_evidence_text(snapshot: dict[str, Any]) -> str:
     """Compact Chinese brief for all seats (frozen numbers only)."""
     lines: list[str] = []
@@ -387,6 +412,7 @@ def format_evidence_text(snapshot: dict[str, Any]) -> str:
         chg_s = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else "—"
         bit = (
             f"{q.get('name') or q.get('symbol')}({q.get('symbol')}) "
+            f"[{q.get('asset_kind') or '标的'}] "
             f"现价 {q.get('price')}"
         )
         if q.get("prev_close") is not None:
@@ -463,16 +489,55 @@ def format_evidence_text(snapshot: dict[str, Any]) -> str:
 
     news = snapshot.get("news") or []
     if news:
-        lines.append(f"新闻 {len(news)} 条：")
-        for n in news[:12]:
+        lines.append(
+            f"新闻 {len(news)} 条（已按持仓/主题相关性筛选，非全网原文；"
+            "无高相关时可判数据不足，禁止编造）："
+        )
+        for n in news[:14]:
             syms = n.get("symbols") or []
-            sym_s = ",".join(str(s) for s in syms[:4]) if syms else "未标注"
+            board = str(n.get("board") or "")
+            region = str(n.get("region") or "cn")
+            if board == "headline" and not syms:
+                sym_s = "要闻"
+            elif board == "world" or region == "world":
+                sym_s = "国际"
+            elif syms:
+                sym_s = ",".join(str(s) for s in syms[:4])
+            else:
+                sym_s = "未标注"
             age = _news_age_label(n.get("published_at"))
+            src = str(n.get("source") or "").strip()
+            src_bit = f"｜{src}" if src else ""
+            rel = n.get("relevance")
+            rel_bit = ""
+            if isinstance(rel, (int, float)):
+                why = str(n.get("relevance_why") or "").strip()
+                rel_bit = f"｜相关度{rel:.2f}"
+                if why:
+                    rel_bit += f"({why})"
             lines.append(
-                f"- [{age}] 关联标的:{sym_s}｜{n.get('title') or ''}｜{(n.get('summary') or '')[:100]}"
+                f"- [{age}] 关联:{sym_s}{src_bit}{rel_bit}｜{n.get('title') or ''}｜{(n.get('summary') or '')[:100]}"
             )
     else:
         lines.append("新闻：暂无（新闻席应数据不足）。")
+
+    knowledge = snapshot.get("knowledge") or []
+    if knowledge:
+        backend = str(knowledge[0].get("backend") or "经验库")
+        lines.append(
+            f"【经验库·非实时 · {backend}】方法论/纪律参考，不是行情也不是新闻；"
+            "先讲本轮证据数字，经验只嵌一两句框架；勿把库内叙述当今日点位。"
+        )
+        for i, k in enumerate(knowledge[:6], 1):
+            tags = "、".join(str(t) for t in (k.get("tags") or [])[:4]) or "—"
+            age = k.get("date") or "日期未知"
+            lines.append(
+                f"- {i}. {k.get('title') or ''}（{k.get('source') or '经验库'} · {age} · "
+                f"{k.get('channel') or ''} · 相关度 {k.get('score')}）"
+                f" 标签:{tags} — {(k.get('body') or '')[:180]}"
+            )
+    else:
+        lines.append("经验库：本轮未命中（勿编造经验条目）。")
 
     return "\n".join(lines)
 
@@ -570,14 +635,30 @@ def run_committee(
     )
     emit({"type": "agent_done", "agent": news_memo})
 
+    # 资金情绪席：默认开；无证据时确定性「数据不足」，有证据走 LLM
+    flow_memo: dict[str, Any] | None = None
+    tier_agents = list(get_tier(degree).get("agents") or [])
+    if "flow" in tier_agents:
+        emit({"type": "agent_start", "id": "flow", "label": AGENT_LABELS["flow"], "pct": 57})
+        emit_progress(57, f"{AGENT_LABELS['flow']}…", stage="flow")
+        flow_memo = build_flow_seat_memo(snapshot)
+        if flow_memo is None:
+            flow_memo = _run_seat(
+                "flow",
+                prompts.FLOW_SYSTEM,
+                prompts.evidence_user_block(evidence, scope=scope),
+            )
+        emit({"type": "agent_done", "agent": flow_memo})
+
     agents: list[dict[str, Any]] = [trend_memo, news_memo]
+    if flow_memo:
+        agents.append(flow_memo)
     debate: list[dict[str, Any]] = []
     dialectic_memo: dict[str, Any] | None = None
     emit_progress(58, "专家席完成", stage="experts_done")
 
     # 结构风险席：确定性；由档位 agents 勾选控制（标准/深度默认开）
     risk_memo: dict[str, Any] | None = None
-    tier_agents = list(get_tier(degree).get("agents") or [])
     if "risk" in tier_agents:
         emit({"type": "agent_start", "id": "risk", "label": AGENT_LABELS["risk"], "pct": 59})
         emit_progress(59, f"{AGENT_LABELS['risk']}…", stage="risk")
@@ -610,6 +691,12 @@ def run_committee(
             memos_block = (
                 f"【走势席】{json.dumps(_pub(trend_memo), ensure_ascii=False)}\n"
                 f"【新闻席】{json.dumps(_pub(news_memo), ensure_ascii=False)}\n"
+            )
+            if flow_memo:
+                memos_block += f"【资金情绪席】{json.dumps(_pub(flow_memo), ensure_ascii=False)}\n"
+            if risk_memo:
+                memos_block += f"【结构风险席】{json.dumps(_pub(risk_memo), ensure_ascii=False)}\n"
+            memos_block += (
                 f"【辩证回合】第 {i}/{n_dial} 回合\n"
                 f"{prev_extra}"
             )
@@ -665,6 +752,8 @@ def run_committee(
         f"【新闻席】{json.dumps(public_memo(news_memo), ensure_ascii=False)}\n"
         f"【结构事实】{json.dumps(structure, ensure_ascii=False)}\n"
     )
+    if flow_memo:
+        judge_extra += f"【资金情绪席】{json.dumps(public_memo(flow_memo), ensure_ascii=False)}\n"
     if risk_memo:
         judge_extra += f"【结构风险席】{json.dumps(public_memo(risk_memo), ensure_ascii=False)}\n"
     if debate:
@@ -821,7 +910,11 @@ def _assemble_report(
             data.get("confidence"), float(judge.get("confidence") or 0.5)
         )
     # Calibrate confidence from seat health + evidence thinness
-    failed_seats = sum(1 for a in agents if a.get("id") in {"trend", "news"} and a.get("status") == "failed")
+    failed_seats = sum(
+        1
+        for a in agents
+        if a.get("id") in {"trend", "news", "flow"} and a.get("status") == "failed"
+    )
     thin_news = not (snapshot.get("news") or [])
     structure = snapshot.get("structure") if isinstance(snapshot.get("structure"), dict) else {}
     fresh_share = float(structure.get("fresh_share") or 1.0)
@@ -894,7 +987,7 @@ def _assemble_report(
     }
     items: list[dict[str, Any]] = []
     raw_items = data.get("items") if isinstance(data.get("items"), list) else []
-    for it in raw_items[:8]:
+    for it in raw_items[:32]:
         if not isinstance(it, dict):
             continue
         sym = str(it.get("symbol") or "").strip()
@@ -934,7 +1027,8 @@ def _assemble_report(
             key=lambda x: float(x.get("weight") or 0),
             reverse=True,
         )
-        for q in ranked[:8]:
+        item_cap = len(ranked) if str(snapshot.get("scope") or "") == "portfolio" else 8
+        for q in ranked[:item_cap]:
             name = str(q.get("name") or q.get("symbol") or "")
             items.append(
                 {
@@ -956,13 +1050,28 @@ def _assemble_report(
 
     watch_refs = [_watch_evidence_ref(w, snapshot) for w in watch]
 
+    judge_failed = judge.get("status") == "failed"
     for a in agents:
         if a.get("id") == "judge":
             a["summary"] = verdict
             a["stance"] = stance
             a["confidence"] = confidence
             a["bullets"] = highlights
-            a["status"] = "done"
+            a["status"] = "failed" if judge_failed else "done"
+
+    failed_labels = [
+        str(a.get("label") or a.get("id") or "席位")
+        for a in agents
+        if a.get("status") == "failed"
+    ]
+    degraded = bool(failed_labels) or failed_seats > 0
+    quality_note = ""
+    if judge_failed:
+        quality_note = "首席汇总失败，结论可信度低，建议稍后重跑。"
+    elif failed_seats >= 2:
+        quality_note = f"{'、'.join(failed_labels[:3])}未谈成，以下为降级结论。"
+    elif failed_seats == 1:
+        quality_note = f"{failed_labels[0]}未谈成，其余席位仍供参考。"
 
     return {
         "verdict": verdict,
@@ -993,6 +1102,9 @@ def _assemble_report(
         ],
         "debate": debate,
         "template": False,
+        "degraded": degraded,
+        "failed_seats": failed_labels,
+        "quality_note": quality_note,
     }
 
 

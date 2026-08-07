@@ -280,6 +280,24 @@ def _maybe_rebuild_news_interests(engine: Engine) -> None:
         )
 
 
+def ensure_agent_conversation_memory_columns(engine: Engine) -> None:
+    """Add rolling-summary columns on agent_conversations when missing."""
+    cols = _table_columns(engine, "agent_conversations")
+    if not cols:
+        return
+    with engine.begin() as conn:
+        if "memory_summary" not in cols:
+            logger.info("migrate: adding memory_summary to agent_conversations")
+            conn.execute(text("ALTER TABLE agent_conversations ADD COLUMN memory_summary TEXT"))
+        if "memory_until_message_id" not in cols:
+            logger.info("migrate: adding memory_until_message_id to agent_conversations")
+            conn.execute(
+                text(
+                    "ALTER TABLE agent_conversations ADD COLUMN memory_until_message_id INTEGER"
+                )
+            )
+
+
 def ensure_agent_conversation_schema(engine: Engine) -> None:
     """Add conversation_id on messages; backfill one open thread per user with orphans."""
     msg_cols = _table_columns(engine, "agent_messages")
@@ -311,7 +329,9 @@ def ensure_agent_conversation_schema(engine: Engine) -> None:
                         status VARCHAR(16) DEFAULT 'open',
                         created_at DATETIME,
                         updated_at DATETIME,
-                        closed_at DATETIME
+                        closed_at DATETIME,
+                        memory_summary TEXT,
+                        memory_until_message_id INTEGER
                     )
                     """
                 )

@@ -8,6 +8,9 @@ import type {
   HoldingUpdate,
   IndexQuote,
   IntradaySeries,
+  FundBoard,
+  FundNavHistory,
+  FundSearchResult,
   GoldBoard,
   GoldEtf,
   LeadersBoard,
@@ -15,6 +18,7 @@ import type {
   MarketSession,
   NewsFeed,
   NewsBoard,
+  NewsMacroPulse,
   NewsInterest,
   NewsArticle,
   AnzaiIdentity,
@@ -78,6 +82,75 @@ async function request<T>(
     return undefined as T;
   }
   return res.json() as Promise<T>;
+}
+
+export type AnalysisStreamEvent = {
+  type: string;
+  label?: string;
+  pct?: number;
+  stage?: string;
+  message?: string;
+  status?: string;
+  job_id?: number;
+  job?: AnalysisJob;
+  report?: AnalysisJob["report"];
+  agent?: import("@/lib/types").AnalysisAgentStep;
+  [k: string]: unknown;
+};
+
+export type AnalysisStreamEventHandler = (ev: AnalysisStreamEvent) => void;
+
+async function _consumeAnalysisSse(
+  res: Response,
+  onEvent: AnalysisStreamEventHandler,
+): Promise<void> {
+  if (res.status === 401 && typeof window !== "undefined") {
+    clearSession();
+    if (!window.location.pathname.startsWith("/login")) {
+      window.location.assign("/login");
+    }
+    throw new Error("未登录");
+  }
+  if (!res.ok || !res.body) {
+    const text = await res.text();
+    let message = text || `Request failed: ${res.status}`;
+    try {
+      const j = JSON.parse(text) as { detail?: string; message?: string };
+      message = j.message || j.detail || message;
+    } catch {
+      /* plain */
+    }
+    onEvent({ type: "error", message });
+    onEvent({ type: "done", status: "failed" });
+    return;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  const flushLine = (line: string) => {
+    const trimmed = line.trimEnd();
+    if (!trimmed || trimmed.startsWith(":")) return;
+    if (!trimmed.startsWith("data:")) return;
+    const raw = trimmed.slice(5).trim();
+    if (!raw || raw === "[DONE]") {
+      if (raw === "[DONE]") onEvent({ type: "done" });
+      return;
+    }
+    try {
+      onEvent(JSON.parse(raw) as AnalysisStreamEvent);
+    } catch {
+      /* ignore partial / malformed */
+    }
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const parts = buf.split(/\r?\n/);
+    buf = parts.pop() || "";
+    for (const line of parts) flushLine(line);
+  }
+  if (buf.trim()) flushLine(buf);
 }
 
 /** Domain API client — all backend calls go through here. */
@@ -145,6 +218,15 @@ export const api = {
     request<MacroTopic>(`/api/market/macro?topic=${encodeURIComponent(topic)}`),
   getGoldEtfs: () => request<GoldEtf[]>("/api/market/gold-etfs"),
   getGoldBoard: () => request<GoldBoard>("/api/market/gold-board"),
+  getFundBoard: () => request<FundBoard>("/api/market/fund-board"),
+  searchFunds: (q: string, limit = 20) =>
+    request<FundSearchResult>(
+      `/api/market/fund-search?q=${encodeURIComponent(q)}&limit=${limit}`,
+    ),
+  getFundNavHistory: (code: string, days = 30, market = "OF") =>
+    request<FundNavHistory>(
+      `/api/market/fund-nav/${encodeURIComponent(code)}?days=${days}&market=${encodeURIComponent(market)}`,
+    ),
   getSession: (key = "sh-composite") =>
     request<MarketSession>(`/api/market/session?key=${encodeURIComponent(key)}`),
   getIntraday: (key = "sh-composite") =>
@@ -178,6 +260,7 @@ export const api = {
       `/api/news/market?limit=${limit}&board=${encodeURIComponent(board)}`,
     ),
   getNewsBoards: () => request<{ items: NewsBoard[] }>("/api/news/boards"),
+  getNewsMacroPulse: () => request<NewsMacroPulse>("/api/news/macro-pulse"),
   getHoldingsNews: (limit = 100) =>
     request<NewsFeed>(`/api/news/holdings?limit=${limit}`),
   getNewsInterests: () =>
@@ -223,17 +306,7 @@ export const api = {
   /** SSE multi-agent committee: meta / stage / agent_* / report / error / done */
   streamAnalysisJob: async (
     body: AnalysisJobCreate,
-    onEvent: (ev: {
-      type: string;
-      label?: string;
-      pct?: number;
-      stage?: string;
-      message?: string;
-      job?: AnalysisJob;
-      report?: AnalysisJob["report"];
-      agent?: import("@/lib/types").AnalysisAgentStep;
-      [k: string]: unknown;
-    }) => void,
+    onEvent: AnalysisStreamEventHandler,
     signal?: AbortSignal,
   ) => {
     const token = getAccessToken();
@@ -248,54 +321,26 @@ export const api = {
       signal,
       cache: "no-store",
     });
-    if (res.status === 401 && typeof window !== "undefined") {
-      clearSession();
-      if (!window.location.pathname.startsWith("/login")) {
-        window.location.assign("/login");
-      }
-      throw new Error("未登录");
-    }
-    if (!res.ok || !res.body) {
-      const text = await res.text();
-      let message = text || `Request failed: ${res.status}`;
-      try {
-        const j = JSON.parse(text) as { detail?: string; message?: string };
-        message = j.message || j.detail || message;
-      } catch {
-        /* plain */
-      }
-      onEvent({ type: "error", message });
-      onEvent({ type: "done", status: "failed" });
-      return;
-    }
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    const flushLine = (line: string) => {
-      const trimmed = line.trimEnd();
-      if (!trimmed || trimmed.startsWith(":")) return; // SSE comment / keepalive
-      if (!trimmed.startsWith("data:")) return;
-      const raw = trimmed.slice(5).trim();
-      if (!raw || raw === "[DONE]") {
-        if (raw === "[DONE]") onEvent({ type: "done" });
-        return;
-      }
-      try {
-        onEvent(JSON.parse(raw) as { type: string });
-      } catch {
-        /* ignore partial / malformed */
-      }
-    };
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      // SSE events are separated by blank lines; also flush complete lines early
-      const parts = buf.split(/\r?\n/);
-      buf = parts.pop() || "";
-      for (const line of parts) flushLine(line);
-    }
-    if (buf.trim()) flushLine(buf);
+    await _consumeAnalysisSse(res, onEvent);
+  },
+
+  /** Attach to agent/background job — same event shapes as streamAnalysisJob */
+  streamAnalysisJobAttach: async (
+    jobId: number,
+    onEvent: AnalysisStreamEventHandler,
+    signal?: AbortSignal,
+  ) => {
+    const token = getAccessToken();
+    const res = await fetch(`${API_BASE}/api/analysis/jobs/${jobId}/stream`, {
+      method: "GET",
+      headers: {
+        Accept: "text/event-stream",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      signal,
+      cache: "no-store",
+    });
+    await _consumeAnalysisSse(res, onEvent);
   },
   getAnalysisJob: (id: number) => request<AnalysisJob>(`/api/analysis/jobs/${id}`),
   getLatestAnalysis: (scope?: "portfolio" | "symbol") =>
@@ -476,17 +521,23 @@ export const api = {
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
+    let sawDone = false;
 
     const flushLine = (line: string) => {
       const trimmed = line.trim();
       if (!trimmed || !trimmed.startsWith("data:")) return;
       const raw = trimmed.slice(5).trim();
       if (!raw || raw === "[DONE]") {
-        if (raw === "[DONE]") onEvent({ type: "done" });
+        if (raw === "[DONE]" && !sawDone) {
+          sawDone = true;
+          onEvent({ type: "done" });
+        }
         return;
       }
       try {
-        onEvent(JSON.parse(raw) as { type: string });
+        const ev = JSON.parse(raw) as { type: string };
+        if (ev.type === "done") sawDone = true;
+        onEvent(ev);
       } catch {
         /* ignore partial json */
       }
@@ -502,7 +553,8 @@ export const api = {
       for (const line of parts) flushLine(line);
     }
     if (buf.trim()) flushLine(buf);
-    onEvent({ type: "done" });
+    // Only synthesize done if the server never sent one (abrupt EOF)
+    if (!sawDone) onEvent({ type: "done" });
   },
 };
 

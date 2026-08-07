@@ -1,7 +1,7 @@
 from sqlalchemy.orm import Session
 
 from app.models import Holding
-from app.providers.cn_calendar import quote_is_for_shanghai_today
+from app.providers.cn_calendar import quote_counts_for_day_pnl
 from app.schemas import HoldingOut, PortfolioSummary
 from app.services.holding_dates import earlier_bought_at, normalize_bought_at
 from app.services.holding_day_lots import (
@@ -10,7 +10,7 @@ from app.services.holding_day_lots import (
     merge_day_buy_lots,
     refresh_day_buy_lot,
 )
-from app.services.quote import get_quotes
+from app.providers.quote import get_quotes
 
 
 def consolidate_same_symbol(db: Session, user_id: int) -> bool:
@@ -65,8 +65,8 @@ def build_portfolio(db: Session, user_id: int) -> PortfolioSummary:
     total_day_pnl = 0.0
 
     for h in rows:
-        q = quotes.get(h.symbol)
-        price = q.price if q else h.cost
+        q = quotes.get(f"{h.market}:{h.symbol}") or quotes.get(h.symbol)
+        price = q.price if q and q.price > 0 else h.cost
         prev_close = q.prev_close if q else None
         change_pct = q.change_pct if q else None
         as_of = q.as_of if q else None
@@ -83,12 +83,12 @@ def build_portfolio(db: Session, user_id: int) -> PortfolioSummary:
         ensure_day_session(h)
         day_s, day_c = refresh_day_buy_lot(h)
 
-        # 上海日历已跨日，但行情仍是昨收盘 → 「今日盈亏」归零，勿沿用昨天涨跌
-        fresh_today = quote_is_for_shanghai_today(as_of)
+        # A 股：跨日仍挂昨收 → 今日归零；场外净值常 T−1，按 NAV 日放行
+        fresh_for_day = quote_counts_for_day_pnl(as_of, h.market)
 
         day_pnl: float | None = None
         day_pnl_pct: float | None = None
-        if fresh_today:
+        if fresh_for_day:
             day_pnl, baseline = day_pnl_parts(
                 shares=float(h.shares),
                 cost=float(h.cost),

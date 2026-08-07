@@ -448,10 +448,16 @@ def admin_presets_page(request: Request, db: Session = Depends(get_db)):
     if blocked:
         return blocked
     store = presets_svc.load_presets()
+    preset = (store.get("presets") or [None])[0] or {}
     return TEMPLATES.TemplateResponse(
         request,
         "admin_presets.html",
-        _shell_ctx(request, "presets", preset_store=store),
+        _shell_ctx(
+            request,
+            "presets",
+            preset_store=store,
+            prompt_rows=presets_svc.list_editable_prompt_rows(preset),
+        ),
     )
 
 

@@ -33,6 +33,7 @@ export type AgentCard =
       title?: string;
       label?: string;
       degree?: string;
+      eta_minutes?: number[];
       symbol?: string;
       name?: string;
       ack?: string;
@@ -85,6 +86,8 @@ export function AgentResultCards({ cards }: { cards: AgentCard[] }) {
           );
         }
         if (card.kind === "analysis") {
+          // 进行中由 AgentAnalysisWait 单独展示，避免与气泡文案叠床架屋
+          if (card.status === "running") return null;
           const scopeLabel =
             card.scope === "symbol"
               ? card.name || card.symbol
@@ -92,26 +95,11 @@ export function AgentResultCards({ cards }: { cards: AgentCard[] }) {
                 : "个股"
               : "仓库";
           return (
-            <div
-              key={`an-${i}`}
-              className="agent-result-card agent-result-card-analysis"
-              data-live="1"
-            >
-              <div className="agent-result-card-title">
-                <span className="agent-analysis-dot" aria-hidden />
-                {card.title || "分析进行中"}
-              </div>
-              <div className="agent-result-card-meta">
-                已经在分析{scopeLabel}
-                {card.degree
-                  ? ` · ${card.degree === "standard" ? "标准档" : card.degree}`
-                  : ""}
-              </div>
-              <div className="agent-result-card-hint">
-                {card.ack || "你可以继续聊；跑完后问我，或去分析页看报告。"}
-              </div>
+            <div key={`an-${i}`} className="agent-result-card">
+              <div className="agent-result-card-title">分析报告</div>
+              <div className="agent-result-card-meta">{scopeLabel} · 已完成</div>
               <Link href="/analysis" className="agent-result-card-link">
-                去分析页看进度
+                打开分析页
               </Link>
             </div>
           );

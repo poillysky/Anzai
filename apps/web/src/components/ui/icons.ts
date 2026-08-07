@@ -26,6 +26,7 @@ export {
   History,
   MoreHorizontal,
   Sparkles,
+  Scale,
   SlidersHorizontal,
   Warehouse,
   CandlestickChart,
@@ -59,6 +60,7 @@ export {
   Bell,
   Mic,
   MicOff,
+  Download,
 } from "lucide-react";
 
 

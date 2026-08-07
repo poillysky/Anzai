@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -118,9 +119,17 @@ def _summarize_report(report: dict[str, Any] | None) -> list[str]:
     stance = report.get("stance")
     if stance:
         lines.append(f"立场：{stance}")
-    lines.append(
-        "来源：多 Agent 委员会" if not report.get("template") else "来源：模板快评（委员会未跑通时的兜底）"
-    )
+    if report.get("template"):
+        lines.append("来源：模板快评（委员会未跑通时的兜底）")
+    elif report.get("degraded"):
+        fails = report.get("failed_seats") or []
+        bit = "、".join(str(x) for x in fails[:4]) if fails else "部分席位"
+        lines.append(f"来源：委员会（降级 · {bit}异常）")
+    else:
+        lines.append("来源：多 Agent 委员会")
+    note = str(report.get("quality_note") or "").strip()
+    if note:
+        lines.append(f"质量说明：{note[:160]}")
 
     highlights = report.get("highlights") or []
     if isinstance(highlights, list) and highlights:
@@ -137,8 +146,9 @@ def _summarize_report(report: dict[str, Any] | None) -> list[str]:
                 continue
             label = step.get("label") or step.get("id") or "席位"
             summary = step.get("summary") or step.get("stance") or ""
-            lines.append(f"- {label}：{summary}"[:120])
-
+            st = str(step.get("status") or "done")
+            mark = "（失败）" if st == "failed" else ""
+            lines.append(f"- {label}{mark}：{summary}"[:120])
     items = report.get("items") or []
     if isinstance(items, list) and items:
         for it in items[:6]:
@@ -191,6 +201,100 @@ def analysis_context(db: Session, user_id: int) -> str:
         stance = report.get("stance")
         if stance:
             lines.append(f"立场：{stance}")
+    return "\n".join(lines)
+
+
+# After a job finishes, keep a detailed summary in chat for this many *user* turns.
+ANALYSIS_FOLLOW_USER_TURNS = 6
+
+
+def _parse_job_report(job: AnalysisJob | None) -> dict[str, Any] | None:
+    if job is None or not getattr(job, "report_json", None):
+        return None
+    try:
+        raw = json.loads(job.report_json)
+        return raw if isinstance(raw, dict) else None
+    except (TypeError, json.JSONDecodeError):
+        return None
+
+
+def _user_turns_since_job_finish(
+    db: Session,
+    user_id: int,
+    *,
+    conversation_id: int | None,
+    finished_at: datetime,
+) -> int:
+    """Count user messages in this conversation after the job finished."""
+    from app.models import AgentMessage
+    from app.services import agent_history as history_svc
+
+    conv_id = conversation_id
+    if conv_id is None:
+        try:
+            conv = history_svc.get_or_create_active(db, user_id)
+            conv_id = conv.id
+        except Exception:
+            return ANALYSIS_FOLLOW_USER_TURNS + 1
+
+    q = db.query(AgentMessage).filter(
+        AgentMessage.user_id == user_id,
+        AgentMessage.conversation_id == conv_id,
+        AgentMessage.role == "user",
+        AgentMessage.created_at > finished_at,
+    )
+    return int(q.count() or 0)
+
+
+def analysis_follow_context(
+    db: Session,
+    user_id: int,
+    *,
+    conversation_id: int | None = None,
+) -> str | None:
+    """Detailed report summary for N user turns after analysis completes.
+
+    Returns None when outside the follow window (caller may fall back to short hint).
+    """
+    from app.services import analysis as analysis_svc
+
+    running = analysis_svc.running_job(db, user_id)
+    if running is not None:
+        # New run in progress — don't keep pushing the previous detailed dump
+        return None
+
+    job = analysis_svc.latest_job(db, user_id)
+    if job is None or str(job.status or "") != "done":
+        return None
+    finished = getattr(job, "finished_at", None) or getattr(job, "created_at", None)
+    if finished is None:
+        return None
+
+    # prepare_chat 在 append_user_message 之前调用本函数，DB 计数不含本轮 → +1
+    prior = _user_turns_since_job_finish(
+        db, user_id, conversation_id=conversation_id, finished_at=finished
+    )
+    turns = prior + 1
+    if turns > ANALYSIS_FOLLOW_USER_TURNS:
+        return None
+
+    report = _parse_job_report(job)
+    remaining = max(0, ANALYSIS_FOLLOW_USER_TURNS - turns)
+    lines = [
+        "【近期分析·详细摘要】",
+        f"任务 #{job.id} · {job.scope} · {job.degree}"
+        f"（完成后第 {turns}/{ANALYSIS_FOLLOW_USER_TURNS} 轮；"
+        f"约还可跟 {remaining} 轮用户追问）",
+        "用法：用户追问结论/风险/某席位/某标的时据此回答；"
+        "没问分析时不要整段复读；数字仍以本轮实时查询为准。",
+    ]
+    if report and report.get("template"):
+        lines.append("质量：模板兜底，提及时诚实说简化版。")
+    elif report and report.get("degraded"):
+        fails = report.get("failed_seats") or []
+        bit = "、".join(str(x) for x in fails[:4]) if fails else "部分席位"
+        lines.append(f"质量：降级（{bit}），可提一句有的席没谈成。")
+    lines.extend(_summarize_report(report))
     return "\n".join(lines)
 
 

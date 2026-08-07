@@ -187,6 +187,7 @@ def apply_share_cost_delta(
     new_cost: float,
     trade_price: float | None = None,
     trade_date: str | None = None,
+    mark_price: float | None = None,
 ) -> None:
     """Infer 补仓/减仓 from an update of totals and adjust today's cash flows."""
     delta = float(new_shares) - float(old_shares)
@@ -203,8 +204,10 @@ def apply_share_cost_delta(
         qty = -delta
         if trade_price is not None and float(trade_price) > 0:
             px = float(trade_price)
+        elif mark_price is not None and float(mark_price) > 0:
+            # Prefer live mark over book cost so day sell notional ≈ broker
+            px = float(mark_price)
         else:
-            # Last resort: mark at book cost (understates day P&L vs broker)
             px = float(old_cost) if float(old_cost) > 0 else float(new_cost)
         record_day_sell(holding, qty, px)
 

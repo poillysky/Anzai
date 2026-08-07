@@ -2,7 +2,7 @@
 
 Primary:
   - 五档：新浪 hq（与 quote 同源，收盘后档位常为 0）
-  - 资金：东财 fflow/daykline（push2his）
+  - 资金：东财 fflow/kline（push2delay / push2his；daykline 易空）
 
 Fallback:
   - 五档：东财 stock/get（盘中更全，delay 常缺档）
@@ -89,11 +89,19 @@ def _book_has_size(book: OrderBook | None) -> bool:
 
 
 def _fflow_urls() -> tuple[str, ...]:
-    return (
-        f"{_HIS}/api/qt/stock/fflow/daykline/get",
-        f"{_DELAY}/api/qt/stock/fflow/daykline/get",
-        f"{_PUSH2}/api/qt/stock/fflow/daykline/get",
-    )
+    """日频资金：fflow/kline（daykline 常空/断连）。delay 最稳，his 天数更全。"""
+    path = "/api/qt/stock/fflow/kline/get"
+    his = f"{_HIS}{path}"
+    delay = f"{_DELAY}{path}"
+    live = f"{_PUSH2}{path}"
+    try:
+        from app.providers.eastmoney import prefer_delay_first
+
+        if prefer_delay_first():
+            return (delay, his, live)
+    except Exception:
+        pass
+    return (delay, live, his)
 
 
 def _secid(symbol: str, market: str) -> str:
@@ -273,9 +281,15 @@ def _fetch_em_flow(symbol: str, market: str, *, limit: int = 5) -> list[MoneyFlo
         "secid": secid,
         "fields1": "f1,f2,f3,f7",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-        "ut": "b2884a393a59ad64002292a3e90d46a5",
+        "ut": "fa5fd1943c7b386f172d6893dbfba10b",
     }
-    with httpx.Client(timeout=8.0, headers=EM_HEADERS, follow_redirects=True) as client:
+    # HTTP/2 在部分网络会 RemoteProtocolError；强制 HTTP/1.1
+    with httpx.Client(
+        timeout=12.0,
+        headers=EM_HEADERS,
+        follow_redirects=True,
+        http2=False,
+    ) as client:
         for url in _fflow_urls():
             try:
                 resp = client.get(url, params=params)
@@ -288,7 +302,7 @@ def _fetch_em_flow(symbol: str, market: str, *, limit: int = 5) -> list[MoneyFlo
                     if d:
                         days.append(d)
                 if days:
-                    return days
+                    return days[-limit:]
                 logger.info("EM fflow empty from %s for %s", host_label(url), secid)
             except Exception as exc:
                 logger.warning(
@@ -424,6 +438,58 @@ def get_depth_flow(symbol: str, market: str = "SH", *, flow_days: int = 5) -> De
             ),
         )
 
+    if mkt == "GDS" or sym.upper() == "AU9999":
+        from app.providers.quote import get_quote
+
+        name = "AU9999"
+        try:
+            q = get_quote("AU9999", "GDS")
+            if q and q.name:
+                name = q.name
+        except Exception:
+            pass
+        return DepthFlowSnapshot(
+            symbol="AU9999",
+            market="GDS",
+            name=name,
+            book=None,
+            flow_days=[],
+            flow_bias="na",
+            flow_label="现货无场内资金",
+            session_state="na",
+            book_live=False,
+            note=(
+                "AU9999 为上金所现货参考价，不可入仓；无交易所五档与主力净流入。"
+                "分析看金价与宏观，勿编造盘口或庄家。"
+            ),
+        )
+
+    if mkt == "OF":
+        from app.providers.quote import get_quote
+
+        name = sym
+        try:
+            q = get_quote(sym, "OF")
+            if q and q.name:
+                name = q.name
+        except Exception:
+            pass
+        return DepthFlowSnapshot(
+            symbol=sym,
+            market="OF",
+            name=name,
+            book=None,
+            flow_days=[],
+            flow_bias="na",
+            flow_label="场外基金无场内资金",
+            session_state="na",
+            book_live=False,
+            note=(
+                "场外开放式基金按日净值申赎，无交易所五档与主力净流入；"
+                "请看净值与仓位盈亏。勿编造盘口或庄家。"
+            ),
+        )
+
     sess = cn_session()
     trading = sess.state == "trading"
     cache_key = f"{mkt}:{sym}:{flow_days}:{sess.state}"
@@ -463,7 +529,15 @@ def get_depth_flow(symbol: str, market: str = "SH", *, flow_days: int = 5) -> De
         note=(
             "主力按成交额分档，非庄家身份；非投资建议"
             if trading
-            else "已收盘/非连续竞价，无实时五档；资金为日频统计"
+            else (
+                "午间休市，无实时五档；资金为日频统计"
+                if sess.state == "lunch"
+                else (
+                    "未开盘/集合竞价，无连续竞价五档；资金为日频统计"
+                    if sess.state in {"pre", "auction"}
+                    else "已收盘/非连续竞价，无实时五档；资金为日频统计"
+                )
+            )
         ),
     )
     _CACHE[cache_key] = (now, snap)
@@ -484,6 +558,12 @@ def format_depth_flow_summary(symbol: str, market: str = "SH") -> str:
             f"{snap.flow_label}。积存金无交易所五档/主力分档；"
             "用 get_quote 看实时金价；勿编造盘口或庄家。"
         )
+    if snap.market == "OF":
+        return (
+            f"【盘口·资金 · {snap.name}（{snap.symbol} 场外基金）】\n"
+            f"{snap.flow_label}。场外基金无交易所五档/主力分档；"
+            "用净值看仓位盈亏；勿编造盘口或庄家。"
+        )
     lines = [f"【盘口·资金 · {snap.name}（{snap.symbol} {snap.market}）】"]
     book = snap.book
     if snap.book_live and book and (book.bids or book.asks):
@@ -501,8 +581,10 @@ def format_depth_flow_summary(symbol: str, market: str = "SH") -> str:
         label = {
             "closed": "已收盘",
             "weekend": "周末休市",
+            "holiday": "节假日休市",
             "lunch": "午间休市",
             "pre": "未开盘",
+            "auction": "集合竞价",
         }.get(snap.session_state, "非交易时段")
         lines.append(f"{label}，无实时买卖五档（勿把昨收残留价当挂单）。")
 

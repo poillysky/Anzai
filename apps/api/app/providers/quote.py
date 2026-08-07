@@ -47,8 +47,15 @@ def normalize_symbol(symbol: str, market: str | None = None) -> tuple[str, str]:
     # 积存金：catalog id（zs-jcj）或 JD sku，不走 A 股推断
     if m_in == "JD":
         return s.lower(), "JD"
+    # 上金所现货参考（AU9999），不可入仓但可分析
+    if m_in == "GDS" or s.upper() in {"AU9999", "GDS_AU9999"}:
+        return "AU9999", "GDS"
+    # 场外开放式：六位基金代码，勿按 A 股规则改市场
+    if m_in == "OF":
+        code = re.sub(r"^(OF|SH|SZ)", "", s, flags=re.I).strip()
+        return code, "OF"
     s = s.upper()
-    s = re.sub(r"^(SH|SZ|HK|US|JD)", "", s)
+    s = re.sub(r"^(SH|SZ|HK|US|JD|OF|GDS)", "", s)
     if market:
         m = market.upper()
     elif s in _INDEX_DEFAULT_MARKET:
@@ -293,7 +300,7 @@ def fetch_sina_int(codes: list[tuple[str, str, str]]) -> dict[str, Quote]:
 
 
 def get_quotes(items: list[tuple[str, str]]) -> dict[str, Quote]:
-    """items: list of (symbol, market). Returns map by symbol.
+    """items: list of (symbol, market). Returns map by symbol and market:symbol.
 
     Never silently injects fake prices when sina fails — returns live=False / price=0.
     Mock numbers only if QUOTE_PROVIDER=mock.
@@ -302,29 +309,51 @@ def get_quotes(items: list[tuple[str, str]]) -> dict[str, Quote]:
     use_mock = (get_settings().quote_provider or "sina").strip().lower() == "mock"
     pending: list[tuple[str, str]] = []
     pending_jd: list[str] = []
+    pending_of: list[str] = []
+    pending_gds: list[str] = []
     out: dict[str, Quote] = {}
+
+    def _put(sym: str, mkt: str, q: Quote) -> None:
+        out[sym] = q
+        out[f"{mkt}:{sym}"] = q
 
     for symbol, market in items:
         sym, mkt = normalize_symbol(symbol, market)
         if use_mock:
-            out[sym] = _mock_quote(sym, mkt)
+            _put(sym, mkt, _mock_quote(sym, mkt))
             continue
         if mkt == "JD":
             cache_key = f"JD:{sym}"
             cached = _CACHE.get(cache_key)
             if cached and now - cached[0] < _CACHE_TTL:
-                out[sym] = cached[1]
+                _put(sym, mkt, cached[1])
             else:
                 pending_jd.append(sym)
             continue
+        if mkt == "GDS":
+            cache_key = f"GDS:{sym}"
+            cached = _CACHE.get(cache_key)
+            if cached and now - cached[0] < _CACHE_TTL:
+                _put(sym, mkt, cached[1])
+            else:
+                pending_gds.append(sym)
+            continue
+        if mkt == "OF":
+            cache_key = f"OF:{sym}"
+            cached = _CACHE.get(cache_key)
+            if cached and now - cached[0] < _CACHE_TTL:
+                _put(sym, mkt, cached[1])
+            else:
+                pending_of.append(sym)
+            continue
         # Unsupported markets for sina A/HK batch (US uses other helpers)
         if mkt not in ("SH", "SZ", "HK"):
-            out[sym] = _empty_quote(sym, mkt)
+            _put(sym, mkt, _empty_quote(sym, mkt))
             continue
         cache_key = f"{mkt}:{sym}"
         cached = _CACHE.get(cache_key)
         if cached and now - cached[0] < _CACHE_TTL:
-            out[sym] = cached[1]
+            _put(sym, mkt, cached[1])
         else:
             pending.append((sym, mkt))
 
@@ -341,7 +370,7 @@ def get_quotes(items: list[tuple[str, str]]) -> dict[str, Quote]:
                 q = _empty_quote(sym, mkt, (q.name if q else "") or sym)
                 logger.warning("No live quote for %s:%s", mkt, sym)
             _CACHE[f"{mkt}:{sym}"] = (now, q)
-            out[sym] = q
+            _put(sym, mkt, q)
 
     if pending_jd:
         try:
@@ -357,7 +386,65 @@ def get_quotes(items: list[tuple[str, str]]) -> dict[str, Quote]:
                 q = _empty_quote(sym, "JD", (q.name if q else "") or sym)
                 logger.warning("No live quote for JD:%s", sym)
             _CACHE[f"JD:{sym}"] = (now, q)
-            out[sym] = q
+            _put(sym, "JD", q)
+
+    if pending_gds:
+        try:
+            from app.providers.gold import get_gds_holding_quotes
+
+            gds_fetched = get_gds_holding_quotes(pending_gds)
+        except Exception:
+            logger.exception("GDS AU9999 quote fetch failed")
+            gds_fetched = {}
+        for sym in pending_gds:
+            q = gds_fetched.get(sym) or gds_fetched.get("AU9999")
+            if q is None or not q.live or q.price <= 0:
+                q = _empty_quote(sym, "GDS", "AU9999")
+                logger.warning("No live quote for GDS:%s", sym)
+            _CACHE[f"GDS:{sym}"] = (now, q)
+            _put(sym, "GDS", q)
+
+    if pending_of:
+        try:
+            from app.providers.fund import fetch_otc_nav_batch
+
+            nav_map = fetch_otc_nav_batch(list(dict.fromkeys(pending_of)))
+        except Exception:
+            logger.exception("OF fund NAV quote fetch failed")
+            nav_map = {}
+        for sym in pending_of:
+            nav = nav_map.get(sym) or {}
+            price = nav.get("nav") if isinstance(nav.get("nav"), (int, float)) else None
+            chg = nav.get("change_pct") if isinstance(nav.get("change_pct"), (int, float)) else None
+            as_of = str(nav.get("as_of") or "") or None
+            name = str(nav.get("name") or "").strip() or sym
+            prev = None
+            if (
+                isinstance(price, (int, float))
+                and price > 0
+                and isinstance(chg, (int, float))
+            ):
+                # 由日涨跌反推昨净值，供仓库「今日盈亏」
+                try:
+                    prev = float(price) / (1.0 + float(chg) / 100.0)
+                except ZeroDivisionError:
+                    prev = None
+            if price is None or float(price) <= 0:
+                q = _empty_quote(sym, "OF", name)
+                logger.warning("No NAV quote for OF:%s", sym)
+            else:
+                q = Quote(
+                    symbol=sym,
+                    name=name,
+                    market="OF",
+                    price=float(price),
+                    change_pct=float(chg) if chg is not None else None,
+                    prev_close=round(prev, 4) if prev and prev > 0 else None,
+                    as_of=as_of,
+                    live=True,
+                )
+            _CACHE[f"OF:{sym}"] = (now, q)
+            _put(sym, "OF", q)
 
     return out
 

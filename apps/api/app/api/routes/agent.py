@@ -104,6 +104,20 @@ def clear_agent_messages(
     return {"status": "ok", "deleted": n}
 
 
+@router.post("/chat/preview")
+def agent_chat_preview(
+    payload: ChatRequest,
+    db: Session = Depends(get_db),
+    user: AuthUser = Depends(require_user),
+) -> dict[str, Any]:
+    """Dry-run: scene / packs / token estimate / system block previews (no LLM call)."""
+    msgs = [{"role": m.role, "content": m.content} for m in payload.messages]
+    conv = history_svc.resolve_conversation(db, user.id, payload.conversation_id)
+    return chat_svc.preview_chat(
+        db, user.id, msgs, conversation_id=conv.id
+    )
+
+
 @router.post("/chat")
 async def agent_chat(
     payload: ChatRequest,
@@ -117,7 +131,9 @@ async def agent_chat(
     if (conv.status or "") == "closed":
         conv = history_svc.create_conversation(db, user_id, close_current=False)
     conversation_id = conv.id
-    gen, openai_msgs, meta = chat_svc.prepare_chat(db, user_id, msgs)
+    gen, openai_msgs, meta = chat_svc.prepare_chat(
+        db, user_id, msgs, conversation_id=conversation_id
+    )
     meta = {**meta, "conversation_id": conversation_id}
 
     latest_user = ""
@@ -136,6 +152,9 @@ async def agent_chat(
             logger.exception("failed to persist user message for user %s", user_id)
 
     async def event_gen():
+        from app.services import agent_memory as memory_svc
+        from app.services.agent_reply_finalize import finalize_assistant_text
+
         assistant_parts: list[str] = []
         had_error = False
         yield (
@@ -150,6 +169,7 @@ async def agent_chat(
                     "tools": meta.get("tools") or [],
                     "conversation_id": conversation_id,
                     "scene": meta.get("scene"),
+                    "assemble": meta.get("assemble") or {},
                 },
                 ensure_ascii=False,
             )
@@ -174,7 +194,23 @@ async def agent_chat(
                         assistant_parts.append(f"（出错）{ev.get('message')}")
                 yield f"data: {piece}\n\n"
         finally:
-            reply = "".join(assistant_parts).strip()
+            raw_reply = "".join(assistant_parts).strip()
+            if had_error:
+                reply = raw_reply
+            elif raw_reply:
+                reply = finalize_assistant_text(raw_reply)
+                if not (reply or "").strip():
+                    # 全是推理/工具泄漏被剥空：换占位，避免 UI 留脏字且不落库
+                    reply = "（这轮没整理出可读回答，换个说法再问我一次～）"
+            else:
+                reply = ""
+            # 清洗后与流式原文不同，或剥空后换了占位 → 推 final 覆盖前端
+            if reply and reply != raw_reply:
+                yield (
+                    "data: "
+                    + json.dumps({"type": "final", "text": reply}, ensure_ascii=False)
+                    + "\n\n"
+                )
             # 有正文或错误文案都落库；中断且零字则仅保留已写入的用户句
             if latest_user and (reply or had_error):
                 try:
@@ -185,6 +221,19 @@ async def agent_chat(
                             reply or "（已中断）",
                             conversation_id=conversation_id,
                         )
+                        if reply and not had_error:
+                            try:
+                                memory_svc.maybe_update_conversation_summary(
+                                    persist_db,
+                                    user_id,
+                                    conversation_id,
+                                    gen=gen,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "failed to refresh conversation memory for user %s",
+                                    user_id,
+                                )
                 except Exception:
                     logger.exception("failed to persist assistant reply for user %s", user_id)
 

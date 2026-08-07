@@ -8,14 +8,58 @@ import { OverlayProvider } from "@/components/overlay/OverlayContext";
 import { getAccessToken } from "@/lib/auth";
 import { scheduleTabWarm } from "@/lib/prefetch";
 import { InstallPrompt } from "./InstallPrompt";
-import { StatusBar } from "./StatusBar";
+import { ShellChromeProvider, useShellChrome } from "./ShellChromeContext";
 import { TabBar } from "./TabBar";
 import { TabCache } from "./TabCache";
+import { TabNavProvider, useTabNav } from "./TabNavContext";
+import { ServiceWorkerRegister } from "./ServiceWorkerRegister";
 import "@/features/auth/login.css";
 
 const TAB_PATHS = new Set(["/", "/market", "/news", "/analysis", "/agent"]);
 /** Pin header + scroll body — match CSS; set on shell so layout mode is known before :has */
 const PIN_MAIN_PATHS = new Set(["/", "/market", "/news"]);
+
+function AppMain({
+  isLogin,
+  children,
+}: {
+  isLogin: boolean;
+  children: React.ReactNode;
+}) {
+  const { path } = useTabNav();
+  return (
+    <main className={`app-main${PIN_MAIN_PATHS.has(path) ? " app-main--pin" : ""}`}>
+      {isLogin ? children : <TabCache>{children}</TabCache>}
+    </main>
+  );
+}
+
+function AppShellInner({
+  isLogin,
+  showTab,
+  children,
+}: {
+  isLogin: boolean;
+  showTab: boolean;
+  children: React.ReactNode;
+}) {
+  const { tabHidden } = useShellChrome();
+  const showTabBar = showTab && !tabHidden;
+
+  return (
+    <>
+      <div
+        className={`app-shell ${showTabBar ? "" : "app-shell-no-tab"} ${isLogin ? "app-shell-login" : ""}`}
+        data-tab-hidden={tabHidden ? "1" : "0"}
+      >
+        <AppMain isLogin={isLogin}>{children}</AppMain>
+        {showTabBar ? <TabBar /> : null}
+      </div>
+      {!isLogin && <InstallPrompt />}
+      {!isLogin && <ServiceWorkerRegister />}
+    </>
+  );
+}
 
 /**
  * Auth gate before paint:
@@ -70,13 +114,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     return scheduleTabWarm((href) => router.prefetch(href));
   }, [ready, isLogin, router]);
 
+  const stageClass = `device-stage ${nativeShell ? "device-stage-native" : "device-stage-app"}`;
+  const frameClass = `device-frame ${nativeShell ? "device-frame-native" : "device-frame-app"}`;
+
   if (!ready) {
     return (
-      <div className={`device-stage ${nativeShell ? "device-stage-native" : ""}`}>
-        <div
-          className={`device-frame ${nativeShell ? "device-frame-native" : ""}`}
-          aria-label={nativeShell ? "安崽" : "iOS 预览"}
-        >
+      <div className={stageClass}>
+        <div className={frameClass} aria-label="安崽">
           <div className="device-bezel">
             <div
               className={`app-shell app-shell-no-tab ${bootLogin ? "app-shell-login" : ""}`}
@@ -95,34 +139,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <div className={`device-stage ${nativeShell ? "device-stage-native" : ""}`}>
-      <div
-        className={`device-frame ${nativeShell ? "device-frame-native" : ""}`}
-        aria-label={nativeShell ? "安崽" : "iOS 预览"}
-      >
+    <div className={stageClass}>
+      <div className={frameClass} aria-label="安崽">
         <div className="device-bezel">
           <OverlayProvider>
-            {!nativeShell && !isLogin && (
-              <>
-                <div className="ios-notch" aria-hidden>
-                  <span className="ios-notch-speaker" />
-                  <span className="ios-notch-camera" />
-                </div>
-                <StatusBar />
-              </>
-            )}
-
-            <div
-              className={`app-shell ${showTab ? "" : "app-shell-no-tab"} ${isLogin ? "app-shell-login" : ""}`}
-            >
-              <main className={`app-main${PIN_MAIN_PATHS.has(pathname) ? " app-main--pin" : ""}`}>
-                {isLogin ? children : <TabCache>{children}</TabCache>}
-              </main>
-              {showTab ? <TabBar /> : null}
-            </div>
-
-            {!nativeShell && !isLogin && <div className="device-home-indicator" aria-hidden />}
-            {!isLogin && <InstallPrompt />}
+            <ShellChromeProvider>
+              <TabNavProvider>
+                <AppShellInner isLogin={isLogin} showTab={showTab}>
+                  {children}
+                </AppShellInner>
+              </TabNavProvider>
+            </ShellChromeProvider>
           </OverlayProvider>
         </div>
       </div>

@@ -15,7 +15,8 @@ from app.services.holding_dates import earlier_bought_at, normalize_bought_at
 from app.services.holding_day_lots import apply_share_cost_delta, ensure_day_session, record_day_buy
 from app.services.portfolio import build_portfolio, consolidate_same_symbol
 from app.services.portfolio_returns import build_returns_summary, upsert_today_snapshot
-from app.services.quote import get_quote, normalize_symbol
+from app.providers.quote import get_quote, normalize_symbol
+from app.providers.search import is_pending_ipo
 
 router = APIRouter(prefix="/holdings", tags=["holdings"], dependencies=[Depends(require_user)])
 
@@ -59,6 +60,11 @@ def create_holding(
     user: AuthUser = Depends(require_user),
 ) -> HoldingOut:
     symbol, market = normalize_symbol(payload.symbol, payload.market)
+    if is_pending_ipo(symbol, market):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="新股尚未上市，不能加入仓库",
+        )
     name = payload.name
     if not name:
         try:
@@ -164,6 +170,16 @@ def update_holding(
         row.bought_at = earlier_bought_at(getattr(row, "bought_at", None), fill_day)
 
     if "shares" in data or "cost" in data:
+        mark_price: float | None = None
+        if trade_price is None or float(trade_price) <= 0:
+            try:
+                from app.providers.quote import get_quote
+
+                q = get_quote(row.symbol, row.market)
+                if q and q.price and float(q.price) > 0:
+                    mark_price = float(q.price)
+            except Exception:
+                mark_price = None
         apply_share_cost_delta(
             row,
             old_shares=old_shares,
@@ -172,6 +188,7 @@ def update_holding(
             new_cost=float(row.cost),
             trade_price=float(trade_price) if trade_price is not None else None,
             trade_date=fill_day,
+            mark_price=mark_price,
         )
 
     db.commit()

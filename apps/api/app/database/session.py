@@ -28,6 +28,7 @@ def init_db() -> None:
     from app import models  # noqa: F401
     from app.database.migrate import (
         dedupe_preferences,
+        ensure_agent_conversation_memory_columns,
         ensure_agent_conversation_schema,
         ensure_holdings_bought_at,
         ensure_holdings_day_buy_lot,
@@ -42,5 +43,6 @@ def init_db() -> None:
     ensure_holdings_bought_at(engine)
     ensure_holdings_day_buy_lot(engine)
     ensure_agent_conversation_schema(engine)
+    ensure_agent_conversation_memory_columns(engine)
     dedupe_preferences(engine)
     recreate_unique_if_needed(engine)

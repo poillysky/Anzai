@@ -162,6 +162,44 @@ def create_job_stream(
     )
 
 
+@router.get("/jobs/{job_id}/stream")
+def attach_job_stream(
+    job_id: int,
+    user: AuthUser = Depends(require_user),
+) -> StreamingResponse:
+    """SSE attach to a running/finished job (agent background or late join)."""
+    user_id = user.id
+
+    def event_gen():
+        yield ": " + (" " * 2048) + "\n\n"
+        try:
+            for ev in analysis_svc.iter_attach_job_events(
+                user_id=user_id, job_id=job_id
+            ):
+                if ev.get("type") == "ping":
+                    yield ": ping\n\n"
+                    continue
+                yield "data: " + json.dumps(ev, ensure_ascii=False, default=str) + "\n\n"
+        except Exception as exc:
+            logger.exception("analysis attach stream failed")
+            yield (
+                "data: "
+                + json.dumps({"type": "error", "message": str(exc)[:400]}, ensure_ascii=False)
+                + "\n\n"
+            )
+            yield "data: " + json.dumps({"type": "done", "status": "failed"}, ensure_ascii=False) + "\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.get("/jobs/{job_id}", response_model=AnalysisJobOut)
 def get_job(
     job_id: int,

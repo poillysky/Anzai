@@ -176,7 +176,8 @@ def _embed_texts(texts: list[str]) -> list[list[float] | None]:
     url = f"{base}/embeddings"
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     out: list[list[float] | None] = [None] * len(texts)
-    batch_size = 16
+    # 部分兼容网关对大 batch 返回 400；小批量更稳
+    batch_size = 4
     got_any = False
     try:
         with httpx.Client(timeout=30.0, headers=headers) as client:
@@ -509,6 +510,99 @@ def _lex_boost(query: str, card: KnowledgeCard) -> tuple[float, float]:
     return lex, boost
 
 
+# 进阶问法线索：出现则 auto 模式抬升「专业」chunk
+_ADVANCED_HINTS = (
+    "实际利率",
+    "TIPS",
+    "CFTC",
+    "递延费",
+    "移仓",
+    "便利收益",
+    "基差",
+    "杜邦",
+    "扣非",
+    "自由现金流",
+    "FCF",
+    "EV/EBITDA",
+    "EBITDA",
+    "DCF",
+    "估值分位",
+    "大宗交易",
+    "大小非",
+    "两融余额",
+    "北向",
+    "陆股通",
+    "Beta",
+    "贝塔",
+    "社融",
+    "Brinson",
+    "归因",
+    "阿尔法",
+    "卡玛",
+    "索提诺",
+    "下行波动",
+    "风格漂移",
+    "久期",
+    "信用利差",
+    "现金替代",
+    "YTM",
+    "到期收益率",
+    "隐含波动",
+    "债底",
+    "双杀",
+    "MPT",
+    "有效前沿",
+    "未来函数",
+    "过拟合",
+    "处置效应",
+    "禀赋效应",
+    "确认偏误",
+    "后见之明",
+    "羊群效应",
+    "心理账户",
+    "修正久期",
+    "指数编制",
+    "跟踪误差来源",
+    "护城河",
+    "单位经济",
+    "港股通",
+    "ADR",
+    "REITs",
+    "认购认沽",
+)
+
+
+def card_knowledge_level(card: KnowledgeCard) -> str:
+    """基础 | 专业 — 未标注视为基础。"""
+    tags = card.tags or []
+    if "专业" in tags or "knowledge_level=专业" in tags:
+        return "专业"
+    return "基础"
+
+
+def resolve_knowledge_mode(query: str, mode: str | None = None) -> str:
+    """basic | advanced。auto：专业名词 → advanced，否则 basic。"""
+    m = (mode or "auto").strip().lower()
+    if m in ("basic", "基础", "normal", "普通"):
+        return "basic"
+    if m in ("advanced", "专业", "pro", "进阶"):
+        return "advanced"
+    q = query or ""
+    if any(h in q for h in _ADVANCED_HINTS):
+        return "advanced"
+    return "basic"
+
+
+def _level_factor(mode: str, card: KnowledgeCard) -> float:
+    """普通模式压低专业 chunk；进阶模式抬升专业 chunk。"""
+    level = card_knowledge_level(card)
+    if mode == "basic":
+        return 0.28 if level == "专业" else 1.0
+    if mode == "advanced":
+        return 1.2 if level == "专业" else 0.82
+    return 1.0
+
+
 def _row_to_card(row: dict[str, Any]) -> KnowledgeCard:
     tags = row.get("tags") or []
     if not isinstance(tags, list):
@@ -529,17 +623,26 @@ def _row_to_card(row: dict[str, Any]) -> KnowledgeCard:
     )
 
 
-def search_cards(query: str, *, limit: int = 5) -> list[tuple[KnowledgeCard, float, str]]:
-    """Return (card, score, channel) sorted by score desc."""
+def search_cards(
+    query: str,
+    *,
+    limit: int = 5,
+    mode: str | None = None,
+) -> list[tuple[KnowledgeCard, float, str]]:
+    """Return (card, score, channel) sorted by score desc.
+
+    mode: auto|basic|advanced — 控制基础/专业 chunk 权重（未标注视为基础）。
+    """
     q = (query or "").strip()
     if not q:
         return []
     lim = max(1, min(int(limit or 5), 8))
+    resolved = resolve_knowledge_mode(q, mode)
     from app.services import knowledge_pg as pg
 
     if pg.knowledge_db_configured():
         try:
-            return _search_postgres(q, limit=lim)
+            return _search_postgres(q, limit=lim, mode=resolved)
         except Exception:
             logger.exception("postgres knowledge search failed; fallback local")
 
@@ -569,7 +672,7 @@ def search_cards(query: str, *, limit: int = 5) -> list[tuple[KnowledgeCard, flo
             score = 0.65 * vec_score + 0.35 * lex + boost
         else:
             score = lex + boost
-        score *= _age_factor(c.date)
+        score *= _age_factor(c.date) * _level_factor(resolved, c)
         if score > 0.05:
             scored.append((c, score, channel))
 
@@ -577,7 +680,12 @@ def search_cards(query: str, *, limit: int = 5) -> list[tuple[KnowledgeCard, flo
     return scored[:lim]
 
 
-def _search_postgres(query: str, *, limit: int) -> list[tuple[KnowledgeCard, float, str]]:
+def _search_postgres(
+    query: str,
+    *,
+    limit: int,
+    mode: str = "basic",
+) -> list[tuple[KnowledgeCard, float, str]]:
     from app.services import knowledge_pg as pg
     from app.services.embedding_connection import resolve_creds
 
@@ -589,22 +697,24 @@ def _search_postgres(query: str, *, limit: int) -> list[tuple[KnowledgeCard, flo
         if embedded and embedded[0]:
             q_vec = embedded[0]
 
+    # 多取候选再按 knowledge_level 重排
+    pool = max(limit * 4, 16)
     scored: list[tuple[KnowledgeCard, float, str]] = []
     if q_vec:
-        rows = pg.search_by_vector(q_vec, limit=max(limit * 3, 12))
+        rows = pg.search_by_vector(q_vec, limit=pool)
         for row in rows:
             c = _row_to_card(row)
             lex, boost = _lex_boost(query, c)
             vec_score = float(row.get("vec_score") or 0.0)
             score = (0.65 * vec_score + 0.35 * lex + boost) * _age_factor(c.date)
+            score *= _level_factor(mode, c)
             if score > 0.05:
                 scored.append((c, score, "pgvector+关键词"))
     else:
-        # keyword-only over PG rows
         for row in pg.load_all_cards():
             c = _row_to_card(row)
             lex, boost = _lex_boost(query, c)
-            score = (lex + boost) * _age_factor(c.date)
+            score = (lex + boost) * _age_factor(c.date) * _level_factor(mode, c)
             if score > 0.05:
                 scored.append((c, score, "关键词"))
 
@@ -612,13 +722,20 @@ def _search_postgres(query: str, *, limit: int) -> list[tuple[KnowledgeCard, flo
     return scored[:limit]
 
 
-def format_search_text(query: str, *, limit: int = 5) -> str:
-    hits = search_cards(query, limit=limit)
+def format_search_text(
+    query: str,
+    *,
+    limit: int = 5,
+    mode: str | None = None,
+) -> str:
+    resolved = resolve_knowledge_mode(query, mode)
+    hits = search_cards(query, limit=limit, mode=resolved)
     from app.services import knowledge_pg as pg
 
     backend = "Postgres/pgvector" if pg.knowledge_db_configured() else "本地索引"
+    mode_label = "进阶" if resolved == "advanced" else "普通"
     lines = [
-        f"【经验库·非实时 · {backend}】方法论/纪律参考，不是行情也不是新闻。",
+        f"【经验库·非实时 · {backend} · {mode_label}模式】方法论/纪律参考，不是行情也不是新闻。",
         "引用规则：先讲本轮 Tools 里的数字；经验只嵌一两句框架；勿把库内叙述当今日点位。",
     ]
     if not hits:
@@ -627,11 +744,12 @@ def format_search_text(query: str, *, limit: int = 5) -> str:
     for i, (c, score, channel) in enumerate(hits, 1):
         tags = "、".join(c.tags[:4]) if c.tags else "—"
         age = c.date or "日期未知"
+        lvl = card_knowledge_level(c)
         body = re.sub(r"\s+", " ", c.body).strip()
         if len(body) > 220:
             body = body[:220] + "…"
         lines.append(
-            f"{i}. {c.title}（{c.source} · {age} · {channel} · 相关度 {score:.2f}）"
+            f"{i}. {c.title}（{c.source} · {age} · {lvl} · {channel} · 相关度 {score:.2f}）"
             f" 标签:{tags} — {body}"
         )
     return "\n".join(lines)

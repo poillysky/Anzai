@@ -1,6 +1,6 @@
 "use client";
 
-import { CandlestickChart, MessagesSquare, Sparkles, Users } from "@/components/ui/icons";
+import { CandlestickChart, MessagesSquare, Scale, Sparkles, Users } from "@/components/ui/icons";
 import type { AnalysisAgentStep, AnalysisReport } from "@/lib/types";
 
 function pctClass(v?: number | null) {
@@ -33,25 +33,50 @@ function AgentCards({ agents }: { agents: AnalysisAgentStep[] }) {
         </span>
       </div>
       <ul className="analysis-agent-list">
-        {seats.map((a) => (
-          <li key={`${a.id}-${a.summary?.slice(0, 12)}`} className="analysis-agent-card">
-            <div className="analysis-agent-top">
-              <span className="analysis-agent-label">{a.label || a.id}</span>
-              <span className={`analysis-item-stance ${stanceClass(a.stance)}`}>{a.stance}</span>
-            </div>
-            <p className="analysis-agent-summary">{a.summary}</p>
-            {a.bullets?.length ? (
-              <ul className="analysis-agent-bullets">
-                {a.bullets.map((b) => (
-                  <li key={b}>{b}</li>
-                ))}
-              </ul>
-            ) : null}
-          </li>
-        ))}
+        {seats.map((a) => {
+          const failed = a.status === "failed";
+          return (
+            <li
+              key={`${a.id}-${a.summary?.slice(0, 12)}`}
+              className="analysis-agent-card"
+              data-status={failed ? "failed" : "done"}
+            >
+              <div className="analysis-agent-top">
+                <span className="analysis-agent-label">
+                  {a.label || a.id}
+                  {failed ? (
+                    <span className="analysis-agent-fail-tag">失败</span>
+                  ) : null}
+                </span>
+                <span className={`analysis-item-stance ${stanceClass(a.stance)}`}>
+                  {failed ? "未完成" : a.stance}
+                </span>
+              </div>
+              <p className="analysis-agent-summary">{a.summary}</p>
+              {!failed && a.bullets?.length ? (
+                <ul className="analysis-agent-bullets">
+                  {a.bullets.map((b) => (
+                    <li key={b}>{b}</li>
+                  ))}
+                </ul>
+              ) : null}
+            </li>
+          );
+        })}
       </ul>
     </section>
   );
+}
+
+function reportQualityBadge(report: AnalysisReport): {
+  label: string;
+  kind: "live" | "template" | "degraded";
+} {
+  if (report.template) return { label: "模板兜底", kind: "template" };
+  if (report.degraded || (report.failed_seats?.length ?? 0) > 0) {
+    return { label: "部分失败", kind: "degraded" };
+  }
+  return { label: "委员会", kind: "live" };
 }
 
 export function AnalysisReportBlocks({
@@ -97,6 +122,14 @@ export function AnalysisReportBlocks({
       }));
   const agents = report.agents?.length ? report.agents : liveAgents || [];
   const debate = report.debate || [];
+  const quality = reportQualityBadge(report);
+  const qualityNote =
+    report.quality_note ||
+    (report.template
+      ? "委员会未完整跑通，以下为模板快评。"
+      : report.failed_seats?.length
+        ? `${report.failed_seats.join("、")}未谈成，结论已降级。`
+        : "");
 
   return (
     <>
@@ -106,12 +139,23 @@ export function AnalysisReportBlocks({
           <span className="hero-label" style={{ margin: 0 }}>
             总结报告
           </span>
-          {report.template ? (
-            <span className="analysis-badge">模板</span>
-          ) : (
-            <span className="analysis-badge analysis-badge-live">委员会</span>
-          )}
+          <span
+            className={
+              quality.kind === "live"
+                ? "analysis-badge analysis-badge-live"
+                : quality.kind === "degraded"
+                  ? "analysis-badge analysis-badge-warn"
+                  : "analysis-badge"
+            }
+          >
+            {quality.label}
+          </span>
         </div>
+        {qualityNote ? (
+          <p className="analysis-quality-note" role="status">
+            {qualityNote}
+          </p>
+        ) : null}
         <p className="analysis-verdict-text">{report.verdict}</p>
         <div className="analysis-meta-row">
           <span className={stanceClass(report.stance)}>{report.stance}</span>
@@ -155,6 +199,45 @@ export function AnalysisReportBlocks({
           </ul>
         ) : null}
       </section>
+
+      {report.rebalance && !report.rebalance.empty ? (
+        <section
+          className="inset-group analysis-rebalance"
+          style={{ marginTop: 12 }}
+          aria-label="再平衡建议"
+        >
+          <div className="inset-group-header">
+            <span className="skeleton-block-head">
+              <Scale size={14} strokeWidth={2} absoluteStrokeWidth aria-hidden />
+              再平衡建议
+            </span>
+          </div>
+          <div className="analysis-rebalance-body">
+            <p className="analysis-rebalance-stance">
+              倾向：{report.rebalance.stance || "观望"}
+              {report.rebalance.day_pnl_pct != null
+                ? ` · 组合今日盈亏 ${formatPct(report.rebalance.day_pnl_pct)}`
+                : ""}
+            </p>
+            {report.rebalance.head ? (
+              <p className="analysis-rebalance-head text-mute">
+                头仓 {report.rebalance.head.name}
+                {report.rebalance.head.weight != null
+                  ? ` ${report.rebalance.head.weight}%`
+                  : ""}
+              </p>
+            ) : null}
+            {(report.rebalance.notes || []).length > 0 ? (
+              <ul className="analysis-rebalance-notes">
+                {report.rebalance.notes!.map((n) => (
+                  <li key={n}>{n}</li>
+                ))}
+              </ul>
+            ) : null}
+            <p className="analysis-rebalance-hint text-mute">倾向性草案，非下单</p>
+          </div>
+        </section>
+      ) : null}
 
       <AgentCards agents={agents} />
 

@@ -14,8 +14,14 @@ logger = logging.getLogger(__name__)
 
 _EM_SUGGEST = "https://searchapi.eastmoney.com/api/suggest/get"
 _EM_TOKEN = "D43BF722C8E33BDC906FB84D85E326E8"
+_EM_IPO = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 _CODE_RE = re.compile(r"^\d{6}$")
 _HK_CODE_RE = re.compile(r"^\d{5}$")
+
+# IPO apply calendar cache: code -> {issue_price, apply_date, apply_code, name}
+_IPO_CACHE: dict[str, dict[str, object]] = {}
+_IPO_CACHE_AT = 0.0
+_IPO_TTL = 30 * 60
 
 # 聊天口语 → 纯名称，否则东财 suggest 常返回空再误落到 mock
 _SEARCH_STRIP = (
@@ -59,9 +65,10 @@ class SearchHit:
     symbol: str
     name: str
     market: str
-    kind: str  # stock | etf | index | hk | us
+    kind: str  # stock | etf | index | hk | us | ipo
     price: float | None = None
     change_pct: float | None = None
+    note: str | None = None
 
 
 def clean_search_query(q: str) -> str:
@@ -238,17 +245,160 @@ def _quote_code_fallback(query: str, hits: list[SearchHit], limit: int) -> list[
     return hits
 
 
+def _fetch_ipo_by_codes(codes: list[str]) -> dict[str, dict[str, object]]:
+    """East Money 新股申购表 — 未上市代码用发行价补全搜索展示。"""
+    global _IPO_CACHE_AT, _IPO_CACHE
+    import time
+
+    now = time.time()
+    need = [c for c in codes if c and c not in _IPO_CACHE]
+    if need and (now - _IPO_CACHE_AT > _IPO_TTL or not _IPO_CACHE):
+        try:
+            with httpx.Client(timeout=8.0) as client:
+                # Recent apply calendar (covers upcoming IPOs)
+                resp = client.get(
+                    _EM_IPO,
+                    params={
+                        "sortColumns": "APPLY_DATE",
+                        "sortTypes": "-1",
+                        "pageSize": "80",
+                        "pageNumber": "1",
+                        "reportName": "RPTA_APP_IPOAPPLY",
+                        "columns": "SECURITY_CODE,SECURITY_NAME_ABBR,APPLY_CODE,ISSUE_PRICE,APPLY_DATE,LISTING_DATE",
+                        "source": "WEB",
+                        "client": "WEB",
+                    },
+                    headers={"Referer": "https://data.eastmoney.com/xg/"},
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                rows = ((payload.get("result") or {}) if isinstance(payload, dict) else {}).get(
+                    "data"
+                ) or []
+                if isinstance(rows, list):
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        code = str(row.get("SECURITY_CODE") or "").strip()
+                        if not code:
+                            continue
+                        _IPO_CACHE[code] = {
+                            "name": str(row.get("SECURITY_NAME_ABBR") or "").strip(),
+                            "issue_price": row.get("ISSUE_PRICE"),
+                            "apply_date": str(row.get("APPLY_DATE") or "")[:10],
+                            "listing_date": str(row.get("LISTING_DATE") or "")[:10],
+                            "apply_code": str(row.get("APPLY_CODE") or "").strip(),
+                        }
+                    _IPO_CACHE_AT = now
+        except Exception:
+            logger.exception("EM IPO calendar fetch failed")
+
+    # Targeted lookup for codes still missing (older / filtered out of top page)
+    missing = [c for c in codes if c and c not in _IPO_CACHE]
+    for code in missing[:6]:
+        try:
+            with httpx.Client(timeout=6.0) as client:
+                resp = client.get(
+                    _EM_IPO,
+                    params={
+                        "reportName": "RPTA_APP_IPOAPPLY",
+                        "columns": "SECURITY_CODE,SECURITY_NAME_ABBR,APPLY_CODE,ISSUE_PRICE,APPLY_DATE,LISTING_DATE",
+                        "filter": f'(SECURITY_CODE="{code}")',
+                        "pageNumber": "1",
+                        "pageSize": "5",
+                        "source": "WEB",
+                        "client": "WEB",
+                    },
+                    headers={"Referer": "https://data.eastmoney.com/xg/"},
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                rows = ((payload.get("result") or {}) if isinstance(payload, dict) else {}).get(
+                    "data"
+                ) or []
+                if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                    row = rows[0]
+                    _IPO_CACHE[code] = {
+                        "name": str(row.get("SECURITY_NAME_ABBR") or "").strip(),
+                        "issue_price": row.get("ISSUE_PRICE"),
+                        "apply_date": str(row.get("APPLY_DATE") or "")[:10],
+                        "listing_date": str(row.get("LISTING_DATE") or "")[:10],
+                        "apply_code": str(row.get("APPLY_CODE") or "").strip(),
+                    }
+        except Exception:
+            logger.exception("EM IPO lookup failed for %s", code)
+
+    return {c: _IPO_CACHE[c] for c in codes if c in _IPO_CACHE}
+
+
+def _enrich_ipo_hits(hits: list[SearchHit]) -> list[SearchHit]:
+    """未上市 / 无行情：挂发行价与申购提示，避免「查不到」观感。"""
+    need = [h.symbol for h in hits if h.market in ("SH", "SZ") and (h.price is None or h.price <= 0)]
+    if not need:
+        return hits
+    ipo_map = _fetch_ipo_by_codes(need)
+    for h in hits:
+        row = ipo_map.get(h.symbol)
+        if not row:
+            continue
+        issue = row.get("issue_price")
+        if isinstance(issue, (int, float)) and float(issue) > 0 and (h.price is None or h.price <= 0):
+            h.price = float(issue)
+        if row.get("name") and (not h.name or h.name == h.symbol):
+            h.name = str(row["name"])
+        apply_d = str(row.get("apply_date") or "").strip()
+        list_d = str(row.get("listing_date") or "").strip()
+        bits = ["新股待上市"]
+        if isinstance(issue, (int, float)) and float(issue) > 0:
+            bits.append(f"发行价 {float(issue):.2f}")
+        if apply_d and apply_d != "None":
+            bits.append(f"申购 {apply_d}")
+        elif list_d and list_d != "None":
+            bits.append(f"上市 {list_d}")
+        h.note = " · ".join(bits)
+        if h.kind == "stock":
+            h.kind = "ipo"
+    return hits
+
+
+def is_pending_ipo(symbol: str, market: str) -> bool:
+    """True if A-share code is in IPO calendar and not yet trading (no live quote)."""
+    from app.providers.cn_calendar import parse_as_of_date, shanghai_today
+
+    sym = (symbol or "").strip()
+    mkt = (market or "").upper()
+    if not sym or mkt not in {"SH", "SZ"}:
+        return False
+    try:
+        qte = get_quote(sym, mkt)
+        if qte and qte.live and qte.price and float(qte.price) > 0:
+            return False
+    except Exception:
+        pass
+    row = _fetch_ipo_by_codes([sym]).get(sym)
+    if not row:
+        return False
+    listing = str(row.get("listing_date") or "").strip()
+    if not listing or listing in {"None", "null"}:
+        return True
+    ld = parse_as_of_date(listing)
+    if ld is None:
+        return True
+    return ld > shanghai_today()
+
+
 def _attach_quotes(hits: list[SearchHit]) -> list[SearchHit]:
     cn_hk = [(h.symbol, h.market) for h in hits if h.market in ("SH", "SZ", "HK")]
     quotes = get_quotes(cn_hk) if cn_hk else {}
     for h in hits:
         qte = quotes.get(h.symbol)
         if qte:
-            h.price = qte.price
-            h.change_pct = qte.change_pct
-            if qte.name:
+            if qte.price and qte.price > 0:
+                h.price = qte.price
+                h.change_pct = qte.change_pct
+            if qte.name and qte.live:
                 h.name = qte.name
-    return hits
+    return _enrich_ipo_hits(hits)
 
 
 def search_symbols(q: str, limit: int = 12) -> list[SearchHit]:
@@ -298,6 +448,7 @@ def format_search_summary(q: str, limit: int = 5) -> str:
         px = f"{h.price}" if h.price is not None else "—"
         lines.append(
             f"{i}. {h.name}（{h.symbol} {h.market}）· {h.kind} · 现价 {px} · {chg}"
+            + (f" · {h.note}" if h.note else "")
         )
     return "\n".join(lines)
 

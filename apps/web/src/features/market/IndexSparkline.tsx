@@ -7,11 +7,16 @@ type Props = {
   points: IntradayPoint[];
   prevClose?: number | null;
   changePct?: number | null;
-  /** cn A-share · hk · us overnight · day24 · comex 外盘金(06:00→次日05:00) */
-  session?: "cn" | "us" | "hk" | "day24" | "comex" | string;
+  /** cn A-share · hk · us overnight · day24 · comex 外盘金 · daily 按日(基金) */
+  session?: "cn" | "us" | "hk" | "day24" | "comex" | "daily" | string;
   label?: string;
   interactive?: boolean;
   compact?: boolean;
+  /**
+   * 已有点等距铺满整宽（与日K相同拉伸）。
+   * 基金页分时用此模式，避免「按交易时段留白」与日K整宽拉伸不一致。
+   */
+  fillWidth?: boolean;
 };
 
 const CN_SLOTS = 242;
@@ -213,6 +218,7 @@ export function IndexSparkline({
   label = "分时走势",
   interactive = true,
   compact = false,
+  fillWidth = false,
 }: Props) {
   const gid = useId().replace(/:/g, "");
   const fillUpId = `fill-up-${gid}`;
@@ -226,28 +232,35 @@ export function IndexSparkline({
   const isHk = session === "hk";
   const isDay24 = session === "day24";
   const isComex = session === "comex";
+  const isDaily = session === "daily";
+  /** 日K 或显式 fillWidth：等距铺满，不按交易时段留白 */
+  const useEqualSpace = isDaily || fillWidth;
 
   const built = useMemo<Built | null>(() => {
     if (points.length < 2) return null;
 
-    const sessionSlots = isUs
-      ? US_SLOTS
-      : isHk
-        ? HK_SLOTS
-        : isComex
-          ? COMEX_SLOTS
-          : isDay24
-            ? DAY24_SLOTS
-            : CN_SLOTS;
-    const midSlot = isUs
-      ? Math.round(US_SLOTS / 2)
-      : isHk
-        ? HK_AM
-        : isComex
-          ? Math.round(COMEX_SLOTS / 2)
-          : isDay24
-            ? 12 * 60
-            : CN_AM;
+    const sessionSlots = useEqualSpace
+      ? Math.max(points.length, 2)
+      : isUs
+        ? US_SLOTS
+        : isHk
+          ? HK_SLOTS
+          : isComex
+            ? COMEX_SLOTS
+            : isDay24
+              ? DAY24_SLOTS
+              : CN_SLOTS;
+    const midSlot = useEqualSpace
+      ? Math.floor((sessionSlots - 1) / 2)
+      : isUs
+        ? Math.round(US_SLOTS / 2)
+        : isHk
+          ? HK_AM
+          : isComex
+            ? Math.round(COMEX_SLOTS / 2)
+            : isDay24
+              ? 12 * 60
+              : CN_AM;
     const toSlot = isUs
       ? usTimeToSlot
       : isHk
@@ -298,30 +311,49 @@ export function IndexSparkline({
               ];
 
     const slotted: { slot: number; price: number; avg: number | null; time: string }[] = [];
-    for (const p of points) {
-      const slot = toSlot(p.time);
-      if (slot == null) continue;
-      slotted.push({ slot, price: p.price, avg: p.avg ?? null, time: p.time });
-    }
-    if (slotted.length < 2) {
+    if (useEqualSpace) {
+      // 等距铺满整宽（日K / 基金分时）
       points.forEach((p, i) => {
-        const slot = Math.round((i / Math.max(points.length - 1, 1)) * (sessionSlots - 1));
-        const synth =
-          isDay24 || isComex
-            ? `${String(Math.floor(slot / 60)).padStart(2, "0")}:${String(slot % 60).padStart(2, "0")}`
-            : p.time;
         slotted.push({
-          slot,
+          slot: i,
           price: p.price,
           avg: p.avg ?? null,
-          time: /^\d{1,2}:\d{2}/.test(p.time) ? p.time : synth,
+          time: p.time,
         });
       });
+    } else {
+      for (const p of points) {
+        const slot = toSlot(p.time);
+        if (slot == null) continue;
+        slotted.push({ slot, price: p.price, avg: p.avg ?? null, time: p.time });
+      }
+      if (slotted.length < 2) {
+        points.forEach((p, i) => {
+          const slot = Math.round((i / Math.max(points.length - 1, 1)) * (sessionSlots - 1));
+          const synth =
+            isDay24 || isComex
+              ? `${String(Math.floor(slot / 60)).padStart(2, "0")}:${String(slot % 60).padStart(2, "0")}`
+              : p.time;
+          slotted.push({
+            slot,
+            price: p.price,
+            avg: p.avg ?? null,
+            time: /^\d{1,2}:\d{2}/.test(p.time) ? p.time : synth,
+          });
+        });
+      }
     }
 
     // AU9999 等：夜盘跨日折返时按顺序铺满；国际金用 comex 固定开收，不把右端改成「最新时刻」
     let axisLabels = timeLabels;
-    if (isDay24 && slotted.length >= 2) {
+    if (useEqualSpace && slotted.length >= 2) {
+      const n = slotted.length;
+      const at = (t: number) => slotted[Math.min(n - 1, Math.round(t * (n - 1)))];
+      axisLabels = [0, 0.25, 0.5, 0.75, 1].map((t) => {
+        const p = at(t);
+        return { slot: p.slot, label: (p.time || "").slice(0, 5) };
+      });
+    } else if (isDay24 && slotted.length >= 2) {
       let wraps = false;
       for (let i = 1; i < slotted.length; i++) {
         if (slotted[i].slot + 30 < slotted[i - 1].slot) {
@@ -444,7 +476,7 @@ export function IndexSparkline({
       hiCoord,
       loCoord,
     };
-  }, [points, prevClose, changePct, isUs, isHk, isDay24, isComex]);
+  }, [points, prevClose, changePct, isUs, isHk, isDay24, isComex, useEqualSpace]);
 
   function pickAtClientX(clientX: number) {
     if (!built || !svgRef.current) return;
@@ -507,7 +539,7 @@ export function IndexSparkline({
         ref={svgRef}
         className={`market-spark market-spark-pro${compact ? " market-spark-compact" : ""}${interactive ? " market-spark-interactive" : ""}`}
         viewBox={`0 0 ${VB_W} ${VB_H}`}
-        preserveAspectRatio="xMidYMid meet"
+        preserveAspectRatio="none"
         role="img"
         aria-label={label}
         shapeRendering="geometricPrecision"
@@ -745,13 +777,13 @@ export function IndexSparkline({
       )}
 
       {/* Time axis */}
-      {built.timeLabels.map(({ slot, label: tl }) => {
+      {built.timeLabels.map(({ slot, label: tl }, i) => {
         const x = PAD.left + (slot / (built.sessionSlots - 1)) * PLOT_W;
         const anchor =
           slot === 0 ? "start" : slot >= built.sessionSlots - 1 ? "end" : "middle";
         return (
           <text
-            key={tl}
+            key={`t-${i}-${tl}`}
             x={x}
             y={PAD.top + PLOT_H + 11}
             textAnchor={anchor}

@@ -1,4 +1,4 @@
-"""Market / holdings / interests news — EM + Sina + 同花顺."""
+"""Market / holdings / interests news — EM + Sina + 同花顺 + 国际 RSS."""
 
 from __future__ import annotations
 
@@ -6,8 +6,10 @@ import json
 import logging
 import re
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 
 import httpx
@@ -18,15 +20,24 @@ _MARKET_CACHE: dict[str, tuple[float, list["NewsItem"]]] = {}
 _MARKET_TTL = 60.0
 _SYMBOL_CACHE: dict[str, tuple[float, list["NewsItem"]]] = {}
 _SYMBOL_TTL = 90.0
+_MARKET_CACHE_MAX = 24
+_SYMBOL_CACHE_MAX = 64
+_ARTICLE_CACHE_MAX = 80
 
 _FEED_CAP = 100
-_HOLDINGS_SYMBOL_CAP = 12
+_HOLDINGS_SYMBOL_CAP = 16
 _PER_SYMBOL_LIMIT = 40
 _PER_INTEREST_LIMIT = 100
+_PER_SYMBOL_NAME_LIMIT = 20
+_PER_SYMBOL_HSF10_LIMIT = 12
+_PER_SYMBOL_ANN_LIMIT = 8
 
-# Market boards: 要闻 = 7×24 + 多源；其余 = EM 栏目/关键词（并补搜索以丰富来源）
+# Market boards: 要闻 = 7×24 + 多源；国际 = RSS + 海外宏观；港美 = 中文港美关键词 + CN RSS
 MARKET_BOARDS: list[dict[str, str]] = [
     {"id": "headline", "label": "要闻", "kind": "fast", "value": "102"},
+    {"id": "hkus", "label": "港美", "kind": "hkus", "value": "hkus"},
+    {"id": "world", "label": "国际", "kind": "world", "value": "world"},
+    {"id": "announce", "label": "公告", "kind": "announce", "value": "announce"},
     {"id": "tech", "label": "科技", "kind": "column", "value": "360"},
     {"id": "agri", "label": "农业", "kind": "keyword", "value": "农业"},
     {"id": "auto", "label": "汽车", "kind": "column", "value": "358"},
@@ -37,6 +48,43 @@ MARKET_BOARDS: list[dict[str, str]] = [
     {"id": "company", "label": "公司", "kind": "column", "value": "354"},
 ]
 _BOARD_BY_ID = {b["id"]: b for b in MARKET_BOARDS}
+
+# Public RSS — no API key; single-feed failure must not break the board
+_WORLD_RSS: list[tuple[str, str]] = [
+    ("https://feeds.bbci.co.uk/news/business/rss.xml", "BBC Business"),
+    ("https://www.cnbc.com/id/100003114/device/rss/rss.html", "CNBC"),
+    ("https://feeds.marketwatch.com/marketwatch/topstories/", "MarketWatch"),
+    (
+        "https://news.google.com/rss/search?q=Federal+Reserve+OR+gold+OR+oil&hl=en-US&gl=US&ceid=US:en",
+        "Google News",
+    ),
+]
+_WORLD_KEYWORDS = ("美联储", "美股", "黄金", "原油", "非农")
+
+# 港美中文：东财关键词 + Google 中文 RSS（无新爬虫主机）
+_HKUS_KEYWORDS = (
+    "港股",
+    "美股",
+    "恒生",
+    "纳斯达克",
+    "道琼斯",
+    "标普500",
+    "中概股",
+    "ADR",
+)
+_HKUS_RSS: list[tuple[str, str]] = [
+    (
+        "https://news.google.com/rss/search?q=%E6%B8%AF%E8%82%A1+OR+%E6%81%92%E7%94%9F&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+        "Google 港股",
+    ),
+    (
+        "https://news.google.com/rss/search?q=%E7%BE%8E%E8%82%A1+OR+%E7%BA%B3%E6%96%AF%E8%BE%BE%E5%85%8B&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+        "Google 美股",
+    ),
+]
+
+# 公告速览：关键词聚合（持仓明细公告仍走 holdings 源）
+_ANNOUNCE_KEYWORDS = ("公司公告", "业绩预告", "股份回购", "增减持", "分红")
 
 _HEADERS = {
     "User-Agent": (
@@ -53,6 +101,29 @@ _ARTICLE_CACHE: dict[str, tuple[float, "NewsArticle"]] = {}
 _ARTICLE_TTL = 300.0
 
 
+def _cache_put(
+    store: dict,
+    key: str,
+    value: object,
+    *,
+    max_entries: int,
+) -> None:
+    """Insert with soft cap — drop oldest by timestamp when over max."""
+    now = time.time()
+    store[key] = (now, value)
+    if len(store) <= max_entries:
+        return
+    # Drop expired first, then oldest
+    expired = [k for k, (ts, _) in store.items() if now - float(ts) > 3600]
+    for k in expired:
+        store.pop(k, None)
+        if len(store) <= max_entries:
+            return
+    while len(store) > max_entries:
+        oldest = min(store.items(), key=lambda kv: float(kv[1][0]))[0]
+        store.pop(oldest, None)
+
+
 @dataclass
 class NewsItem:
     id: str
@@ -62,6 +133,7 @@ class NewsItem:
     published_at: str
     url: str
     symbols: list[str] = field(default_factory=list)
+    region: str = "cn"  # cn | world
 
 
 @dataclass
@@ -306,7 +378,7 @@ def _fetch_em_article(code: str) -> NewsArticle | None:
         url=url,
         images=images,
     )
-    _ARTICLE_CACHE[f"em:v2:{code}"] = (now, article)
+    _cache_put(_ARTICLE_CACHE, f"em:v2:{code}", article, max_entries=_ARTICLE_CACHE_MAX)
     return article
 
 
@@ -381,7 +453,7 @@ def _fetch_sina_article(id_or_url: str) -> NewsArticle | None:
         url=url,
         images=images,
     )
-    _ARTICLE_CACHE[cache_key] = (now, article)
+    _cache_put(_ARTICLE_CACHE, cache_key, article, max_entries=_ARTICLE_CACHE_MAX)
     return article
 
 
@@ -450,7 +522,7 @@ def _fetch_ths_article(url: str) -> NewsArticle | None:
         url=raw,
         images=images,
     )
-    _ARTICLE_CACHE[cache_key] = (now, article)
+    _cache_put(_ARTICLE_CACHE, cache_key, article, max_entries=_ARTICLE_CACHE_MAX)
     return article
 
 
@@ -537,11 +609,12 @@ def format_news_digest(
     *,
     title: str,
     limit: int = 8,
+    filtered: bool = False,
 ) -> str:
     """Compact Chinese digest for Agent tools (title + age + related)."""
     lim = max(1, min(int(limit or 5), 12))
     lines = [
-        f"【{title}】",
+        f"【{title}】" + (" · 相关性已筛选" if filtered else ""),
         "引用规则：优先「今日」；≥3天前只当背景，勿当今天突发驱动；无条目就说没有。",
     ]
     if not items:
@@ -552,7 +625,11 @@ def format_news_digest(
         src = (it.source or "").strip()
         summary = (it.summary or "").strip().replace("\n", " ")[:100]
         syms = ",".join((it.symbols or [])[:4])
-        bit = f"- [{age}] {it.title or '（无标题）'}"
+        region = (getattr(it, "region", None) or "cn").strip()
+        bit = f"- [{age}]"
+        if region == "world":
+            bit += " [国际]"
+        bit += f" {it.title or '（无标题）'}"
         if src:
             bit += f" · {src}"
         if syms:
@@ -632,6 +709,12 @@ def get_market_news(limit: int = _FEED_CAP, board: str = "headline") -> tuple[st
                     batches.append(fut.result() or [])
                 except Exception:
                     logger.exception("Headline multi-source worker failed")
+    elif kind == "world":
+        batches = _fetch_world_news_batches(need)
+    elif kind == "hkus":
+        batches = _fetch_hkus_news_batches(need)
+    elif kind == "announce":
+        batches = _fetch_announce_news_batches(need)
     elif kind == "column":
         with ThreadPoolExecutor(max_workers=2) as pool:
             futs = [
@@ -649,8 +732,172 @@ def get_market_news(limit: int = _FEED_CAP, board: str = "headline") -> tuple[st
         batches = []
 
     items = _merge_news(batches, need)
-    _MARKET_CACHE[board_id] = (now, items)
+    if board_id in {"world", "hkus"}:
+        for it in items:
+            it.region = "world"
+    if board_id == "announce":
+        for it in items:
+            if not (it.summary or "").strip():
+                it.summary = "公司公告速览"
+    _cache_put(_MARKET_CACHE, board_id, items, max_entries=_MARKET_CACHE_MAX)
     return title, items[:need]
+
+
+def _tag_region(items: list[NewsItem], region: str) -> list[NewsItem]:
+    for it in items:
+        it.region = region
+    return items
+
+
+def _fmt_rss_date(raw: str) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    try:
+        dt = parsedate_to_datetime(s)
+        if dt is not None:
+            return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        pass
+    m = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", s)
+    if m:
+        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    return s[:16]
+
+
+def _local(tag: str) -> str:
+    """Strip XML namespace for ElementTree tags."""
+    if "}" in tag:
+        return tag.rsplit("}", 1)[-1]
+    return tag
+
+
+def _fetch_rss_feed(url: str, *, source: str, limit: int = 40) -> list[NewsItem]:
+    """Parse a public RSS/Atom feed into NewsItems (region=world)."""
+    items: list[NewsItem] = []
+    try:
+        headers = {
+            **_HEADERS,
+            "Accept": "application/rss+xml, application/xml, text/xml, */*",
+            "Referer": "https://www.google.com/",
+        }
+        with httpx.Client(timeout=14.0, headers=headers, follow_redirects=True) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            raw = resp.content
+        root = ET.fromstring(raw)
+        nodes: list[ET.Element] = []
+        # RSS 2.0
+        for ch in root.iter():
+            if _local(ch.tag) == "item":
+                nodes.append(ch)
+        # Atom
+        if not nodes:
+            for ch in root.iter():
+                if _local(ch.tag) == "entry":
+                    nodes.append(ch)
+
+        for i, node in enumerate(nodes):
+            if len(items) >= limit:
+                break
+            title = ""
+            link = ""
+            summary = ""
+            published = ""
+            nid = ""
+            for child in list(node):
+                name = _local(child.tag)
+                text = (child.text or "").strip()
+                if name == "title":
+                    title = _strip_em(text)
+                elif name == "link":
+                    href = (child.attrib.get("href") or "").strip()
+                    link = href or text or link
+                elif name in {"description", "summary", "content"}:
+                    summary = _strip_em(re.sub(r"<[^>]+>", " ", text))[:280]
+                elif name in {"pubDate", "published", "updated", "date"}:
+                    published = _fmt_rss_date(text)
+                elif name in {"guid", "id"}:
+                    nid = text[:120]
+            if not title:
+                continue
+            if not link:
+                link = nid or url
+            items.append(
+                NewsItem(
+                    id=nid or f"rss-{source}-{i}",
+                    title=title,
+                    summary=summary,
+                    source=source,
+                    published_at=published,
+                    url=link,
+                    symbols=[],
+                    region="world",
+                )
+            )
+    except Exception:
+        logger.exception("RSS fetch failed source=%s url=%s", source, url)
+    return items
+
+
+def _fetch_world_news_batches(limit: int) -> list[list[NewsItem]]:
+    """International board: RSS + CN keyword coverage of overseas macro."""
+    need = max(1, min(limit, _FEED_CAP))
+    per_kw = max(10, need // max(1, len(_WORLD_KEYWORDS)))
+    batches: list[list[NewsItem]] = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = [
+            pool.submit(_fetch_rss_feed, feed_url, source=src, limit=need)
+            for feed_url, src in _WORLD_RSS
+        ]
+        for kw in _WORLD_KEYWORDS:
+            futs.append(pool.submit(_fetch_keyword_news, kw, per_kw))
+        for fut in as_completed(futs):
+            try:
+                rows = fut.result() or []
+                batches.append(_tag_region(rows, "world"))
+            except Exception:
+                logger.exception("World news worker failed")
+    return batches
+
+
+def _fetch_hkus_news_batches(limit: int) -> list[list[NewsItem]]:
+    """HK / US Chinese coverage: EM keywords + Google News zh-CN RSS."""
+    need = max(1, min(limit, _FEED_CAP))
+    per_kw = max(8, need // max(1, len(_HKUS_KEYWORDS)))
+    batches: list[list[NewsItem]] = []
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futs = [
+            pool.submit(_fetch_rss_feed, feed_url, source=src, limit=need)
+            for feed_url, src in _HKUS_RSS
+        ]
+        for kw in _HKUS_KEYWORDS:
+            futs.append(pool.submit(_fetch_keyword_news, kw, per_kw))
+        for fut in as_completed(futs):
+            try:
+                rows = fut.result() or []
+                # Chinese copy about HK/US markets — keep region=world for quotas
+                batches.append(_tag_region(rows, "world"))
+            except Exception:
+                logger.exception("HK/US news worker failed")
+    return batches
+
+
+def _fetch_announce_news_batches(limit: int) -> list[list[NewsItem]]:
+    """Market-level announcement flash via keyword search (not per-symbol F10)."""
+    need = max(1, min(limit, _FEED_CAP))
+    per_kw = max(10, need // max(1, len(_ANNOUNCE_KEYWORDS)))
+    batches: list[list[NewsItem]] = []
+    with ThreadPoolExecutor(max_workers=min(6, len(_ANNOUNCE_KEYWORDS))) as pool:
+        futs = [
+            pool.submit(_fetch_keyword_news, kw, per_kw) for kw in _ANNOUNCE_KEYWORDS
+        ]
+        for fut in as_completed(futs):
+            try:
+                batches.append(fut.result() or [])
+            except Exception:
+                logger.exception("Announce news worker failed")
+    return batches
 
 
 def _fetch_fast_news(fast_column: str, limit: int = _FEED_CAP) -> list[NewsItem]:
@@ -840,7 +1087,7 @@ def _fetch_keyword_news(keyword: str, limit: int = _FEED_CAP) -> list[NewsItem]:
     except Exception:
         logger.exception("Keyword news fetch failed for %s", kw)
 
-    _SYMBOL_CACHE[cache_key] = (now, items)
+    _cache_put(_SYMBOL_CACHE, cache_key, items, max_entries=_SYMBOL_CACHE_MAX)
     return items[:limit]
 
 
@@ -959,34 +1206,250 @@ def _fetch_ths_push(limit: int = _FEED_CAP) -> list[NewsItem]:
     return items[:limit]
 
 
-def _fetch_symbol_news(symbol: str) -> list[NewsItem]:
-    sym = symbol.strip()
+def _sec_prefix(symbol: str, market: str = "SH") -> str:
+    """East Money HSF10 code prefix: SH600519 / SZ000001."""
+    sym = (symbol or "").strip()
+    mkt = (market or "SH").upper()
     if not sym:
-        return []
-    now = time.time()
-    cached = _SYMBOL_CACHE.get(f"sym:{sym}")
-    if cached and now - cached[0] < _SYMBOL_TTL:
-        return cached[1]
+        return ""
+    if mkt in {"SZ", "OF"} and (sym.startswith(("0", "1", "2", "3"))):
+        return f"SZ{sym}"
+    if mkt == "BJ" or sym.startswith(("8", "4")):
+        return f"BJ{sym}"
+    return f"SH{sym}"
 
-    rows = _fetch_keyword_news(sym, limit=_PER_SYMBOL_LIMIT)
-    items = [
-        NewsItem(
-            id=r.id,
-            title=r.title,
-            summary=r.summary,
-            source=r.source,
-            published_at=r.published_at,
-            url=r.url,
-            symbols=[sym],
+
+def _tag_symbols(items: list[NewsItem], symbol: str) -> list[NewsItem]:
+    sym = symbol.strip()
+    out: list[NewsItem] = []
+    for r in items:
+        syms = list(r.symbols) if r.symbols else []
+        if sym and sym not in syms:
+            syms = [sym, *syms]
+        out.append(
+            NewsItem(
+                id=r.id,
+                title=r.title,
+                summary=r.summary,
+                source=r.source,
+                published_at=r.published_at,
+                url=r.url,
+                symbols=syms,
+            )
         )
-        for r in rows
-    ]
-    _SYMBOL_CACHE[f"sym:{sym}"] = (now, items)
+    return out
+
+
+def _fetch_hsf10_stock_news(symbol: str, market: str = "SH") -> list[NewsItem]:
+    """个股 F10 公司资讯 + 公告（对 ETF 常空，靠名称搜索补）。"""
+    code = _sec_prefix(symbol, market)
+    if not code:
+        return []
+    items: list[NewsItem] = []
+    seen: set[str] = set()
+    try:
+        headers = {
+            **_HEADERS,
+            "Referer": "https://emweb.securities.eastmoney.com/",
+        }
+        url = "https://emweb.securities.eastmoney.com/PC_HSF10/NewsBulletin/PageAjax"
+        with httpx.Client(timeout=12.0, headers=headers, follow_redirects=True) as client:
+            resp = client.get(url, params={"code": code})
+            resp.raise_for_status()
+            data = resp.json() or {}
+
+        gszx = data.get("gszx") or {}
+        rows = ((gszx.get("data") if isinstance(gszx, dict) else None) or {}).get("items") or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            title = _strip_em(str(row.get("title") or ""))
+            if not title:
+                continue
+            raw_url = str(row.get("uniqueUrl") or row.get("url") or "").strip() or None
+            nid = str(row.get("code") or row.get("infoCode") or "").strip()
+            key = raw_url or nid or title
+            if key in seen:
+                continue
+            seen.add(key)
+            pub = _fmt_unix(row.get("showDateTime") or row.get("publishDate"))
+            items.append(
+                NewsItem(
+                    id=nid or f"hsf-{len(items)}",
+                    title=title,
+                    summary=_strip_em(str(row.get("summary") or "")),
+                    source=_strip_em(str(row.get("source") or "")) or "东方财富F10",
+                    published_at=pub,
+                    url=_article_url(nid, raw_url),
+                    symbols=[symbol.strip()],
+                )
+            )
+            if len(items) >= _PER_SYMBOL_HSF10_LIMIT:
+                break
+
+        for row in data.get("gsgg") or []:
+            if not isinstance(row, dict):
+                continue
+            title = _strip_em(str(row.get("title") or ""))
+            if not title:
+                continue
+            art = str(row.get("art_code") or "").strip()
+            key = art or title
+            if key in seen:
+                continue
+            seen.add(key)
+            pub = str(row.get("display_time") or row.get("notice_date") or "").strip()
+            if pub and ":" in pub:
+                # "2026-07-17 21:26:22:242" → truncate millis segment
+                parts = pub.split(":")
+                if len(parts) >= 4:
+                    pub = ":".join(parts[:3])
+            ann_url = (
+                f"https://data.eastmoney.com/notices/detail/{symbol.strip()}/{art}.html"
+                if art
+                else ""
+            )
+            items.append(
+                NewsItem(
+                    id=art or f"gg-{len(items)}",
+                    title=title,
+                    summary="公司公告",
+                    source="东方财富公告",
+                    published_at=pub[:19] if pub else "",
+                    url=ann_url,
+                    symbols=[symbol.strip()],
+                )
+            )
+            if len(items) >= _PER_SYMBOL_HSF10_LIMIT + _PER_SYMBOL_ANN_LIMIT:
+                break
+    except Exception:
+        logger.exception("HSF10 stock news failed for %s", code)
     return items
 
 
-def get_holdings_news(symbols: list[str], limit: int = _FEED_CAP) -> list[NewsItem]:
-    """Fetch & merge news for unique symbols (capped). Sorted newest-first."""
+def _fetch_em_announcements(symbol: str) -> list[NewsItem]:
+    """东财公告列表（与 HSF10 gsgg 互补）。"""
+    sym = symbol.strip()
+    if not sym:
+        return []
+    items: list[NewsItem] = []
+    try:
+        headers = {
+            **_HEADERS,
+            "Referer": "https://data.eastmoney.com/notices/",
+        }
+        url = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+        params = {
+            "sr": -1,
+            "page_size": str(_PER_SYMBOL_ANN_LIMIT),
+            "page_index": 1,
+            "ann_type": "A",
+            "client_source": "web",
+            "stock_list": sym,
+        }
+        with httpx.Client(timeout=12.0, headers=headers, follow_redirects=True) as client:
+            resp = client.get(url, params=params)
+            resp.raise_for_status()
+            rows = ((resp.json() or {}).get("data") or {}).get("list") or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            title = _strip_em(str(row.get("title") or ""))
+            art = str(row.get("art_code") or "").strip()
+            if not title:
+                continue
+            pub = str(row.get("display_time") or row.get("notice_date") or "").strip()
+            if pub.count(":") >= 3:
+                pub = ":".join(pub.split(":")[:3])
+            cols = row.get("columns") or []
+            col = ""
+            if isinstance(cols, list) and cols and isinstance(cols[0], dict):
+                col = _strip_em(str(cols[0].get("column_name") or ""))
+            items.append(
+                NewsItem(
+                    id=art or f"ann-{len(items)}",
+                    title=title,
+                    summary=col or "公司公告",
+                    source="东方财富公告",
+                    published_at=pub[:19] if pub else "",
+                    url=(
+                        f"https://data.eastmoney.com/notices/detail/{sym}/{art}.html"
+                        if art
+                        else ""
+                    ),
+                    symbols=[sym],
+                )
+            )
+    except Exception:
+        logger.exception("EM announcements failed for %s", sym)
+    return items
+
+
+def _fetch_symbol_news(
+    symbol: str,
+    *,
+    name: str = "",
+    market: str = "SH",
+) -> list[NewsItem]:
+    """Multi-source per symbol: EM code search + 名称搜索 + F10 资讯/公告."""
+    sym = symbol.strip()
+    if not sym:
+        return []
+    nm = (name or "").strip()
+    # Avoid name==code / pure digits as "name"
+    if nm == sym or (nm.isdigit() and len(nm) <= 6):
+        nm = ""
+    cache_key = f"sym:{sym}:{nm}:{market.upper()}"
+    now = time.time()
+    cached = _SYMBOL_CACHE.get(cache_key)
+    if cached and now - cached[0] < _SYMBOL_TTL:
+        return cached[1]
+
+    batches: list[list[NewsItem]] = []
+
+    def _code_search() -> list[NewsItem]:
+        return _tag_symbols(
+            _fetch_keyword_news(sym, limit=_PER_SYMBOL_LIMIT),
+            sym,
+        )
+
+    def _name_search() -> list[NewsItem]:
+        if not nm:
+            return []
+        return _tag_symbols(
+            _fetch_keyword_news(nm, limit=_PER_SYMBOL_NAME_LIMIT),
+            sym,
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = [
+            pool.submit(_code_search),
+            pool.submit(_name_search),
+            pool.submit(_fetch_hsf10_stock_news, sym, market),
+            pool.submit(_fetch_em_announcements, sym),
+        ]
+        for fut in as_completed(futs):
+            try:
+                batches.append(fut.result() or [])
+            except Exception:
+                logger.exception("Symbol multi-source worker failed for %s", sym)
+
+    items = _merge_news(batches, _PER_SYMBOL_LIMIT + _PER_SYMBOL_NAME_LIMIT)
+    _cache_put(_SYMBOL_CACHE, cache_key, items, max_entries=_SYMBOL_CACHE_MAX)
+    return items
+
+
+def get_holdings_news(
+    symbols: list[str],
+    limit: int = _FEED_CAP,
+    *,
+    names: dict[str, str] | None = None,
+    markets: dict[str, str] | None = None,
+) -> list[NewsItem]:
+    """Fetch & merge news for unique symbols (capped). Sorted newest-first.
+
+    Optional names/markets improve ETF/个股召回（名称搜索 + F10）。
+    """
     unique: list[str] = []
     seen: set[str] = set()
     for s in symbols:
@@ -1001,9 +1464,19 @@ def get_holdings_news(symbols: list[str], limit: int = _FEED_CAP) -> list[NewsIt
     if not unique:
         return []
 
+    name_map = names or {}
+    mkt_map = markets or {}
     batches: list[list[NewsItem]] = []
     with ThreadPoolExecutor(max_workers=min(6, len(unique))) as pool:
-        futures = {pool.submit(_fetch_symbol_news, sym): sym for sym in unique}
+        futures = {
+            pool.submit(
+                _fetch_symbol_news,
+                sym,
+                name=str(name_map.get(sym) or ""),
+                market=str(mkt_map.get(sym) or "SH"),
+            ): sym
+            for sym in unique
+        }
         for fut in as_completed(futures):
             sym = futures[fut]
             try:

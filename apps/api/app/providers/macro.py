@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
@@ -14,6 +15,9 @@ logger = logging.getLogger(__name__)
 
 _SH = ZoneInfo("Asia/Shanghai")
 _WEEKDAY = "一二三四五六日"
+
+_NEWS_STRIP_CACHE: tuple[float, dict] | None = None
+_NEWS_STRIP_TTL = 45.0
 
 
 @dataclass
@@ -442,18 +446,18 @@ def news_keyword_for_topic(topic_id: str) -> str:
     return topic_id
 
 
-def format_macro_text(topic_query: str) -> str:
+def format_macro_text(topic_query: str, *, user_text: str = "") -> str:
     q = (topic_query or "").strip()
     # 总览：常见品种一块看（零售高频）
     if not q or q.lower() in {"overview", "board", "看板", "总览", "宏观", "商品"}:
         return format_macro_overview()
 
     topic = resolve_topic(q)
-    # 黄金：与 App「股票→黄金」看板一致，勿用期货连续合约话术
+    # 黄金：精简速览（按用户问法挑品种），勿把 App 全页灌给模型复读
     if topic is not None and topic["id"] == "gold":
         from app.providers.gold import format_gold_board_text
 
-        return format_gold_board_text()
+        return format_gold_board_text(user_text or q)
 
     topic_id, quotes, err = get_macro_quotes(topic_query)
     if err and not quotes:
@@ -510,8 +514,65 @@ def format_macro_overview() -> str:
         )
         + "。想看细的再说主题名。",
     ]
-    bits: list[str] = []
-    # 黄金速览：取 App 黄金页国内 AU9999（与问黄金细查同源）
+    strip = build_news_macro_strip()
+    bits = [
+        f"{it['name']} {it['price']}{it.get('unit') or ''}（"
+        f"{'+' if (it.get('change_pct') or 0) >= 0 else ''}"
+        f"{it['change_pct']:.2f}%"
+        f"，{it.get('freshness') or '—'}）"
+        if it.get("change_pct") is not None
+        else f"{it['name']} {it['price']}{it.get('unit') or ''}"
+        for it in strip.get("items") or []
+        if it.get("price") is not None
+    ]
+    if bits:
+        lines.append("速览：" + "；".join(bits) + "。")
+    else:
+        lines.append("速览暂时拉不到（勿编造）。")
+    return "\n".join(lines)
+
+
+def build_news_macro_strip() -> dict:
+    """Compact calendar + macro pulse for News page header (no LLM)."""
+    global _NEWS_STRIP_CACHE
+    now_ts = time.time()
+    if _NEWS_STRIP_CACHE and now_ts - _NEWS_STRIP_CACHE[0] < _NEWS_STRIP_TTL:
+        return _NEWS_STRIP_CACHE[1]
+
+    from app.providers.session import cn_session
+
+    now = shanghai_now()
+    wd = _WEEKDAY[now.weekday()]
+    try:
+        sess = cn_session()
+        session_hint = str(getattr(sess, "label", None) or getattr(sess, "status", "") or "")
+    except Exception:
+        session_hint = ""
+
+    items: list[dict] = []
+
+    def _push(
+        *,
+        key: str,
+        name: str,
+        price: float | None,
+        unit: str = "",
+        change_pct: float | None = None,
+        freshness: str = "",
+    ) -> None:
+        if price is None:
+            return
+        items.append(
+            {
+                "key": key,
+                "name": name,
+                "price": float(price),
+                "unit": unit or "",
+                "change_pct": float(change_pct) if change_pct is not None else None,
+                "freshness": freshness or "",
+            }
+        )
+
     try:
         from app.providers.gold import get_gold_board
 
@@ -520,23 +581,46 @@ def format_macro_overview() -> str:
             if sec.id != "domestic":
                 continue
             for it in sec.items:
-                if it.id == "au9999" and it.price is not None:
-                    chg = f"{it.change_pct:+.2f}%" if it.change_pct is not None else "—"
-                    bits.append(f"AU9999 {it.price}{it.unit or '元/克'}（{chg}）")
+                if it.id == "au9999":
+                    _push(
+                        key="au9999",
+                        name="AU9999",
+                        price=it.price,
+                        unit=it.unit or "元/克",
+                        change_pct=it.change_pct,
+                        freshness=it.freshness or "",
+                    )
                     break
     except Exception:
-        logger.exception("overview gold board failed")
+        logger.exception("news macro strip gold failed")
+
     for tid in ("oil", "usd_cny", "copper"):
-        _id, quotes, err = get_macro_quotes(tid)
-        if err or not quotes:
-            continue
-        # Prefer CN venue first for oil, else first quote
-        pick = next((q for q in quotes if q.venue in {"spot", "cn_future", "a_share", "fx"}), quotes[0])
-        chg = f"{pick.change_pct:+.2f}%" if pick.change_pct is not None else "—"
-        tag = freshness_label(pick.as_of, venue=pick.venue)
-        bits.append(f"{pick.name} {pick.price}{pick.unit}（{chg}，{tag}）")
-    if bits:
-        lines.append("速览：" + "；".join(bits) + "。")
-    else:
-        lines.append("速览暂时拉不到（勿编造）。")
-    return "\n".join(lines)
+        try:
+            _id, quotes, err = get_macro_quotes(tid)
+            if err or not quotes:
+                continue
+            pick = next(
+                (q for q in quotes if q.venue in {"spot", "cn_future", "fx", "a_share"}),
+                quotes[0],
+            )
+            _push(
+                key=pick.key or tid,
+                name=pick.name,
+                price=pick.price,
+                unit=pick.unit or "",
+                change_pct=pick.change_pct,
+                freshness=freshness_label(pick.as_of, venue=pick.venue),
+            )
+        except Exception:
+            logger.exception("news macro strip %s failed", tid)
+
+    out = {
+        "as_of": now.strftime("%Y-%m-%d %H:%M"),
+        "weekday": wd,
+        "session_hint": session_hint,
+        "calendar": f"上海 {now.strftime('%m-%d %H:%M')} · 星期{wd}",
+        "items": items[:6],
+        "note": "" if items else "行情源暂时拉不到，下拉刷新重试",
+    }
+    _NEWS_STRIP_CACHE = (now_ts, out)
+    return out

@@ -1,11 +1,13 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import {
   Bell,
   Check,
   ChevronLeft,
   ChevronRight,
+  Download,
   Eye,
   EyeOff,
   KeyRound,
@@ -18,6 +20,12 @@ import { useOverlay } from "@/components/overlay/OverlayContext";
 import { api } from "@/lib/api";
 import { clearSession, getStoredUser, setSession, getAccessToken } from "@/lib/auth";
 import { haptics } from "@/lib/haptics";
+import {
+  canNativeInstall,
+  promptNativeInstall,
+  subscribeInstallPrompt,
+} from "@/components/layout/InstallPrompt";
+import { isStandalone } from "@/lib/standalone";
 import type { AnzaiIdentity, AnzaiIdentityRole, NotifySettings } from "@/lib/types";
 import type { AuthUser } from "@/lib/auth";
 
@@ -99,6 +107,7 @@ export function AgentSettings({
   onClearHistory,
 }: Props) {
   const { toast } = useOverlay();
+  const router = useRouter();
   const [profile, setProfile] = useState<AuthUser | null>(() => getStoredUser());
   const [saving, setSaving] = useState(false);
   const [customOpen, setCustomOpen] = useState(false);
@@ -116,6 +125,18 @@ export function AgentSettings({
   const [notifyToken, setNotifyToken] = useState("");
   const [showToken, setShowToken] = useState(false);
   const [notifyBusy, setNotifyBusy] = useState(false);
+  const [installReady, setInstallReady] = useState(false);
+  const [standalone, setStandalone] = useState(false);
+
+  useEffect(() => {
+    setStandalone(isStandalone());
+  }, []);
+
+  useEffect(() => {
+    const sync = () => setInstallReady(canNativeInstall());
+    sync();
+    return subscribeInstallPrompt(sync);
+  }, []);
 
   useEffect(() => {
     setLocalIdentity(identity);
@@ -332,6 +353,37 @@ export function AgentSettings({
               </span>
               <ChevronRight size={16} strokeWidth={2} absoluteStrokeWidth aria-hidden />
             </button>
+            {!standalone ? (
+              <button
+                type="button"
+                className="agent-settings-row"
+                onClick={() => {
+                  haptics.tap();
+                  void (async () => {
+                    if (installReady) {
+                      const outcome = await promptNativeInstall();
+                      if (outcome === "accepted") toast("已开始安装", "success");
+                      return;
+                    }
+                    toast(
+                      "iPhone：Safari 底部分享 →「添加到主屏幕」；安卓 Chrome 可用系统安装提示",
+                      "info",
+                    );
+                  })();
+                }}
+              >
+                <span className="agent-settings-row-main">
+                  <span className="agent-settings-row-label">
+                    <Download size={15} strokeWidth={2} absoluteStrokeWidth aria-hidden />
+                    安装到主屏幕
+                  </span>
+                  <span className="agent-settings-row-meta">
+                    {installReady ? "点击安装" : "全屏使用 · 像原生 App"}
+                  </span>
+                </span>
+                <ChevronRight size={16} strokeWidth={2} absoluteStrokeWidth aria-hidden />
+              </button>
+            ) : null}
             <button
               type="button"
               className="agent-settings-row agent-settings-row-danger"
@@ -418,7 +470,7 @@ export function AgentSettings({
                     /* client clears anyway */
                   }
                   clearSession();
-                  window.location.href = "/login";
+                  router.replace("/login");
                 }}
               >
                 <span className="agent-settings-row-main">

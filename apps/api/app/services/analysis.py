@@ -17,7 +17,7 @@ from app.providers.intraday import get_intraday
 from app.providers.session import cn_session
 from app.providers.kline import get_daily_klines
 from app.providers.macro import format_macro_text, topics_mentioned
-from app.providers.news import get_holdings_news
+from app.providers.news import get_holdings_news, get_market_news
 from app.services.analysis_recipes import (
     AGENT_LABELS,
     get_recipe,
@@ -27,7 +27,8 @@ from app.services.analysis_recipes import (
 )
 from app.services.analysis_tiers import TIER_IDS, normalize_degree
 from app.services.portfolio import build_portfolio, consolidate_same_symbol
-from app.services.quote import get_quotes, normalize_symbol
+from app.providers.quote import get_quotes, normalize_symbol
+from app.services.rebalance import draft_rebalance_from_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,178 @@ _DEPTH_FLOW_CAP = 5
 _NEWS_LIGHT = 5
 _NEWS_STANDARD = 12
 _NEWS_DEEP = 20
+_GOLD_ETF_SYMS = frozenset({"159937", "518660", "518880", "518800", "159934"})
+
+
+def _asset_kind(market: str, symbol: str, name: str = "") -> str:
+    """股票 / 场内ETF / 黄金ETF / 场外基金 / 黄金积存 — 委员会证据用。"""
+    m = (market or "").upper()
+    sym = (symbol or "").strip()
+    nm = name or ""
+    if m == "JD":
+        return "黄金积存"
+    if m == "GDS" or sym.upper() == "AU9999":
+        return "黄金现货"
+    if m == "OF":
+        return "场外基金"
+    if sym in _GOLD_ETF_SYMS or "黄金" in nm:
+        return "黄金ETF"
+    if sym.startswith(("51", "56", "58", "15", "16", "12")):
+        return "场内ETF"
+    return "股票"
+
+
+def _knowledge_queries(
+    scope: str,
+    quote_rows: list[dict[str, Any]],
+    *,
+    head_weight: float | None = None,
+) -> list[str]:
+    """检索词：纪律/框架向，不当行情关键词。"""
+    queries: list[str] = []
+    kinds = {str(r.get("asset_kind") or "") for r in quote_rows}
+    names = [
+        str(r.get("name") or r.get("symbol") or "").strip()
+        for r in quote_rows[:3]
+        if str(r.get("name") or r.get("symbol") or "").strip()
+    ]
+    if scope == "portfolio":
+        queries.append("持仓分散 仓位偏重 宜减不宜加")
+        if isinstance(head_weight, (int, float)) and float(head_weight) >= 35:
+            queries.append("仓位太重 别再加仓 观望")
+        if any("黄金" in k for k in kinds):
+            queries.append("黄金还追吗 仓位纪律")
+            queries.append("黄金投资风险 免责 强制召回")
+        if any(k in ("场外基金", "场内ETF") or "基金" in k for k in kinds):
+            queries.append("基金仓位 观望 加减")
+            queries.append("基金投资风险 免责 强制召回")
+        if any(k == "股票" for k in kinds):
+            queries.append("股票投资风险 免责 强制召回")
+    else:
+        row = quote_rows[0] if quote_rows else {}
+        name = str(row.get("name") or row.get("symbol") or "").strip()
+        kind = str(row.get("asset_kind") or "")
+        if name:
+            queries.append(f"{name} {kind} 怎么看 买卖纪律".strip())
+        if "黄金" in kind or "黄金" in name:
+            queries.append("黄金还追吗")
+            queries.append("黄金投资风险 免责 强制召回")
+        elif kind in ("场外基金", "场内ETF") or "基金" in kind:
+            queries.append("基金仓位 观望 加减")
+            queries.append("基金投资风险 免责 强制召回")
+        elif "转债" in kind or "转债" in name:
+            queries.append("可转债风险 强赎 强制召回")
+        elif kind == "股票" or "股" in kind or "股" in name:
+            queries.append("追高 仓位纪律 宜减不宜加")
+            queries.append("股票投资风险 免责 强制召回")
+        else:
+            queries.append("追高 仓位纪律 宜减不宜加")
+    # 去重保序
+    out: list[str] = []
+    seen: set[str] = set()
+    for q in queries:
+        q = " ".join(q.split())
+        if not q or q in seen:
+            continue
+        seen.add(q)
+        out.append(q)
+    return out[:4]
+
+
+def _pack_knowledge_hits(
+    scope: str,
+    quote_rows: list[dict[str, Any]],
+    *,
+    evidence_tier: str,
+    head_weight: float | None = None,
+) -> list[dict[str, Any]]:
+    """Freeze vector/keyword knowledge cards into analysis evidence."""
+    from app.services.knowledge import search_cards
+    from app.services import knowledge_pg as pg
+
+    lim = {"light": 2, "standard": 3, "deep": 4}.get(evidence_tier, 3)
+    queries = _knowledge_queries(scope, quote_rows, head_weight=head_weight)
+    if not queries:
+        return []
+    backend = "Postgres/pgvector" if pg.knowledge_db_configured() else "本地索引"
+    merged: dict[str, dict[str, Any]] = {}
+    for q in queries:
+        try:
+            hits = search_cards(q, limit=lim, mode="auto")
+        except Exception:
+            logger.exception("knowledge search failed q=%s", q)
+            continue
+        for card, score, channel in hits:
+            prev = merged.get(card.id)
+            if prev is not None and float(prev.get("score") or 0) >= float(score):
+                continue
+            body = " ".join((card.body or "").split())
+            if len(body) > 220:
+                body = body[:220] + "…"
+            merged[card.id] = {
+                "id": card.id,
+                "title": card.title,
+                "tags": list(card.tags[:6]),
+                "source": card.source or "经验库",
+                "date": card.date or "",
+                "body": body,
+                "score": round(float(score), 3),
+                "channel": channel,
+                "backend": backend,
+                "query": q,
+            }
+    rows = sorted(merged.values(), key=lambda x: float(x.get("score") or 0), reverse=True)
+    # 黄金/基金/股票：至少保留一条「强制召回」风险/免责片段
+    kinds = {str(r.get("asset_kind") or "") for r in quote_rows}
+    names = " ".join(
+        str(r.get("name") or r.get("symbol") or "") for r in quote_rows[:3]
+    )
+    force_q = ""
+    if any("黄金" in k for k in kinds) or "黄金" in names:
+        force_q = "黄金投资风险 免责 强制召回"
+    elif any(k in ("场外基金", "场内ETF") or "基金" in k for k in kinds):
+        force_q = "基金投资风险 免责 强制召回"
+    elif any("转债" in k for k in kinds) or "转债" in names:
+        force_q = "可转债风险 强赎 强制召回"
+    elif any(k == "股票" for k in kinds) or "股" in names:
+        force_q = "股票投资风险 免责 强制召回"
+    force_row: dict[str, Any] | None = None
+    if force_q:
+        for h in rows:
+            if "强制召回" in (h.get("tags") or []):
+                force_row = h
+                break
+        if force_row is None:
+            try:
+                risk_hits = search_cards(force_q, limit=3)
+            except Exception:
+                risk_hits = []
+            for card, score, channel in risk_hits:
+                tags = list(card.tags or [])
+                if "强制召回" not in tags:
+                    continue
+                body = " ".join((card.body or "").split())
+                if len(body) > 220:
+                    body = body[:220] + "…"
+                force_row = {
+                    "id": card.id,
+                    "title": card.title,
+                    "tags": tags[:6],
+                    "source": card.source or "经验库",
+                    "date": card.date or "",
+                    "body": body,
+                    "score": round(float(score), 3),
+                    "channel": channel,
+                    "backend": backend,
+                    "query": "强制召回",
+                }
+                break
+    if force_row is not None:
+        rest = [r for r in rows if r.get("id") != force_row.get("id")]
+        rows = ([force_row] + rest)[:lim] if lim else [force_row]
+    else:
+        rows = rows[:lim]
+    return rows
 
 
 def _pack_depth_flow_row(symbol: str, market: str, name: str = "") -> dict[str, Any]:
@@ -189,6 +362,11 @@ def build_snapshot(
                 "symbol": s["symbol"],
                 "market": s["market"],
                 "name": (q.name if q and q.name else s.get("name") or s["symbol"]),
+                "asset_kind": _asset_kind(
+                    s["market"],
+                    s["symbol"],
+                    (q.name if q and q.name else s.get("name") or ""),
+                ),
                 "price": price,
                 "change_pct": day["change_pct"],
                 "last_session_change_pct": day["last_session_change_pct"],
@@ -254,6 +432,21 @@ def build_snapshot(
             if slice_h.get("last_price") is not None:
                 row["price"] = slice_h["last_price"]
 
+    # 组合：按仓位权重优先拉分时/资金/新闻（避免 Holding.id 序漏掉头仓）
+    ordered_symbols = list(symbols)
+    if scope == "portfolio" and any(
+        holding_map.get(s["symbol"], {}).get("weight") is not None for s in symbols
+    ):
+        ordered_symbols = sorted(
+            symbols,
+            key=lambda s: float(holding_map.get(s["symbol"], {}).get("weight") or 0),
+            reverse=True,
+        )
+        quote_rows.sort(
+            key=lambda r: float(r.get("weight") or 0),
+            reverse=True,
+        )
+
     prog(16, "指数行情…")
     indices: list[dict[str, Any]] = []
     try:
@@ -279,8 +472,14 @@ def build_snapshot(
 
     prog(22, "分时数据…")
     intraday: list[dict[str, Any]] = []
-    if evidence_tier in ("standard", "deep") and symbols:
-        for s in symbols[:_INTRADAY_CAP]:
+    # 分时仅场内 SH/SZ；场外基金 / 积存金无交易所分时
+    board_syms = [
+        s
+        for s in ordered_symbols
+        if (s.get("market") or "").upper() in {"SH", "SZ"}
+    ]
+    if evidence_tier in ("standard", "deep") and board_syms:
+        for s in board_syms[:_INTRADAY_CAP]:
             try:
                 series = get_intraday(s["symbol"], s["market"], s.get("name") or "")
                 pts = series.points
@@ -311,10 +510,24 @@ def build_snapshot(
 
     prog(24, "盘口与资金…")
     depth_flow: list[dict[str, Any]] = []
-    # light 也带头部资金摘要；标准/深度覆盖更多标的
-    depth_cap = 2 if evidence_tier == "light" else _DEPTH_FLOW_CAP
-    if symbols:
-        for s in symbols[:depth_cap]:
+    # 仓库：场内头部 + 全部 OF/JD 说明行；个股：轻量 2 / 标准·深度 5
+    if ordered_symbols:
+        if scope == "portfolio":
+            board_first = [
+                s
+                for s in ordered_symbols
+                if (s.get("market") or "").upper() in {"SH", "SZ"}
+            ]
+            off_board = [
+                s
+                for s in ordered_symbols
+                if (s.get("market") or "").upper() in {"OF", "JD", "GDS"}
+            ]
+            depth_targets = board_first[:_DEPTH_FLOW_CAP] + off_board
+        else:
+            depth_cap = 2 if evidence_tier == "light" else _DEPTH_FLOW_CAP
+            depth_targets = ordered_symbols[:depth_cap]
+        for s in depth_targets:
             try:
                 depth_flow.append(
                     _pack_depth_flow_row(
@@ -334,20 +547,79 @@ def build_snapshot(
     }.get(evidence_tier, _NEWS_STANDARD)
     news_items: list[dict[str, Any]] = []
     try:
-        sym_list = [s["symbol"] for s in symbols]
+        from app.services.news_relevance import news_items_to_dicts, rank_and_trim_news
+
+        sym_list = [s["symbol"] for s in ordered_symbols]
+        name_map = {
+            s["symbol"]: (s.get("name") or "").strip()
+            for s in ordered_symbols
+            if (s.get("name") or "").strip()
+        }
+        # 报价行里的简称更准（ETF 尤甚）
+        for row in quote_rows:
+            sym = str(row.get("symbol") or "")
+            nm = str(row.get("name") or "").strip()
+            if sym and nm:
+                name_map[sym] = nm
+        mkt_map = {
+            s["symbol"]: (s.get("market") or "SH")
+            for s in ordered_symbols
+            if s.get("symbol")
+        }
+        asset_kinds = [
+            str(r.get("asset_kind") or "").strip()
+            for r in quote_rows
+            if str(r.get("asset_kind") or "").strip()
+        ]
+        name_list = list({v for v in name_map.values() if v})
+
+        # Over-fetch then relevance-trim (pool >> final news_limit)
+        holding_pool = max(news_limit * 2, news_limit + 4)
+        headline_pool = 0
+        world_pool = 0
+        if evidence_tier == "light":
+            world_pool = 6
+        elif evidence_tier == "standard":
+            headline_pool = 16
+            world_pool = 16
+        else:  # deep
+            headline_pool = 24
+            world_pool = 24
+
+        pool: list[dict[str, Any]] = []
         if sym_list:
-            raw = get_holdings_news(sym_list, limit=news_limit)
-            for i in raw:
-                news_items.append(
-                    {
-                        "id": i.id,
-                        "title": i.title,
-                        "summary": (i.summary or "")[:280],
-                        "source": i.source,
-                        "published_at": i.published_at,
-                        "symbols": list(i.symbols),
-                    }
-                )
+            raw = get_holdings_news(
+                sym_list,
+                limit=holding_pool,
+                names=name_map,
+                markets=mkt_map,
+            )
+            pool.extend(news_items_to_dicts(raw, board="holding"))
+        if headline_pool > 0:
+            try:
+                _title, head_rows = get_market_news(limit=headline_pool, board="headline")
+                pool.extend(news_items_to_dicts(head_rows, board="headline"))
+            except Exception:
+                logger.exception("headline news for analysis failed")
+        if world_pool > 0:
+            try:
+                _wt, world_rows = get_market_news(limit=world_pool, board="world")
+                pool.extend(news_items_to_dicts(world_rows, board="world"))
+            except Exception:
+                logger.exception("world news for analysis failed")
+
+        news_items = rank_and_trim_news(
+            pool,
+            limit=news_limit,
+            symbols=sym_list,
+            names=name_list,
+            asset_kinds=asset_kinds,
+        )
+        # Keep evidence payload compact
+        for n in news_items:
+            n["summary"] = (n.get("summary") or "")[:280]
+            n.setdefault("symbols", [])
+            n.setdefault("region", "cn")
     except Exception:
         logger.exception("news snapshot failed")
 
@@ -393,6 +665,26 @@ def build_snapshot(
     except Exception:
         logger.exception("macro snapshot failed")
 
+    prog(42, "经验知识库…")
+    knowledge_hits: list[dict[str, Any]] = []
+    try:
+        ranked_for_kw = sorted(
+            quote_rows,
+            key=lambda r: float(r.get("weight") or 0),
+            reverse=True,
+        )
+        head_w = None
+        if ranked_for_kw and ranked_for_kw[0].get("weight") is not None:
+            head_w = float(ranked_for_kw[0]["weight"])
+        knowledge_hits = _pack_knowledge_hits(
+            scope,
+            quote_rows,
+            evidence_tier=evidence_tier,
+            head_weight=head_w,
+        )
+    except Exception:
+        logger.exception("knowledge snapshot failed")
+
     prog(44, "证据已齐，召开委员会…")
     sess = cn_session()
     sh_now = shanghai_now()
@@ -424,6 +716,7 @@ def build_snapshot(
         "news": news_items,
         "portfolio": portfolio_slice,
         "macro": macro_blocks,
+        "knowledge": knowledge_hits,
     }
 
 
@@ -535,8 +828,21 @@ def build_template_report(
 
     up = sum(1 for q in quotes if (q.get("change_pct") or 0) > 0)
     down = sum(1 for q in quotes if (q.get("change_pct") or 0) < 0)
-    flow_stance = "偏多" if up > down else ("偏空" if down > up else "中性")
-    add_agent("flow", f"涨{up}跌{down}", flow_stance, 0.5, [])
+    depth = list(snapshot.get("depth_flow") or [])
+    with_flow = [d for d in depth if d.get("main_net") is not None]
+    if with_flow:
+        net_sum = sum(float(d["main_net"]) for d in with_flow)
+        flow_stance = "偏多" if net_sum > 0 else ("偏空" if net_sum < 0 else "中性")
+        add_agent(
+            "flow",
+            f"头部主力净合计 {net_sum / 1e8:+.2f}亿",
+            flow_stance,
+            0.55,
+            [str(d.get("flow_label") or "") for d in with_flow[:2] if d.get("flow_label")],
+        )
+    else:
+        flow_stance = "偏多" if up > down else ("偏空" if down > up else "中性")
+        add_agent("flow", f"涨{up}跌{down}（无分档资金）", flow_stance, 0.4, [])
 
     risk_stance = "偏空" if conc is not None and conc >= 35 else "中性"
     add_agent(
@@ -681,6 +987,9 @@ def build_template_report(
         "actions": [],
         "agents": agent_steps + [judge],
         "template": True,
+        "degraded": True,
+        "failed_seats": [],
+        "quality_note": "委员会未完整跑通，已回退模板快评。",
     }
 
 
@@ -697,10 +1006,15 @@ def _resolve_job_targets(
             raise ValueError("持仓为空，无法巡检。请先在仓库录入标的。")
         return targets
     if not symbols:
-        raise ValueError("请指定至少一只股票")
+        raise ValueError("请指定至少一只标的（股票 / ETF / 基金 / 黄金均可）")
     targets: list[dict[str, str]] = []
     for s in symbols[:5]:
-        sym, mkt = normalize_symbol(s["symbol"], s.get("market") or "SH")
+        raw_mkt = (s.get("market") or "SH").strip().upper()
+        if raw_mkt == "HK":
+            raise ValueError("港股不开标准分析；请选 A 股、场内 ETF、场外基金或积存金")
+        if raw_mkt not in {"SH", "SZ", "JD", "OF", "GDS"}:
+            raise ValueError("标的市场仅支持 SH / SZ / OF / JD / GDS")
+        sym, mkt = normalize_symbol(s["symbol"], raw_mkt)
         targets.append(
             {
                 "symbol": sym,
@@ -763,7 +1077,43 @@ def _finalize_job(
     job.finished_at = _now()
     db.commit()
     db.refresh(job)
+    try:
+        prune_old_analysis_jobs(db, int(job.user_id), scope=str(job.scope or ""))
+    except Exception:
+        logger.exception("prune analysis jobs failed for user %s", job.user_id)
     return job
+
+
+_ANALYSIS_JOBS_KEEP = 8
+
+
+def prune_old_analysis_jobs(
+    db: Session,
+    user_id: int,
+    *,
+    scope: str = "",
+    keep: int = _ANALYSIS_JOBS_KEEP,
+) -> int:
+    """Keep newest N finished jobs per scope (or all scopes if scope empty); delete older blobs."""
+    scopes = [scope] if scope else ["portfolio", "symbol"]
+    deleted = 0
+    for sc in scopes:
+        q = (
+            db.query(AnalysisJob)
+            .filter(
+                AnalysisJob.user_id == user_id,
+                AnalysisJob.scope == sc,
+                AnalysisJob.status.in_(("done", "failed")),
+            )
+            .order_by(AnalysisJob.id.desc())
+        )
+        rows = q.offset(max(1, int(keep))).all()
+        for row in rows:
+            db.delete(row)
+            deleted += 1
+    if deleted:
+        db.commit()
+    return deleted
 
 
 def create_and_run_job(
@@ -802,39 +1152,69 @@ def _run_committee_or_template(
     from app.services import analysis_orchestra as orch
 
     try:
-        return orch.run_committee(snapshot, scope=scope, degree=degree)
+        report = orch.run_committee(snapshot, scope=scope, degree=degree)
     except Exception:
         logger.exception("committee failed; falling back to template")
-        return build_template_report(snapshot, recipe_id=recipe_id, scope=scope)
+        report = build_template_report(snapshot, recipe_id=recipe_id, scope=scope)
+    rb = draft_rebalance_from_snapshot(snapshot)
+    if rb is not None:
+        report["rebalance"] = rb
+        # 无 LLM actions 时，用草案 notes 填白话建议
+        if not report.get("actions") and rb.get("notes"):
+            report["actions"] = [
+                f"调仓倾向：{rb.get('stance') or '观望'}（非下单）",
+                *list(rb.get("notes") or [])[:1],
+            ][:2]
+    return report
 
 
-def iter_job_events(
-    db: Session,
+def _attach_rebalance(snapshot: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    rb = draft_rebalance_from_snapshot(snapshot)
+    if rb is not None:
+        report["rebalance"] = rb
+        if not report.get("actions") and rb.get("notes"):
+            report["actions"] = [
+                f"调仓倾向：{rb.get('stance') or '观望'}（非下单）",
+                *list(rb.get("notes") or [])[:1],
+            ][:2]
+    return report
+
+
+def execute_job_events(
     *,
+    job_id: int,
     user_id: int,
     scope: str,
-    symbols: list[dict[str, str]] | None,
-    degree: str | None,
+    targets: list[dict[str, str]],
+    degree: str,
+    recipe_id: str,
 ) -> Iterator[dict[str, Any]]:
-    """Prepare job, stream evidence+committee progress, persist result."""
+    """
+    Run evidence + committee for an already-prepared running job.
+    Yields the same event types as the analysis page SSE.
+    Caller owns DB finalize via events; this opens its own sessions.
+    """
     import queue
     import threading
 
+    from app.database import SessionLocal
+    from app.services import analysis_live as live
     from app.services import analysis_orchestra as orch
 
-    job, targets, deg, rid = prepare_job(
-        db, user_id=user_id, scope=scope, symbols=symbols, degree=degree
-    )
-    yield {"type": "meta", "job_id": job.id, "scope": scope, "degree": deg}
-    yield {"type": "progress", "pct": 2, "label": "准备分析…", "stage": "prep"}
-    tier = resolve_evidence_tier(deg, rid)
+    live.ensure_job(job_id)
+
+    def _emit(ev: dict[str, Any]) -> dict[str, Any]:
+        live.publish(job_id, ev)
+        return ev
+
+    yield _emit({"type": "meta", "job_id": job_id, "scope": scope, "degree": degree})
+    yield _emit({"type": "progress", "pct": 2, "label": "准备分析…", "stage": "prep"})
+    tier = resolve_evidence_tier(degree, recipe_id)
 
     prog_q: queue.Queue[dict[str, Any] | None] = queue.Queue()
     box: dict[str, Any] = {}
 
     def _snap_worker() -> None:
-        from app.database import SessionLocal
-
         def on_progress(pct: int, label: str) -> None:
             prog_q.put(
                 {
@@ -867,49 +1247,144 @@ def iter_job_events(
         ev = prog_q.get()
         if ev is None:
             break
-        yield ev
+        yield _emit(ev)
 
-    if "error" in box:
-        exc = box["error"]
-        _finalize_job(db, job, snapshot=None, report=None, error=str(exc))
-        yield {"type": "error", "message": str(exc)[:400]}
-        yield {"type": "done", "job_id": job.id, "status": "failed"}
+    db = SessionLocal()
+    try:
+        job = (
+            db.query(AnalysisJob)
+            .filter(AnalysisJob.id == job_id, AnalysisJob.user_id == user_id)
+            .first()
+        )
+        if job is None:
+            yield _emit({"type": "error", "message": "任务不存在"})
+            yield _emit({"type": "done", "job_id": job_id, "status": "failed"})
+            return
+
+        if "error" in box:
+            exc = box["error"]
+            _finalize_job(db, job, snapshot=None, report=None, error=str(exc))
+            yield _emit({"type": "error", "message": str(exc)[:400]})
+            yield _emit(
+                {
+                    "type": "done",
+                    "job_id": job_id,
+                    "status": "failed",
+                    "job": job_to_out(job),
+                }
+            )
+            return
+
+        snapshot = box["snapshot"]
+        yield _emit(
+            {
+                "type": "progress",
+                "pct": 48,
+                "label": "委员会开会…",
+                "stage": "committee",
+            }
+        )
+
+        report: dict[str, Any] | None = None
+        saw_report = False
+        try:
+            for ev in orch.iter_committee_events(snapshot, scope=scope, degree=degree):
+                if ev.get("type") == "report" and isinstance(ev.get("report"), dict):
+                    report = _attach_rebalance(snapshot, ev["report"])
+                    ev = {**ev, "report": report}
+                    saw_report = True
+                yield _emit(ev)
+        except Exception as exc:
+            logger.exception("stream committee failed")
+            yield _emit({"type": "error", "message": str(exc)[:400]})
+
+        if report is None:
+            report = build_template_report(snapshot, recipe_id=recipe_id, scope=scope)
+            report = _attach_rebalance(snapshot, report)
+            if not saw_report:
+                yield _emit({"type": "report", "report": report})
+            yield _emit({"type": "stage", "stage": "fallback", "label": "已回退模板报告"})
+
+        _finalize_job(db, job, snapshot=snapshot, report=report)
+        yield _emit({"type": "progress", "pct": 100, "label": "完成", "stage": "done"})
+        yield _emit(
+            {
+                "type": "done",
+                "job_id": job_id,
+                "status": "done",
+                "job": job_to_out(job),
+            }
+        )
+    finally:
+        db.close()
+
+
+def iter_job_events(
+    db: Session,
+    *,
+    user_id: int,
+    scope: str,
+    symbols: list[dict[str, str]] | None,
+    degree: str | None,
+) -> Iterator[dict[str, Any]]:
+    """Prepare job, stream evidence+committee progress, persist result."""
+    job, targets, deg, rid = prepare_job(
+        db, user_id=user_id, scope=scope, symbols=symbols, degree=degree
+    )
+    # Detach so execute_job_events can use its own sessions freely
+    job_id = int(job.id)
+    db.expunge(job)
+    yield from execute_job_events(
+        job_id=job_id,
+        user_id=user_id,
+        scope=scope,
+        targets=targets,
+        degree=deg,
+        recipe_id=rid,
+    )
+
+
+def iter_attach_job_events(
+    *,
+    user_id: int,
+    job_id: int,
+) -> Iterator[dict[str, Any]]:
+    """Attach to a running (or just-finished) job: replay bus history + live tail."""
+    from app.database import SessionLocal
+    from app.services import analysis_live as live
+
+    db = SessionLocal()
+    try:
+        job = get_job(db, job_id, user_id)
+        if job is None:
+            yield {"type": "error", "message": "任务不存在"}
+            yield {"type": "done", "job_id": job_id, "status": "failed"}
+            return
+        status = job.status
+        err = (job.error or "")[:400]
+        out = job_to_out(job)
+    finally:
+        db.close()
+
+    hist = live.history(job_id)
+    if not hist and status != "running":
+        # Finished before bus existed / process restart — return final snapshot
+        if status == "done" and out.get("report"):
+            yield {"type": "report", "report": out["report"], "job_id": job_id}
+        if status == "failed":
+            yield {"type": "error", "message": err or "分析失败"}
+        yield {
+            "type": "done",
+            "job_id": job_id,
+            "status": status,
+            "job": out,
+        }
         return
 
-    snapshot = box["snapshot"]
-    yield {
-        "type": "progress",
-        "pct": 48,
-        "label": "委员会开会…",
-        "stage": "committee",
-    }
-
-    report: dict[str, Any] | None = None
-    saw_report = False
-    try:
-        for ev in orch.iter_committee_events(snapshot, scope=scope, degree=deg):
-            if ev.get("type") == "report" and isinstance(ev.get("report"), dict):
-                report = ev["report"]
-                saw_report = True
-            yield ev
-    except Exception as exc:
-        logger.exception("stream committee failed")
-        yield {"type": "error", "message": str(exc)[:400]}
-
-    if report is None:
-        report = build_template_report(snapshot, recipe_id=rid, scope=scope)
-        if not saw_report:
-            yield {"type": "report", "report": report}
-        yield {"type": "stage", "stage": "fallback", "label": "已回退模板报告"}
-
-    _finalize_job(db, job, snapshot=snapshot, report=report)
-    yield {"type": "progress", "pct": 100, "label": "完成", "stage": "done"}
-    yield {
-        "type": "done",
-        "job_id": job.id,
-        "status": "done",
-        "job": job_to_out(job),
-    }
+    for ev in live.subscribe(job_id):
+        if ev.get("type") == "ping":
+            continue
+        yield ev
 
 
 def get_job(db: Session, job_id: int, user_id: int) -> AnalysisJob | None:
@@ -953,12 +1428,13 @@ def start_job_background(
     degree: str | None = None,
 ) -> AnalysisJob:
     """
-    Create a running job and finish it on a daemon thread.
-    Chat can continue; later turns read done report via latest_job.
+    Create a running job and finish it on a daemon thread (emits live bus events).
+    Chat can continue; analysis page may attach via GET /jobs/{id}/stream.
     """
     import threading
 
     from app.database import SessionLocal
+    from app.services import analysis_live as live
 
     db = SessionLocal()
     try:
@@ -970,46 +1446,50 @@ def start_job_background(
             db, user_id=user_id, scope=scope, symbols=symbols, degree=degree
         )
         job_id = int(job.id)
+        live.ensure_job(job_id)
     finally:
         db.close()
 
     def _worker() -> None:
-        wdb = SessionLocal()
         try:
-            row = (
-                wdb.query(AnalysisJob)
-                .filter(AnalysisJob.id == job_id, AnalysisJob.user_id == user_id)
-                .first()
-            )
-            if row is None or row.status != "running":
-                return
-            tier = resolve_evidence_tier(deg, rid)
+            for _ev in execute_job_events(
+                job_id=job_id,
+                user_id=user_id,
+                scope=scope,
+                targets=targets,
+                degree=deg,
+                recipe_id=rid,
+            ):
+                pass
+        except Exception:
+            logger.exception("background analysis job %s failed", job_id)
+            wdb = SessionLocal()
             try:
-                snapshot = build_snapshot(
-                    wdb,
-                    user_id=user_id,
-                    scope=scope,
-                    symbols=targets,
-                    evidence_tier=tier,
+                row = (
+                    wdb.query(AnalysisJob)
+                    .filter(AnalysisJob.id == job_id, AnalysisJob.user_id == user_id)
+                    .first()
                 )
-                report = _run_committee_or_template(
-                    snapshot, scope=scope, degree=deg, recipe_id=rid
-                )
-                _finalize_job(wdb, row, snapshot=snapshot, report=report)
-            except Exception as exc:
-                logger.exception("background analysis job %s failed", job_id)
-                _finalize_job(wdb, row, snapshot=None, report=None, error=str(exc))
-        finally:
-            wdb.close()
+                if row is not None and row.status == "running":
+                    _finalize_job(wdb, row, snapshot=None, report=None, error="分析失败")
+                    live.publish(
+                        job_id,
+                        {
+                            "type": "done",
+                            "job_id": job_id,
+                            "status": "failed",
+                            "job": job_to_out(row),
+                        },
+                    )
+            finally:
+                wdb.close()
 
     threading.Thread(target=_worker, name=f"analysis-job-{job_id}", daemon=True).start()
-    # Re-load for caller with a short-lived session
     db2 = SessionLocal()
     try:
         row = db2.query(AnalysisJob).filter(AnalysisJob.id == job_id).first()
         if row is None:
             raise RuntimeError("分析任务创建失败")
-        # Detach fields we need by refreshing into a simple access before close
         db2.expunge(row)
         return row
     finally:

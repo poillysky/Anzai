@@ -204,8 +204,12 @@ def prepare_chat(
     db: Session,
     user_id: int,
     messages: list[dict[str, str]],
+    *,
+    conversation_id: int | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     """Return (generation, openai_messages, meta)."""
+    from app.services import agent_tokens as tokens_svc
+
     identity = prefs_svc.get_identity(db, user_id)
     chat = cfg_svc.load_agent_chat()
     if not chat.get("enabled"):
@@ -229,15 +233,21 @@ def prepare_chat(
         include_analyst_skill=scene.include_analyst_skill,
     )
     # 按场景动态篇幅：覆盖预设固定 max_tokens（预设只作后台默认上限参考）
-    gen = {**gen, "max_tokens": scene.max_tokens}
+    max_context = int(gen.get("max_context") or tokens_svc.DEFAULT_MAX_CONTEXT)
+    gen = {**gen, "max_tokens": scene.max_tokens, "max_context": max_context}
 
-    _, openai_msgs = scene_svc.assemble_turn(
+    _, openai_msgs, assemble_meta = scene_svc.assemble_turn(
         db,
         user_id,
         messages,
         system_prompt=gen["system_prompt"],
         history_messages=int(gen.get("history_messages") or 20),
+        conversation_id=conversation_id,
+        max_context=max_context,
+        reserve_for_reply=int(gen["max_tokens"]),
     )
+    if assemble_meta.get("clarify"):
+        gen = {**gen, "max_tokens": min(int(gen["max_tokens"]), 512)}
 
     conn = resolve_llm_connection(gen)
     meta = {
@@ -250,8 +260,89 @@ def prepare_chat(
         "scene": scene.primary,
         "scene_flags": sorted(scene.flags),
         "max_tokens": gen["max_tokens"],
+        "max_context": max_context,
+        "assemble": assemble_meta,
     }
     return gen, openai_msgs, meta
+
+
+def preview_chat(
+    db: Session,
+    user_id: int,
+    messages: list[dict[str, str]],
+    *,
+    conversation_id: int | None = None,
+) -> dict[str, Any]:
+    """Dry-run assemble for debugging — what the model would see this turn."""
+    from app.services import agent_tokens as tokens_svc
+
+    gen, openai_msgs, meta = prepare_chat(
+        db, user_id, messages, conversation_id=conversation_id
+    )
+    user_text = tools_svc.last_user_text(openai_msgs) or ""
+    for m in reversed(messages):
+        if (m.get("role") or "").strip() == "user":
+            user_text = (m.get("content") or "").strip()
+            break
+    turn_scene = scene_svc.detect_turn_scene(user_text)
+    from app.services import agent_clarify as clarify_svc
+
+    clarify = clarify_svc.detect_clarify_need(user_text, history=messages)
+    if clarify_svc.should_skip_prefetch(clarify):
+        prefetch_items = []
+    else:
+        prefetch_items = tools_svc.prefetch_for_turn(db, user_id, user_text)
+    prefetch_block = tools_svc.format_prefetch_block(
+        prefetch_items, scene_primary=turn_scene.primary
+    )
+    msgs = list(openai_msgs)
+    if prefetch_block:
+        msgs.append({"role": "system", "content": prefetch_block})
+    msgs = tokens_svc.trim_messages_to_budget(
+        msgs,
+        int(meta.get("max_context") or tokens_svc.DEFAULT_MAX_CONTEXT),
+        int(gen.get("max_tokens") or 2048),
+    )
+
+    system_blocks: list[dict[str, Any]] = []
+    for m in msgs:
+        if (m.get("role") or "") != "system":
+            continue
+        content = str(m.get("content") or "")
+        system_blocks.append(
+            {
+                "chars": len(content),
+                "tokens": tokens_svc.estimate_tokens(content),
+                "preview": content[:240] + ("…" if len(content) > 240 else ""),
+            }
+        )
+
+    return {
+        "scene": meta.get("scene"),
+        "scene_flags": meta.get("scene_flags") or [],
+        "clarify": meta.get("assemble", {}).get("clarify") if isinstance(meta.get("assemble"), dict) else meta.get("clarify"),
+        "model": meta.get("model"),
+        "preset_name": meta.get("preset_name"),
+        "max_tokens": meta.get("max_tokens"),
+        "max_context": meta.get("max_context"),
+        "assemble": meta.get("assemble") or {},
+        "prefetch": [
+            {"name": it["name"], "label": it["label"], "chars": len(it.get("text") or "")}
+            for it in prefetch_items
+        ],
+        "message_count": len(msgs),
+        "tokens_estimate": tokens_svc.estimate_messages_tokens(msgs),
+        "system_blocks": system_blocks,
+        "history_tail": [
+            {
+                "role": m.get("role"),
+                "chars": len(str(m.get("content") or "")),
+                "preview": str(m.get("content") or "")[:120],
+            }
+            for m in msgs
+            if (m.get("role") or "") in {"user", "assistant"}
+        ][-8:],
+    }
 
 
 def _is_gemini_model(model: str) -> bool:
@@ -321,6 +412,81 @@ def _message_from_completion(data: dict[str, Any]) -> dict[str, Any]:
     return msg if isinstance(msg, dict) else {"role": "assistant", "content": ""}
 
 
+async def _yield_wait_analysis(
+    *,
+    user_id: int,
+    job_id: int,
+    card: dict[str, Any] | None,
+    start_text: str,
+) -> AsyncIterator[tuple[str, str | None]]:
+    """Yield (sse_json, report_text_or_none). Last report_text is set on analysis_ready."""
+    from app.services.agent_analysis_wait import (
+        analysis_label_from_job,
+        iter_wait_analysis,
+        parse_job_id_from_start_text,
+    )
+    from app.database import SessionLocal
+    from app.services import analysis as analysis_svc
+
+    jid = job_id or parse_job_id_from_start_text(start_text) or 0
+    if not jid and card:
+        try:
+            jid = int(card.get("job_id") or 0)
+        except (TypeError, ValueError):
+            jid = 0
+    if not jid:
+        return
+
+    label = ""
+    degree = None
+    if card:
+        label = str(card.get("name") or card.get("label") or "").strip()
+        degree = str(card.get("degree") or "") or None
+        if str(card.get("scope") or "") == "portfolio":
+            label = "仓库"
+    if not label or not degree:
+        db2 = SessionLocal()
+        try:
+            job = analysis_svc.get_job(db2, jid, user_id)
+            if job is not None:
+                label = label or analysis_label_from_job(job)
+                degree = degree or str(job.degree or "standard")
+        finally:
+            db2.close()
+
+    async for ev in iter_wait_analysis(
+        user_id=user_id,
+        job_id=jid,
+        label=label,
+        degree=degree,
+    ):
+        et = ev.get("type")
+        if et == "token":
+            yield json.dumps({"type": "token", "text": ev.get("text") or ""}, ensure_ascii=False), None
+        elif et == "tool_status":
+            yield json.dumps(
+                {
+                    "type": "tool_status",
+                    "label": ev.get("label") or "分析中",
+                    "name": ev.get("name") or "start_analysis",
+                },
+                ensure_ascii=False,
+            ), None
+        elif et == "analysis_ready":
+            text = str(ev.get("text") or "")
+            yield json.dumps(
+                {
+                    "type": "tool_status",
+                    "label": "整理结论中"
+                    if ev.get("ok")
+                    else "分析未完成",
+                    "name": "start_analysis",
+                },
+                ensure_ascii=False,
+            ), text
+            return
+
+
 async def stream_chat_completion(
     gen: dict[str, Any],
     openai_msgs: list[dict[str, Any]],
@@ -356,12 +522,29 @@ async def stream_chat_completion(
     messages: list[dict[str, Any]] = list(openai_msgs)
 
     # Prefetch by user intent (works even when gateway has no tool calling)
+    from app.services import agent_clarify as clarify_svc
+    from app.services import agent_tokens as tokens_svc
+
     user_text = tools_svc.last_user_text(messages)
     turn_scene = scene_svc.detect_turn_scene(user_text)
-    prefetch_items = tools_svc.prefetch_for_turn(db, user_id, user_text)
+    clarify = clarify_svc.detect_clarify_need(user_text, history=openai_msgs)
+    if clarify_svc.should_skip_prefetch(clarify):
+        prefetch_items = []
+        # Ensure clarify block present even if assemble missed (e.g. old path)
+        if not any(
+            "【本轮·先问清楚】" in str(m.get("content") or "")
+            for m in messages
+            if (m.get("role") or "") == "system"
+        ):
+            messages.append(
+                {"role": "system", "content": clarify_svc.format_clarify_block(clarify)}
+            )
+    else:
+        prefetch_items = tools_svc.prefetch_for_turn(db, user_id, user_text)
     prefetch_block = tools_svc.format_prefetch_block(
         prefetch_items, scene_primary=turn_scene.primary
     )
+    analysis_report_block: str | None = None
     for it in prefetch_items:
         yield json.dumps(
             {
@@ -385,20 +568,161 @@ async def stream_chat_completion(
         card = tools_svc.card_payload_for_tool(db, user_id, it["name"])
         if card:
             yield json.dumps({"type": "card", "card": card}, ensure_ascii=False)
-            if it["name"] == "start_analysis" and isinstance(card, dict):
-                yield json.dumps(
-                    {
-                        "type": "tool_status",
-                        "label": "已经在分析了",
-                        "name": it["name"],
-                    },
-                    ensure_ascii=False,
-                )
+        if it["name"] == "start_analysis":
+            async for sse, report in _yield_wait_analysis(
+                user_id=user_id,
+                job_id=int((card or {}).get("job_id") or 0) if isinstance(card, dict) else 0,
+                card=card if isinstance(card, dict) else None,
+                start_text=str(it.get("text") or ""),
+            ):
+                yield sse
+                if report:
+                    analysis_report_block = report
     if prefetch_block:
         messages.append({"role": "system", "content": prefetch_block})
+    if analysis_report_block:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "【本轮分析已完成·请据此播报】\n"
+                    + analysis_report_block
+                    + "\n用户已经等过委员会；直接讲结论，不要再说请等待。"
+                ),
+            }
+        )
+
+    # Prefetch / report may bloat context — keep system prefix, drop older chat
+    messages = tokens_svc.trim_messages_to_budget(
+        messages,
+        int(gen.get("max_context") or tokens_svc.DEFAULT_MAX_CONTEXT),
+        int(gen.get("max_tokens") or turn_scene.max_tokens),
+    )
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
+        # 等分析时可能超过 90s；工具轮 + 最终流式分开放宽
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0, connect=15.0)) as client:
+            # 本轮已等完委员会：跳过 tools 轮，直接据报告流式播报
+            if analysis_report_block:
+                yield json.dumps(
+                    {"type": "tool_status", "label": "整理结论中"},
+                    ensure_ascii=False,
+                )
+                stream_body = {
+                    **_sampling_body(gen, model),
+                    "messages": messages,
+                    "stream": True,
+                }
+                async with client.stream(
+                    "POST", url, headers=headers, json=stream_body
+                ) as res:
+                    if res.status_code >= 400:
+                        detail = (await res.aread()).decode("utf-8", errors="replace")[
+                            :240
+                        ]
+                        yield json.dumps(
+                            {
+                                "type": "error",
+                                "message": f"模型错误 HTTP {res.status_code}: {detail}",
+                            },
+                            ensure_ascii=False,
+                        )
+                        yield json.dumps({"type": "done"}, ensure_ascii=False)
+                        return
+                    async for line in res.aiter_lines():
+                        if not line:
+                            continue
+                        if line.startswith("data:"):
+                            payload = line[5:].strip()
+                        else:
+                            continue
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = (choices[0] or {}).get("delta") or {}
+                        token = delta.get("content") or ""
+                        if not token:
+                            msg = (choices[0] or {}).get("message") or {}
+                            token = msg.get("content") or delta.get("text") or ""
+                        if isinstance(token, list):
+                            token = "".join(
+                                (p.get("text") if isinstance(p, dict) else str(p))
+                                or ""
+                                for p in token
+                            )
+                        if token:
+                            yield json.dumps(
+                                {"type": "token", "text": token},
+                                ensure_ascii=False,
+                            )
+                yield json.dumps({"type": "done"}, ensure_ascii=False)
+                return
+
+            # 模糊意图：只反问，不开工具轮（避免对着空预取仍去查板）
+            if clarify:
+                stream_gen = {**gen, "max_tokens": min(int(gen.get("max_tokens") or 512), 512)}
+                stream_body = {
+                    **_sampling_body(stream_gen, model),
+                    "messages": messages,
+                    "stream": True,
+                }
+                async with client.stream(
+                    "POST", url, headers=headers, json=stream_body
+                ) as res:
+                    if res.status_code >= 400:
+                        detail = (await res.aread()).decode("utf-8", errors="replace")[
+                            :240
+                        ]
+                        yield json.dumps(
+                            {
+                                "type": "error",
+                                "message": f"模型错误 HTTP {res.status_code}: {detail}",
+                            },
+                            ensure_ascii=False,
+                        )
+                        yield json.dumps({"type": "done"}, ensure_ascii=False)
+                        return
+                    async for line in res.aiter_lines():
+                        if not line:
+                            continue
+                        if line.startswith("data:"):
+                            payload = line[5:].strip()
+                        else:
+                            continue
+                        if payload == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(payload)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        delta = (choices[0] or {}).get("delta") or {}
+                        token = delta.get("content") or ""
+                        if not token:
+                            msg = (choices[0] or {}).get("message") or {}
+                            token = msg.get("content") or delta.get("text") or ""
+                        if isinstance(token, list):
+                            token = "".join(
+                                (p.get("text") if isinstance(p, dict) else str(p))
+                                or ""
+                                for p in token
+                            )
+                        if token:
+                            yield json.dumps(
+                                {"type": "token", "text": token},
+                                ensure_ascii=False,
+                            )
+                yield json.dumps({"type": "done"}, ensure_ascii=False)
+                return
+
             # 预取先塞【本轮实时查询】；再用 tools 让模型补缺（含 Gemini，schema 已无空 enum）
             # tools 轮失败则回退流式，预取数据仍在，不会没数
             for _round in range(tools_svc.MAX_TOOL_ROUNDS):
@@ -469,7 +793,9 @@ async def stream_chat_completion(
                         },
                         ensure_ascii=False,
                     )
-                    result = tools_svc.execute_tool(db, user_id, name, args)
+                    result = tools_svc.execute_tool(
+                        db, user_id, name, args, user_text=user_text
+                    )
                     yield json.dumps(
                         {
                             "type": "tool_result",
@@ -485,16 +811,27 @@ async def stream_chat_completion(
                         yield json.dumps(
                             {"type": "card", "card": card}, ensure_ascii=False
                         )
-                        if name == "start_analysis" and isinstance(card, dict):
-                            ack = str(card.get("ack") or "").strip()
-                            if ack:
-                                yield json.dumps(
+                    if name == "start_analysis" and "开不了" not in result and "失败" not in result:
+                        async for sse, report in _yield_wait_analysis(
+                            user_id=user_id,
+                            job_id=int((card or {}).get("job_id") or 0)
+                            if isinstance(card, dict)
+                            else 0,
+                            card=card if isinstance(card, dict) else None,
+                            start_text=result,
+                        ):
+                            yield sse
+                            if report:
+                                analysis_report_block = report
+                                messages.append(
                                     {
-                                        "type": "tool_status",
-                                        "label": "已经在分析了",
-                                        "name": name,
-                                    },
-                                    ensure_ascii=False,
+                                        "role": "system",
+                                        "content": (
+                                            "【本轮分析已完成·请据此播报】\n"
+                                            + report
+                                            + "\n用户已经等过委员会；直接讲结论，不要再说请等待。"
+                                        ),
+                                    }
                                 )
                     messages.append(
                         {
@@ -505,7 +842,7 @@ async def stream_chat_completion(
                     )
 
             # --- final streamed answer (no tools, force prose) ---
-            yield json.dumps({"type": "tool_status", "label": "整理回答"}, ensure_ascii=False)
+            yield json.dumps({"type": "tool_status", "label": "整理结论中"}, ensure_ascii=False)
             stream_body = {
                 **_sampling_body(gen, model),
                 "messages": messages,

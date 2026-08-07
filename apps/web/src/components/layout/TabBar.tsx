@@ -9,10 +9,12 @@ import {
   Warehouse,
   type LucideIcon,
 } from "@/components/ui/icons";
+import { useTabNav } from "@/components/layout/TabNavContext";
+import { haptics } from "@/lib/haptics";
+import { warmTabDataFor, warmTabRoutes } from "@/lib/prefetch";
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
-import { useEffect, useTransition, type MouseEvent } from "react";
-import { warmTabRoutes } from "@/lib/prefetch";
+import { useRouter } from "next/navigation";
+import { useEffect, type PointerEvent } from "react";
 
 type Tab =
   | { href: string; label: string; Icon: LucideIcon; avatar?: undefined }
@@ -21,36 +23,46 @@ type Tab =
 /** 五 Tab：仓库 / 股票 / 新闻 / 分析 / 安崽 — docs/界面设计.md §3 */
 const tabs: Tab[] = [
   { href: "/", label: "仓库", Icon: Warehouse },
-  { href: "/market", label: "股票", Icon: ChartColumn },
+  { href: "/market", label: "行情", Icon: ChartColumn },
   { href: "/news", label: "新闻", Icon: Newspaper },
   { href: "/analysis", label: "分析", Icon: PieChart },
   { href: "/agent", label: "安崽", avatar: "/avatars/anzai.png" },
 ];
 
-function isActive(pathname: string, href: string): boolean {
-  return href === "/" ? pathname === "/" : pathname.startsWith(href);
+function isActive(path: string, href: string): boolean {
+  return href === "/" ? path === "/" : path.startsWith(href);
+}
+
+function deferWarm(href: string) {
+  const run = () => void warmTabDataFor(href);
+  if (typeof window.requestIdleCallback === "function") {
+    window.requestIdleCallback(run, { timeout: 400 });
+  } else {
+    window.setTimeout(run, 0);
+  }
 }
 
 export function TabBar() {
-  const pathname = usePathname();
   const router = useRouter();
-  const [pending, startTransition] = useTransition();
+  const { path, commit } = useTabNav();
 
   useEffect(() => {
     warmTabRoutes((href) => router.prefetch(href));
   }, [router]);
 
-  function go(href: string) {
-    if (isActive(pathname, href) && !pending) return;
-    startTransition(() => {
-      router.replace(href, { scroll: false });
-    });
+  function onPress(href: string, e: PointerEvent<HTMLAnchorElement>) {
+    if (e.button !== 0 && e.pointerType === "mouse") return;
+    if (isActive(path, href)) return;
+    e.preventDefault();
+    haptics.selection();
+    commit(href);
+    deferWarm(href);
   }
 
   return (
     <nav className="tabbar" aria-label="主导航">
       {tabs.map((tab) => {
-        const active = isActive(pathname, tab.href);
+        const active = isActive(path, tab.href);
         return (
           <Link
             key={tab.href}
@@ -59,9 +71,14 @@ export function TabBar() {
             scroll={false}
             className={["tab-item", active ? "tab-item-active" : ""].filter(Boolean).join(" ")}
             aria-current={active ? "page" : undefined}
-            onClick={(e: MouseEvent<HTMLAnchorElement>) => {
+            onPointerDown={(e) => onPress(tab.href, e)}
+            onClick={(e) => {
+              // Navigation already handled on pointerdown; block default / double nav
               e.preventDefault();
-              go(tab.href);
+              if (!isActive(path, tab.href)) {
+                commit(tab.href);
+                deferWarm(tab.href);
+              }
             }}
           >
             <span className="tab-icon" aria-hidden>

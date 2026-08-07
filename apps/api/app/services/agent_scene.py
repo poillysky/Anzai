@@ -310,10 +310,11 @@ def scene_hint(scene: TurnScene) -> str:
     elif scene.primary == "macro":
         bits.append(
             "只答商品/宏观；零提账户、持仓、分散、ETF配置。"
-            "数字只引用本轮宏观工具里的品种（黄金问 AU9999/积存金/纽约金·伦敦金/金ETF；"
-            "其它如螺纹/铁矿/汇率等），"
+            "数字只引用本轮宏观工具里的品种；"
+            "黄金：若用户已点名积存金/ETF/现货等，只答点名的；"
+            "若只说「黄金/金价」且本轮有【先问清楚】，先反问再答，不要默认念 AU9999 整板；"
             "禁止补编美元指数、美债、COMEX、沪金连续等未查项；别列行情看板。"
-            "若本轮有相关新闻：优先「今日」，旧闻只当背景一句带过。"
+            "两三句说完；若本轮有相关新闻：优先「今日」，旧闻只当背景一句带过。"
             + calendar_clock_line()
         )
     elif scene.primary == "market":
@@ -386,7 +387,7 @@ def tool_hint_for_scene(scene: TurnScene) -> str:
         "analysis": (
             "读结论用 get_analysis_snapshot；"
             "明确开跑：仓库→start_analysis(portfolio)；"
-            "个股「帮我分析XX」→start_analysis(symbol,标准档)。"
+            "个股/基金/黄金「帮我分析XX」→start_analysis(symbol)；仓库巡检覆盖股票+基金+黄金。"
         ),
         "news": "新闻用 get_news（可指定 board=tech/energy/finance 等；keyword 用中文）。",
     }
@@ -404,17 +405,36 @@ def tool_hint_for_scene(scene: TurnScene) -> str:
     return f"{base}{extra}"
 
 
-def build_scene_context(db: Session, user_id: int, scene: TurnScene) -> str:
+def build_scene_context(
+    db: Session,
+    user_id: int,
+    scene: TurnScene,
+    *,
+    conversation_id: int | None = None,
+) -> str:
     from app.services import analysis as analysis_svc
     from app.services.agent_context import (
         analysis_context,
+        analysis_follow_context,
         silent_portfolio_context,
     )
 
     parts = [scene_hint(scene)]
     if scene.include_portfolio:
         parts.append(silent_portfolio_context(db, user_id))
-    if scene.include_analysis:
+
+    follow = None
+    try:
+        follow = analysis_follow_context(
+            db, user_id, conversation_id=conversation_id
+        )
+    except Exception:
+        follow = None
+
+    if follow:
+        # Within post-analysis window: carry detailed summary every turn
+        parts.append(follow)
+    elif scene.include_analysis:
         parts.append(analysis_context(db, user_id))
     elif scene.primary != "chat":
         # 非闲聊：若有进行中或刚完成的分析，后面对话自动带上（不阻塞）
@@ -426,7 +446,7 @@ def build_scene_context(db: Session, user_id: int, scene: TurnScene) -> str:
                 parts.append(analysis_context(db, user_id))
         except Exception:
             pass
-    if not scene.include_portfolio and not scene.include_analysis:
+    if not scene.include_portfolio and not scene.include_analysis and not follow:
         if len(parts) == 1:
             parts.append(
                 "【数据说明】本轮以【本轮实时查询】为准；未附仓库/报告，勿自行编造账户数字。"
@@ -464,8 +484,18 @@ def assemble_turn(
     *,
     system_prompt: str,
     history_messages: int,
-) -> tuple[TurnScene, list[dict[str, Any]]]:
-    """Build openai message list for this turn (sans prefetch block)."""
+    conversation_id: int | None = None,
+    max_context: int | None = None,
+    reserve_for_reply: int | None = None,
+) -> tuple[TurnScene, list[dict[str, Any]], dict[str, Any]]:
+    """Build openai message list for this turn (sans prefetch block).
+
+    Returns (scene, messages, assemble_meta) — meta for preview/debug.
+    """
+    from app.services import agent_knowledge_packs as packs_svc
+    from app.services import agent_memory as memory_svc
+    from app.services import agent_tokens as tokens_svc
+
     last_user = ""
     for m in reversed(messages):
         if (m.get("role") or "").strip() == "user":
@@ -474,10 +504,70 @@ def assemble_turn(
 
     scene = detect_turn_scene(last_user)
     hist = filter_history(messages, scene, default_limit=history_messages)
+
+    from app.services import agent_clarify as clarify_svc
+
+    clarify = clarify_svc.detect_clarify_need(last_user, history=hist)
+
     openai_msgs: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
         {"role": "system", "content": tool_hint_for_scene(scene)},
-        {"role": "system", "content": build_scene_context(db, user_id, scene)},
+        {
+            "role": "system",
+            "content": build_scene_context(
+                db, user_id, scene, conversation_id=conversation_id
+            ),
+        },
     ]
+
+    if clarify:
+        openai_msgs.append(
+            {"role": "system", "content": clarify_svc.format_clarify_block(clarify)}
+        )
+
+    memory_summary = ""
+    if conversation_id:
+        memory_summary = memory_svc.get_conversation_memory(db, user_id, conversation_id)
+        mem_block = memory_svc.format_memory_block(memory_summary)
+        if mem_block:
+            openai_msgs.append({"role": "system", "content": mem_block})
+
+    # Clarify turn: skip knowledge packs (they push answering tips)
+    packs: list[Any] = []
+    if not clarify:
+        packs = packs_svc.scan_knowledge_packs(last_user)
+        packs_block = packs_svc.format_packs_block(packs)
+        if packs_block:
+            openai_msgs.append({"role": "system", "content": packs_block})
+
     openai_msgs.extend(hist)
-    return scene, openai_msgs
+
+    ctx = int(max_context or tokens_svc.DEFAULT_MAX_CONTEXT)
+    reserve = int(reserve_for_reply if reserve_for_reply is not None else scene.max_tokens)
+    if clarify:
+        reserve = min(reserve, 512)
+    before_tokens = tokens_svc.estimate_messages_tokens(openai_msgs)
+    openai_msgs = tokens_svc.trim_messages_to_budget(openai_msgs, ctx, reserve)
+    after_tokens = tokens_svc.estimate_messages_tokens(openai_msgs)
+
+    meta = {
+        "scene": scene.primary,
+        "scene_flags": sorted(scene.flags),
+        "clarify": {"kind": clarify.kind, "ask": clarify.ask} if clarify else None,
+        "history_kept": sum(
+            1 for m in openai_msgs if (m.get("role") or "") in {"user", "assistant"}
+        ),
+        "packs": packs_svc.packs_debug(packs),
+        "has_memory": bool(memory_summary),
+        "memory_chars": len(memory_summary),
+        "has_analysis_follow": any(
+            "【近期分析·详细摘要】" in str(m.get("content") or "")
+            for m in openai_msgs
+            if (m.get("role") or "") == "system"
+        ),
+        "tokens_before_trim": before_tokens,
+        "tokens_after_trim": after_tokens,
+        "max_context": ctx,
+        "reserve_for_reply": reserve,
+    }
+    return scene, openai_msgs, meta

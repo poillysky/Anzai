@@ -27,25 +27,25 @@ AGENT_LABELS: dict[str, str] = {
 SEAT_META: dict[str, dict[str, str | bool]] = {
     "trend": {"kind": "LLM", "deferred": False},
     "news": {"kind": "LLM", "deferred": False},
-    "flow": {"kind": "未接入", "deferred": True},
+    "flow": {"kind": "LLM", "deferred": False},
     "risk": {"kind": "确定性", "deferred": False},
 }
 
 TIER_META: dict[str, dict[str, str]] = {
     "light": {
-        "pipeline": "走势∥新闻 → 首席",
+        "pipeline": "走势∥新闻∥资金 → 首席",
         "note": "跳过辩证与结构风险。适合单票快看。",
-        "evidence_hint": "证据偏薄：报价+指数+少量新闻；可不拉分时。",
+        "evidence_hint": "证据偏薄：报价+指数+少量新闻/资金；可不拉分时。",
     },
     "standard": {
-        "pipeline": "走势∥新闻 → 结构风险 → 辩证×1 → 首席",
+        "pipeline": "走势∥新闻∥资金 → 结构风险 → 辩证×1 → 首席",
         "note": "仓库持仓巡检固定本档。结构风险看集中度 / 今日盈亏相对上证 / 空新闻。",
-        "evidence_hint": "标准证据：分时（昨收·今开·最新）+ 日K + 持仓今日盈亏分列。",
+        "evidence_hint": "标准证据：分时（昨收·今开·最新）+ 日K + 持仓今日盈亏分列 + 头部资金。",
     },
     "deep": {
-        "pipeline": "走势∥新闻 → 结构风险 → 辩证×2 → 首席",
+        "pipeline": "走势∥新闻∥资金 → 结构风险 → 辩证×2 → 首席",
         "note": "证据加厚、辩证两回合；open_questions 必须由首席回应。",
-        "evidence_hint": "深度证据：更长K线、更多新闻；仍禁止编造未纳入宏观。",
+        "evidence_hint": "深度证据：更长K线、更多新闻/要闻；仍禁止编造未纳入宏观。",
     },
 }
 
@@ -77,25 +77,25 @@ DEFAULT_TIERS: dict[str, dict[str, Any]] = {
     "light": {
         "id": "light",
         "label": "轻量",
-        "blurb": "走势∥新闻 → 首席（跳过辩证）",
-        "agents": ["trend", "news"],
-        "weights": {"trend": 0.5, "news": 0.5},
+        "blurb": "走势∥新闻∥资金 → 首席（跳过辩证）",
+        "agents": ["trend", "news", "flow"],
+        "weights": {"trend": 0.4, "news": 0.3, "flow": 0.3},
         "evidence_tier": "light",
     },
     "standard": {
         "id": "standard",
         "label": "标准",
-        "blurb": "走势∥新闻 → 结构风险 → 辩证 → 首席",
-        "agents": ["trend", "news", "risk"],
-        "weights": {"trend": 0.4, "news": 0.35, "risk": 0.25},
+        "blurb": "走势∥新闻∥资金 → 结构风险 → 辩证 → 首席",
+        "agents": ["trend", "news", "flow", "risk"],
+        "weights": {"trend": 0.3, "news": 0.25, "flow": 0.2, "risk": 0.25},
         "evidence_tier": "standard",
     },
     "deep": {
         "id": "deep",
         "label": "深度",
-        "blurb": "走势∥新闻 → 结构风险 → 辩证×2 → 首席",
-        "agents": ["trend", "news", "risk"],
-        "weights": {"trend": 0.4, "news": 0.3, "risk": 0.3},
+        "blurb": "走势∥新闻∥资金 → 结构风险 → 辩证×2 → 首席",
+        "agents": ["trend", "news", "flow", "risk"],
+        "weights": {"trend": 0.3, "news": 0.25, "flow": 0.2, "risk": 0.25},
         "evidence_tier": "deep",
     },
 }
@@ -133,15 +133,20 @@ def _normalize_tier(tid: str, raw: dict[str, Any] | None) -> dict[str, Any]:
     if isinstance(agents_in, list):
         for a in agents_in:
             aid = str(a).strip()
-            # 资金情绪未接入，忽略历史勾选
-            if aid == "flow":
-                continue
             if aid in AGENT_IDS and aid not in agents:
                 agents.append(aid)
     if not agents:
         agents = list(base["agents"])
-    # 标准/深度若仍是旧的 trend+news，自动补上结构风险
-    if tid in {"standard", "deep"} and agents == ["trend", "news"]:
+    # 旧档缺资金席时，按默认补上（可再在后台去掉）
+    if "flow" in base["agents"] and "flow" not in agents:
+        # 插在 news 后
+        if "news" in agents:
+            i = agents.index("news") + 1
+            agents.insert(i, "flow")
+        else:
+            agents.append("flow")
+    # 标准/深度若仍是旧的 trend+news，自动补上结构风险与资金
+    if tid in {"standard", "deep"} and set(agents) <= {"trend", "news"}:
         agents = list(base["agents"])
 
     weights_in = raw.get("weights") if isinstance(raw.get("weights"), dict) else {}
@@ -255,7 +260,7 @@ def parse_tier_form(form: dict[str, str]) -> dict[str, dict[str, Any]]:
         agents = [
             a
             for a in AGENT_IDS
-            if a != "flow" and form.get(f"{tid}_agent_{a}") in ("1", "on", "true")
+            if form.get(f"{tid}_agent_{a}") in ("1", "on", "true")
         ]
         weights: dict[str, float] = {}
         for a in agents:

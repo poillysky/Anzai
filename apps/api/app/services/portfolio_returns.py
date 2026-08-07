@@ -1,8 +1,9 @@
 """Day / month / year portfolio P&L rolls from daily snapshots.
 
 - **live**: written when user opens 仓库 / returns (today's mark-to-market)
-- **bought**: backfilled from each holding's bought_at × current shares × daily kline
-  (live rows always win for the same date)
+- **bought**: backfilled from each holding's bought_at × current shares ×
+  daily kline (A-share/ETF) or OTC NAV history (OF); JD has no reliable daily
+  series (live snapshot only). Live rows always win for the same date.
 """
 
 from __future__ import annotations
@@ -102,37 +103,62 @@ def ensure_bought_history(db: Session, user_id: int) -> None:
 
     for h in holdings:
         total_cost += float(h.shares) * float(h.cost)
-        if (h.market or "").upper() == "JD":
-            # 积存金无日K；今日盈亏靠实时昨收，历史回填跳过
-            continue
+        mkt = (h.market or "").upper()
         start = normalize_bought_at(
             getattr(h, "bought_at", None) or "",
             fallback=(h.created_at.date() if h.created_at else None),
         )
-        try:
-            _, bars = get_daily_klines(h.symbol, h.market, limit=_KLINE_LIMIT)
-        except Exception as exc:
-            logger.warning(
-                "bought backfill kline failed %s:%s: %s",
-                h.market,
-                h.symbol,
-                exc,
-            )
+        shares = float(h.shares)
+        if shares <= 0:
             continue
+
+        bars: list[tuple[str, float]] = []
+        if mkt == "OF":
+            try:
+                from app.providers.fund import fetch_otc_nav_history
+
+                hist = fetch_otc_nav_history(h.symbol, days=min(_KLINE_LIMIT, 120))
+                bars = [(d[:10], float(nav)) for d, nav in hist if nav and float(nav) > 0]
+            except Exception as exc:
+                logger.warning(
+                    "bought backfill OF nav failed %s: %s",
+                    h.symbol,
+                    exc,
+                )
+                continue
+        elif mkt == "JD":
+            # 积存金无可靠日K；今日靠 live snapshot，历史不硬编
+            continue
+        else:
+            try:
+                _, kline_bars = get_daily_klines(h.symbol, h.market, limit=_KLINE_LIMIT)
+            except Exception as exc:
+                logger.warning(
+                    "bought backfill kline failed %s:%s: %s",
+                    h.market,
+                    h.symbol,
+                    exc,
+                )
+                continue
+            bars = [
+                (b.date[:10], float(b.close))
+                for b in kline_bars
+                if b.close and float(b.close) > 0
+            ]
+
         if len(bars) < 2:
             continue
-        shares = float(h.shares)
         for i in range(1, len(bars)):
-            prev = bars[i - 1]
-            cur = bars[i]
-            d = cur.date[:10]
+            prev_d, prev_px = bars[i - 1]
+            cur_d, cur_px = bars[i]
+            d = cur_d
             if d < start or d >= today or d in live_dates:
                 continue
-            if prev.close <= 0 or cur.close <= 0:
+            if prev_px <= 0 or cur_px <= 0:
                 continue
-            day_pnl = shares * (cur.close - prev.close)
-            mv = shares * cur.close
-            prev_mv = shares * prev.close
+            day_pnl = shares * (cur_px - prev_px)
+            mv = shares * cur_px
+            prev_mv = shares * prev_px
             bucket = by_date.setdefault(d, [0.0, 0.0, 0.0])
             bucket[0] += day_pnl
             bucket[1] += mv

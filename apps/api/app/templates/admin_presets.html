@@ -2,15 +2,26 @@
 {% block title %}对话预设 · 安崽{% endblock %}
 {% block badge %}/admin/presets{% endblock %}
 {% block content %}
-<h2 class="page-title">对话预设</h2>
-<p class="page-lead">
-  <strong>全站仅一套</strong>真人对话预设（人设 / 采样 / chips）。
-  「你是安崽的谁」在 PWA 里选，对话时以【关系】提示词注入，<strong>不</strong>拆成多套预设。
-  聊天密钥在 <a href="/admin/llm">LLM 聊天</a>；向量在 <a href="/admin/embedding">向量模型</a>。
-</p>
+<div class="preset-hero">
+  <div class="preset-hero-text">
+    <h2 class="page-title" style="margin-top:0">对话预设</h2>
+    <p class="page-lead" style="margin-bottom:0">
+      全站仅一套真人对话预设。结构对齐 BrewStory / ST 的
+      <code>prompts[]</code> + <code>prompt_order</code>，按段开关组装。
+      「你是安崽的谁」在 PWA 选择，运行时注入 <strong>relation</strong>。
+    </p>
+    <div class="preset-chip-row">
+      <span class="soft-chip soft-chip--on">单套预设</span>
+      <span class="soft-chip">分段可开关</span>
+      <span class="soft-chip">密钥 → <a href="/admin/llm" style="color:inherit">LLM</a></span>
+      <span class="soft-chip">向量 → <a href="/admin/embedding" style="color:inherit">Embedding</a></span>
+    </div>
+  </div>
+</div>
 
 {% set p = preset_store.presets[0] %}
-<form class="card" method="post" action="/admin/presets">
+{% set rows = prompt_rows %}
+<form class="card" method="post" action="/admin/presets" id="preset-form">
   <input type="hidden" name="action" value="update" />
   <input type="hidden" name="preset_id" value="{{ p.id }}" />
 
@@ -18,55 +29,107 @@
   <label>名称</label>
   <input type="text" name="name" value="{{ p.name }}" required maxlength="64" />
 
-  <p class="list-section-label">人设</p>
-  <label>系统人设 system_prompt</label>
-  <textarea name="system_prompt" rows="7">{{ p.system_prompt }}</textarea>
-  <p class="hint">身份语气不要写死在这里；对方是谁由 PWA 身份 →【关系】段决定。</p>
+  <p class="list-section-label">Prompt 栈</p>
+  <p class="hint" style="margin-top:0">
+    自上而下拼进 system。带 <span class="tag tag--marker">marker</span> 的段运行时填充；
+    可编辑段对应旧字段 <code>system_prompt</code> / <code>reply_style</code> 等。
+  </p>
 
-  <label>口吻补充 reply_style（可选）</label>
-  <textarea name="reply_style" rows="2">{{ p.reply_style }}</textarea>
+  <div class="prompt-stack">
+    {% for row in rows %}
+    <div class="prompt-item {% if row.marker %}is-marker{% endif %} {% if not row.enabled %}is-off{% endif %}" data-prompt-item>
+      <span class="prompt-step" aria-hidden="true"></span>
+      <div class="prompt-head">
+        <label class="prompt-toggle">
+          <input type="checkbox" name="prompt_enabled_{{ row.identifier }}" value="1"
+            data-prompt-enabled
+            {% if row.enabled %}checked{% endif %} />
+          <strong>{{ row.name }}</strong>
+          <code class="prompt-id">{{ row.identifier }}</code>
+        </label>
+        {% if row.marker %}
+        <span class="tag tag--marker">marker</span>
+        {% else %}
+        <span class="tag tag--edit">可编辑</span>
+        {% endif %}
+      </div>
+      {% if row.hint %}
+      <p class="prompt-hint">{{ row.hint }}</p>
+      {% endif %}
+      {% if row.marker %}
+      <div class="prompt-marker-box">运行时注入，无独立正文。保存时仍可开关是否启用该段。</div>
+      {% else %}
+      <label style="margin-top:10px">
+        正文{% if row.wrap %} <span class="mute">→ 【{{ row.wrap }}】</span>{% endif %}
+      </label>
+      <textarea name="prompt_{{ row.identifier }}" rows="{% if row.identifier == 'main' %}9{% else %}3{% endif %}">{{ row.content }}</textarea>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
 
   <p class="list-section-label">采样</p>
-  <div class="field-row">
-    <div>
-      <label>温度</label>
-      <input type="number" name="temperature" step="0.05" min="0" max="2" value="{{ p.temperature }}" />
+  <div class="section-panel">
+    <div class="field-row">
+      <div>
+        <label>温度</label>
+        <input type="number" name="temperature" step="0.05" min="0" max="2" value="{{ p.temperature }}" />
+      </div>
+      <div>
+        <label>Top P</label>
+        <input type="number" name="top_p" step="0.05" min="0" max="1" value="{{ p.top_p }}" />
+      </div>
     </div>
-    <div>
-      <label>Top P</label>
-      <input type="number" name="top_p" step="0.05" min="0" max="1" value="{{ p.top_p }}" />
+    <div class="field-row">
+      <div>
+        <label>频率惩罚</label>
+        <input type="number" name="frequency_penalty" step="0.05" min="-2" max="2" value="{{ p.frequency_penalty }}" />
+      </div>
+      <div>
+        <label>存在惩罚</label>
+        <input type="number" name="presence_penalty" step="0.05" min="-2" max="2" value="{{ p.presence_penalty }}" />
+      </div>
     </div>
-  </div>
-  <div class="field-row">
-    <div>
-      <label>频率惩罚</label>
-      <input type="number" name="frequency_penalty" step="0.05" min="-2" max="2" value="{{ p.frequency_penalty }}" />
-    </div>
-    <div>
-      <label>存在惩罚</label>
-      <input type="number" name="presence_penalty" step="0.05" min="-2" max="2" value="{{ p.presence_penalty }}" />
-    </div>
-  </div>
-  <div class="field-row">
-    <div>
-      <label>最大回复</label>
-      <input type="number" name="max_tokens" step="1" min="64" max="8192" value="{{ p.max_tokens }}" />
-    </div>
-    <div>
-      <label>历史轮数</label>
-      <input type="number" name="history_messages" step="1" min="2" max="100" value="{{ p.history_messages }}" />
+    <div class="field-row" style="margin-bottom:10px">
+      <div>
+        <label>最大回复</label>
+        <input type="number" name="max_tokens" step="1" min="64" max="8192" value="{{ p.max_tokens }}" />
+      </div>
+      <div>
+        <label>历史轮数</label>
+        <input type="number" name="history_messages" step="1" min="2" max="100" value="{{ p.history_messages }}" />
+      </div>
     </div>
   </div>
 
   <p class="list-section-label">对话体验</p>
-  <label>建议开场 chips（逗号分隔）</label>
-  <input type="text" name="suggested_chips" value="{{ p.suggested_chips | join(', ') }}" />
+  <div class="section-panel" style="padding-bottom:14px">
+    <label>建议开场 chips（逗号分隔）</label>
+    <input type="text" name="suggested_chips" value="{{ p.suggested_chips | join(', ') }}" />
 
-  <label>模型覆盖（空 = 当前连接模型）</label>
-  <input type="text" name="model_override" value="{{ p.model_override }}" placeholder="留空" />
+    <label>模型覆盖（空 = 当前连接模型）</label>
+    <input type="text" name="model_override" value="{{ p.model_override }}" placeholder="留空" />
+  </div>
 
-  <div class="row">
+  <div class="form-actions">
+    <p class="mute">保存后立即作用于全站安崽对话</p>
     <button type="submit">保存预设</button>
   </div>
 </form>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function () {
+    var form = document.getElementById("preset-form");
+    if (!form) return;
+    form.querySelectorAll("[data-prompt-enabled]").forEach(function (cb) {
+      cb.addEventListener("change", function () {
+        var item = cb.closest("[data-prompt-item]");
+        if (!item) return;
+        item.classList.toggle("is-off", !cb.checked);
+      });
+    });
+  })();
+</script>
 {% endblock %}

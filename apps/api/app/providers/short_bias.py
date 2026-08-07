@@ -3,9 +3,10 @@
 Not a forecast API — classical micro-momentum (ROC + slope + vs short MA).
 Label as 短线倾向 / 约5分偏涨跌, never as guaranteed prediction.
 
-Gold day24 (积存金 / AU9999): structure-aware tip — swing-high drawdown,
-~6h ROC, tail slope, vs mean, plus ~30m micro → 震荡偏跌/偏涨 when the
-chart's right side drifts while the tip chops.
+Gold day24 (积存金 / AU9999) — three layers (MTFA / 三重滤网):
+  L1 macro: 4h/2h 定大趋势方向（偏强/偏弱/震荡）
+  L2 near:  原始 tip 斜率+速度抓拐点（含快速下跌/上涨）
+  L3 outlook: 只解读 L1×L2 一致性，不做价位预测
 """
 
 from __future__ import annotations
@@ -56,6 +57,8 @@ _GOLD_LABEL_MAP = {
     "约5分震荡": "金价震荡",
     "震荡偏涨": "震荡偏涨",
     "震荡偏跌": "震荡偏跌",
+    "偏跌抬头": "偏跌抬头",
+    "偏涨回落": "偏涨回落",
     "短线暂无": "金价暂无",
     "开盘观察": "金价观察",
     "短线陈旧": "金价陈旧",
@@ -199,6 +202,10 @@ class ShortBias:
     sample_n: int
     roc_pct: float | None
     as_of: str | None
+    # 多周期完整说明（备用）
+    detail: str | None = None
+    # 卡片上直接展示：①大趋势 ②近端动向 ③可能走向
+    summary: str | None = None
 
 
 def _linreg_slope(ys: list[float]) -> float:
@@ -374,6 +381,8 @@ def _as_gold_labels(result: ShortBias, *, na_label: str = "金价暂无") -> Sho
         sample_n=result.sample_n,
         roc_pct=result.roc_pct,
         as_of=result.as_of,
+        detail=result.detail,
+        summary=result.summary,
     )
 
 
@@ -403,6 +412,8 @@ def _apply_hysteresis(key: str, result: ShortBias) -> ShortBias:
             sample_n=result.sample_n,
             roc_pct=result.roc_pct,
             as_of=result.as_of,
+            detail=result.detail,
+            summary=result.summary,
         )
         _HYST[key] = ("flat", now, float(result.score or 0))
         return flat
@@ -459,6 +470,275 @@ def _tail_slope_frac(prices: list[float]) -> float:
     return slope * (len(tail) - 1) / mean
 
 
+def _window_metrics(prices: list[float], n: int) -> tuple[float | None, float | None, int]:
+    """ROC + tip slope over last n bars. Returns (roc, slope_frac, used_n)."""
+    if n <= 0 or len(prices) < _MIN_POINTS:
+        return None, None, 0
+    w = prices[-min(n, len(prices)) :]
+    if len(w) < _MIN_POINTS:
+        return None, None, len(w)
+    first, last = w[0], w[-1]
+    roc = (last - first) / first if first > 0 else 0.0
+    return roc, _tail_slope_frac(w), len(w)
+
+
+def _fmt_roc(roc: float | None) -> str:
+    if roc is None:
+        return "—"
+    return f"{roc * 100:+.2f}%"
+
+
+def _dir_word(roc: float | None, slope: float | None, band: float) -> str:
+    """偏涨 / 偏跌 / 走平 — from ROC with slope as tie-break."""
+    if roc is None:
+        return "不足"
+    if roc >= band:
+        return "偏涨"
+    if roc <= -band:
+        return "偏跌"
+    if slope is not None:
+        if slope >= band * 0.7:
+            return "抬头"
+        if slope <= -band * 0.7:
+            return "回落"
+    return "走平"
+
+
+def _near_tip_state(prices: list[float], *, band: float) -> tuple[str, float, float, float]:
+    """原始 tip：斜率 + 速度。Returns (kind, tip_roc, tip_slope, speed)."""
+    if len(prices) < 4:
+        return "na", 0.0, 0.0, 0.0
+
+    n = min(12, len(prices))
+    tip = prices[-n:]
+    mean = sum(tip) / len(tip)
+    if mean <= 0:
+        return "na", 0.0, 0.0, 0.0
+
+    a3, b3 = tip[-3], tip[-1]
+    roc3 = (b3 - a3) / a3 if a3 > 0 else 0.0
+    roc_n = (tip[-1] - tip[0]) / tip[0] if tip[0] > 0 else 0.0
+    slope = _linreg_slope(tip)
+    slope_frac = slope * (len(tip) - 1) / mean
+
+    rets: list[float] = []
+    for i in range(1, len(tip)):
+        p0, p1 = tip[i - 1], tip[i]
+        if p0 > 0:
+            rets.append((p1 - p0) / p0)
+    sigma = _stdev(rets) if len(rets) >= 2 else 0.0
+    noise = max(sigma, band * 0.35, 1e-6)
+
+    tip_move = roc3 if abs(roc3) >= abs(roc_n) * 0.55 else roc_n
+    tip_slope = slope_frac
+    speed = max(abs(tip_move), abs(tip_slope)) / noise
+    signed = tip_move if abs(tip_move) >= abs(tip_slope) * 0.6 else tip_slope
+    thr = band * 0.45
+    fast_thr = band * 1.2
+
+    if signed <= -thr or tip_slope <= -thr * 0.85:
+        kind = "fast_down" if (speed >= 2.2 or abs(signed) >= fast_thr or abs(tip_slope) >= fast_thr) else "down"
+        return kind, tip_move, tip_slope, speed
+    if signed >= thr or tip_slope >= thr * 0.85:
+        kind = "fast_up" if (speed >= 2.2 or abs(signed) >= fast_thr or abs(tip_slope) >= fast_thr) else "up"
+        return kind, tip_move, tip_slope, speed
+    if tip_slope <= -thr * 0.7:
+        return ("fast_down" if speed >= 2.0 else "down"), tip_move, tip_slope, speed
+    if tip_slope >= thr * 0.7:
+        return ("fast_up" if speed >= 2.0 else "up"), tip_move, tip_slope, speed
+    return "flat", tip_move, tip_slope, speed
+
+
+@dataclass(frozen=True)
+class _MacroTrend:
+    """层1：大趋势（高周期定方向，不越权看 tip）。"""
+
+    side: BiasKind  # up | down | flat
+    text: str
+    votes: int
+    score: float
+    narr_roc: float
+    sample_n: int
+
+
+@dataclass(frozen=True)
+class _NearInflection:
+    """层2：近端拐点（原始 tip 斜率/速度，禁止抽稀）。"""
+
+    kind: str  # fast_down | down | flat | up | fast_up | na
+    text: str
+    turn: str  # "" | turn_up | turn_down
+    tip_roc: float
+    tip_slope: float
+    speed: float
+
+
+def _layer_macro_trend(clean: list[float], slots: int) -> _MacroTrend | None:
+    """层1 大趋势：约 4h/2h ROC+斜率，辅以 6h 结构回撤加权。"""
+    day = slots if slots > 0 else max(len(clean), 24 * 60)
+    n_4h = min(len(clean), max(60, day // 6))
+    n_2h = min(len(clean), max(40, day // 12))
+    n_6h = min(len(clean), max(72, day // 4))
+    mid = clean[-n_6h:]
+    if len(mid) < _MIN_POINTS:
+        return None
+
+    band = _DEADBAND_GOLD
+    last = mid[-1]
+    mean = sum(mid) / len(mid)
+    roc_6h = (last - mid[0]) / mid[0] if mid[0] > 0 else 0.0
+    slope_t = _tail_slope_frac(mid)
+    vs_mean = (last - mean) / mean if mean > 0 else 0.0
+
+    roc_4h, sl_4h, _ = _window_metrics(clean, n_4h)
+    roc_2h, sl_2h, _ = _window_metrics(clean, n_2h)
+    d4 = _dir_word(roc_4h, sl_4h, band)
+    d2 = _dir_word(roc_2h, sl_2h, band)
+
+    votes = 0
+    for d in (d4, d2):
+        if d == "偏涨":
+            votes += 1
+        elif d == "偏跌":
+            votes -= 1
+    if roc_6h >= band:
+        votes += 1
+    elif roc_6h <= -band:
+        votes -= 1
+    if slope_t >= band * 0.7:
+        votes += 1
+    elif slope_t <= -band * 0.7:
+        votes -= 1
+    if vs_mean >= band * 0.45:
+        votes += 1
+    elif vs_mean <= -band * 0.45:
+        votes -= 1
+
+    # 结构回撤只加权，不单独定文案
+    tip_guard = max(5, len(mid) // 12)
+    swing = _last_swing_extreme(mid, kind="high")
+    hi_i = max(range(0, len(mid) - tip_guard), key=lambda i: mid[i])
+    peak_px = swing[1] if swing and swing[1] >= mid[hi_i] else mid[hi_i]
+    dd = (last - peak_px) / peak_px if peak_px > 0 else None
+    swing_lo = _last_swing_extreme(mid, kind="low")
+    lo_i = min(range(0, len(mid) - tip_guard), key=lambda i: mid[i])
+    trough_px = swing_lo[1] if swing_lo and swing_lo[1] <= mid[lo_i] else mid[lo_i]
+    ur = (last - trough_px) / trough_px if trough_px > 0 else None
+    if dd is not None and dd <= -band:
+        votes -= 1
+    if ur is not None and ur >= band:
+        votes += 1
+
+    if votes >= 2 or (votes >= 1 and d4 == "偏涨" and d2 != "偏跌"):
+        side: BiasKind = "up"
+        text = "大趋势偏强"
+    elif votes <= -2 or (votes <= -1 and d4 == "偏跌" and d2 != "偏涨"):
+        side = "down"
+        text = "大趋势偏弱"
+    else:
+        side = "flat"
+        text = "大趋势来回震荡"
+
+    score = 0.4 * roc_6h + 0.35 * slope_t + 0.25 * vs_mean
+    if dd is not None and votes < 0:
+        score = 0.45 * score + 0.55 * dd
+        narr = dd
+    elif ur is not None and votes > 0:
+        score = 0.45 * score + 0.55 * ur
+        narr = ur
+    else:
+        narr = roc_6h
+
+    return _MacroTrend(
+        side=side,
+        text=text,
+        votes=votes,
+        score=float(score),
+        narr_roc=float(narr),
+        sample_n=len(mid),
+    )
+
+
+def _layer_near_inflection(
+    clean: list[float],
+    *,
+    band: float,
+    macro_side: BiasKind,
+) -> _NearInflection:
+    """层2 近端拐点：原始 tip（约 8–12 根），禁止均匀抽样。"""
+    tip_raw = clean[-min(12, len(clean)) :]
+    kind, tip_roc, tip_slope, speed = _near_tip_state(tip_raw, band=band)
+
+    if kind == "fast_down":
+        text = "近端快速下跌"
+    elif kind == "down":
+        text = "近端往下走"
+    elif kind == "fast_up":
+        text = "近端快速上涨"
+    elif kind == "up":
+        text = "近端往上走"
+    elif kind == "flat":
+        text = "近端几乎走平"
+    else:
+        text = "近端方向不明"
+
+    tip_up = kind in {"fast_up", "up"}
+    tip_dn = kind in {"fast_down", "down"}
+    turn = ""
+    if macro_side == "down" and tip_up:
+        turn = "turn_up"
+    elif macro_side == "up" and tip_dn:
+        turn = "turn_down"
+    elif macro_side == "flat" and tip_up:
+        turn = "turn_up"
+    elif macro_side == "flat" and tip_dn:
+        turn = "turn_down"
+
+    return _NearInflection(
+        kind=kind,
+        text=text,
+        turn=turn,
+        tip_roc=float(tip_roc),
+        tip_slope=float(tip_slope),
+        speed=float(speed),
+    )
+
+
+def _layer_outlook(macro: _MacroTrend, near: _NearInflection) -> str:
+    """层3 综合：只做 L1×L2 一致性解读，不算第三套价位预测。"""
+    trend = macro.text
+    kind = near.kind
+    turn = near.turn
+
+    if kind == "fast_down":
+        if trend.endswith("偏强"):
+            return "偏强里正在快速回落"
+        if turn == "turn_down":
+            return "冲高后快速回落"
+        return "短线压力偏大"
+    if kind == "fast_up":
+        if trend.endswith("偏弱"):
+            return "偏弱里正在快速反弹"
+        if turn == "turn_up":
+            return "止跌后快速抬头"
+        return "短线动能偏强"
+    if turn == "turn_up":
+        return "可能止跌抬头"
+    if turn == "turn_down":
+        return "可能冲高回落"
+    if trend.endswith("偏强") and kind == "up":
+        return "暂看延续偏强"
+    if trend.endswith("偏弱") and kind == "down":
+        return "暂看延续偏弱"
+    if trend.endswith("偏强") and kind in {"down", "flat"}:
+        return "偏强里注意回落"
+    if trend.endswith("偏弱") and kind in {"up", "flat"}:
+        return "偏弱里留意反弹"
+    if trend.endswith("震荡"):
+        return "先看能不能走出方向"
+    return "方向未明，先观望"
+
+
 def _analyze_gold_day_chart(
     clean: list[float],
     *,
@@ -467,127 +747,54 @@ def _analyze_gold_day_chart(
     slots: int,
     as_of: str | None,
 ) -> ShortBias:
-    """Structure-aware gold tip bias — aligns with what the day24 chart shows.
+    """金价 day24 偏势：L1 大趋势 → L2 近端拐点 → L3 综合解读（非预测）。
 
-    Votes from: window/swing-high drawdown, ~6h ROC, tail slope, vs mean,
-    plus ~30m micro. Structure uses a stable 0.15% floor so adaptive noise
-    widening does not hide a clear peak→tip fade users see on the sparkline.
+    依据多周期共振 / 三重滤网：每层只做本职，不越权混算。
     """
-    day = slots if slots > 0 else max(len(clean), 24 * 60)
-    n_6h = min(len(clean), max(72, day // 4))  # ~6h
-    n_30m = min(len(clean), max(12, day // 48))
-    mid = clean[-n_6h:]
-    micro_src = clean[-n_30m:]
-    if len(mid) < _MIN_POINTS:
-        return _na_bias(symbol, market, "金价暂无", as_of=as_of, n=len(mid))
+    macro = _layer_macro_trend(clean, slots)
+    if macro is None:
+        return _na_bias(symbol, market, "金价暂无", as_of=as_of, n=len(clean))
 
-    band_noise = _adaptive_deadband(mid, _DEADBAND_GOLD)
-    band_struct = _DEADBAND_GOLD
-    last = mid[-1]
-    mean = sum(mid) / len(mid)
-    roc_6h = (last - mid[0]) / mid[0] if mid[0] > 0 else 0.0
-    slope_t = _tail_slope_frac(mid)
-    vs_mean = (last - mean) / mean if mean > 0 else 0.0
+    near = _layer_near_inflection(clean, band=_DEADBAND_GOLD, macro_side=macro.side)
+    outlook = _layer_outlook(macro, near)
 
-    tip_guard = max(5, len(mid) // 12)
-    swing = _last_swing_extreme(mid, kind="high")
-    hi_i = max(range(0, len(mid) - tip_guard), key=lambda i: mid[i])
-    hi_px = mid[hi_i]
-    if swing and swing[1] >= hi_px:
-        peak_px = swing[1]
-    else:
-        peak_px = hi_px
-    dd = (last - peak_px) / peak_px if peak_px > 0 else None
-
-    swing_lo = _last_swing_extreme(mid, kind="low")
-    lo_i = min(range(0, len(mid) - tip_guard), key=lambda i: mid[i])
-    lo_px = mid[lo_i]
-    if swing_lo and swing_lo[1] <= lo_px:
-        trough_px = swing_lo[1]
-    else:
-        trough_px = lo_px
-    ur = (last - trough_px) / trough_px if trough_px > 0 else None
-
-    micro = _sample_even(micro_src, _LOOKBACK)
-    m_bias, _, m_score, m_roc = _core_signal(
-        micro if len(micro) >= _MIN_POINTS else mid[-_LOOKBACK:],
-        band=_adaptive_deadband(micro_src, _DEADBAND_GOLD),
-    )
-
-    down = 0
-    up = 0
-    if dd is not None and dd <= -band_struct:
-        down += 2
-        if dd <= -band_struct * 2:
-            down += 1
-    if ur is not None and ur >= band_struct:
-        up += 2
-        if ur >= band_struct * 2:
-            up += 1
-    if roc_6h <= -band_struct:
-        down += 1
-    elif roc_6h >= band_struct:
-        up += 1
-    if slope_t <= -band_struct * 0.7:
-        down += 1
-    elif slope_t >= band_struct * 0.7:
-        up += 1
-    if vs_mean <= -band_struct * 0.45:
-        down += 1
-    elif vs_mean >= band_struct * 0.45:
-        up += 1
-    if slope_t <= -band_noise * 0.5 and down >= 1:
-        down += 1
-    if slope_t >= band_noise * 0.5 and up >= 1:
-        up += 1
-
-    if dd is not None and down > up and abs(dd) >= max(abs(roc_6h), band_struct):
-        narr_roc = dd
-    elif ur is not None and up > down and abs(ur) >= max(abs(roc_6h), band_struct):
-        narr_roc = ur
-    else:
-        narr_roc = roc_6h
-
-    score = 0.4 * roc_6h + 0.35 * slope_t + 0.25 * vs_mean
-    if dd is not None and down >= up:
-        score = 0.45 * score + 0.55 * dd
-    if ur is not None and up > down:
-        score = 0.45 * score + 0.55 * ur
-
-    need = 2 if (dd is not None and dd <= -band_struct) or (ur is not None and ur >= band_struct) else 3
-
-    if down >= need and down > up:
-        if m_bias == "down":
-            label = "约5分偏跌"
-            bias: BiasKind = "down"
-            narr_roc = m_roc if abs(m_roc) >= abs(narr_roc) * 0.5 else narr_roc
-            score = m_score
-        else:
-            label = "震荡偏跌"
-            bias = "down"
-    elif up >= need and up > down:
-        if m_bias == "up":
-            label = "约5分偏涨"
-            bias = "up"
-            narr_roc = m_roc if abs(m_roc) >= abs(narr_roc) * 0.5 else narr_roc
-            score = m_score
-        else:
-            label = "震荡偏涨"
-            bias = "up"
-    elif m_bias == "down" and down >= up:
-        label = "约5分偏跌"
-        bias = "down"
-        narr_roc = m_roc
-        score = m_score
-    elif m_bias == "up" and up >= down:
-        label = "约5分偏涨"
+    # bias / label：近端优先（急跌勿配全日偏涨色）
+    if near.kind in {"fast_down", "down"}:
+        bias: BiasKind = "down"
+        label = (
+            "偏涨回落"
+            if near.turn == "turn_down"
+            else ("约5分偏跌" if near.kind == "fast_down" else "震荡偏跌")
+        )
+        narr_roc = near.tip_roc
+        score = 0.4 * macro.score + 0.6 * near.tip_roc
+    elif near.kind in {"fast_up", "up"}:
         bias = "up"
-        narr_roc = m_roc
-        score = m_score
+        label = (
+            "偏跌抬头"
+            if near.turn == "turn_up"
+            else ("约5分偏涨" if near.kind == "fast_up" else "震荡偏涨")
+        )
+        narr_roc = near.tip_roc
+        score = 0.4 * macro.score + 0.6 * near.tip_roc
+    elif macro.side == "up":
+        bias = "up"
+        label = "震荡偏涨"
+        narr_roc = macro.narr_roc
+        score = macro.score
+    elif macro.side == "down":
+        bias = "down"
+        label = "震荡偏跌"
+        narr_roc = macro.narr_roc
+        score = macro.score
     else:
-        label = "约5分震荡"
         bias = "flat"
-        narr_roc = m_roc if abs(m_roc) > abs(roc_6h) * 0.5 else roc_6h
+        label = "约5分震荡"
+        narr_roc = near.tip_roc if abs(near.tip_roc) > abs(macro.narr_roc) * 0.5 else macro.narr_roc
+        score = macro.score
+
+    summary = f"{macro.text}\n{near.text}\n{outlook}"
+    detail = f"{macro.text} · {near.text} · {outlook} · 非预测"
 
     return ShortBias(
         symbol=symbol,
@@ -596,9 +803,11 @@ def _analyze_gold_day_chart(
         label=label,
         score=round(score, 6),
         lookback_min=_LOOKBACK,
-        sample_n=len(mid),
+        sample_n=macro.sample_n,
         roc_pct=round(narr_roc * 100, 3),
         as_of=as_of,
+        detail=detail,
+        summary=summary,
     )
 
 

@@ -1,12 +1,13 @@
 """Gold board: domestic (浙商/民生) / international (伦敦/纽约) / shop (门店).
 
 Holdable: A-share gold ETFs + 浙商/民生积存金 (market=JD, shares=克).
-Jicunjin quotes via JD Gold public APIs.
+积存金记账：买入按金额÷金价折克；卖出按克。Jicunjin quotes via JD Gold public APIs.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 
 import httpx
@@ -15,6 +16,9 @@ from app.providers.macro import freshness_label, get_macro_quotes
 from app.providers.quote import get_quotes
 
 logger = logging.getLogger(__name__)
+
+_BOARD_CACHE: tuple[float, "GoldBoard"] | None = None
+_BOARD_TTL = 45.0
 
 _JD_HEADERS = {
     "User-Agent": (
@@ -58,7 +62,7 @@ DOMESTIC_CATALOG: list[dict] = [
         "kind": "jd",
         "sku": "2005453243",
         "unit": "元/克",
-        "note": "积存金，可入仓（按克）",
+        "note": "积存金，可入仓（按金额买入）",
     },
     {
         "id": "zs-jcj",
@@ -66,7 +70,7 @@ DOMESTIC_CATALOG: list[dict] = [
         "kind": "jd",
         "sku": "1961543816",
         "unit": "元/克",
-        "note": "积存金，可入仓（按克）",
+        "note": "积存金，可入仓（按金额买入）",
     },
     {
         "id": "ms-jcj",
@@ -74,7 +78,7 @@ DOMESTIC_CATALOG: list[dict] = [
         "kind": "jd",
         "sku": "21001001000001",
         "unit": "元/克",
-        "note": "积存金，可入仓（按克）",
+        "note": "积存金，可入仓（按金额买入）",
     },
     {
         "id": "bosera-etf",
@@ -638,6 +642,54 @@ def jd_name_by_symbol(symbol: str) -> str:
     return key
 
 
+def get_gds_holding_quotes(symbols: list[str]) -> dict[str, "Quote"]:
+    """上金所 AU9999 参考价（market=GDS）。不可入仓，供分析/宏观引用。"""
+    from app.providers.quote import Quote
+
+    out: dict[str, Quote] = {}
+    want = {(raw or "").strip().upper() or "AU9999" for raw in symbols if (raw or "").strip()}
+    if not want:
+        return out
+    # 一律归一到 AU9999
+    price = 0.0
+    prev = None
+    chg = None
+    try:
+        from app.providers.macro import _fetch_raw, _parse_gds
+
+        raw_map = _fetch_raw(["gds_AU9999"])
+        line = raw_map.get("gds_AU9999") or ""
+        if line:
+            parsed = _parse_gds("gds_AU9999", line, "AU9999", "元/克")
+            if parsed is not None:
+                price = float(parsed.price or 0.0)
+                prev = parsed.prev
+                chg = parsed.change_pct
+    except Exception:
+        logger.exception("get_gds_holding_quotes failed")
+    if price <= 0:
+        try:
+            prices, _times, _slots = _fetch_em_au9999_chart("118.AU9999")
+            if prices:
+                price = float(prices[-1])
+        except Exception:
+            logger.exception("AU9999 EM chart fallback failed")
+    q = Quote(
+        symbol="AU9999",
+        name="AU9999",
+        market="GDS",
+        price=price,
+        change_pct=float(chg) if chg is not None else None,
+        prev_close=float(prev) if prev is not None else None,
+        as_of=None,
+        live=price > 0,
+    )
+    for sym in want:
+        out[sym] = q
+        out["AU9999"] = q
+    return out
+
+
 def get_jd_holding_quotes(symbols: list[str]) -> dict[str, "Quote"]:
     """Live quotes for 积存金 holdings (market=JD). Keyed by requested symbol."""
     from app.providers.quote import Quote
@@ -676,11 +728,30 @@ def get_jd_holding_quotes(symbols: list[str]) -> dict[str, "Quote"]:
 
 
 def get_gold_board() -> GoldBoard:
+    global _BOARD_CACHE
+    now = time.time()
+    if _BOARD_CACHE and now - _BOARD_CACHE[0] < _BOARD_TTL:
+        return _BOARD_CACHE[1]
+
     domestic = _catalog_items(DOMESTIC_CATALOG, "domestic")
     international = _international_items()
     shop = _shop_items()
 
-    return GoldBoard(
+    base_note = (
+        "AU9999 为上金所现货参考；工行/浙商/民生积存金参考京东金融可入仓；"
+        "博时/瑞信为场内黄金ETF可入仓；"
+        "门店为品牌金店零售/回收参考价，以门店公示为准。非投资建议。"
+    )
+    priced = sum(
+        1
+        for sec in (domestic, international, shop)
+        for it in sec
+        if it.price is not None and float(it.price) > 0
+    )
+    if priced == 0:
+        base_note = "行情源暂时拉不到，请稍后刷新。" + base_note
+
+    board = GoldBoard(
         sections=[
             GoldBoardSection(
                 id="domestic",
@@ -701,16 +772,14 @@ def get_gold_board() -> GoldBoard:
                 items=shop,
             ),
         ],
-        note=(
-            "AU9999 为上金所现货参考；工行/浙商/民生积存金参考京东金融可入仓；"
-            "博时/瑞信为场内黄金ETF可入仓；"
-            "门店为品牌金店零售/回收参考价，以门店公示为准。非投资建议。"
-        ),
+        note=base_note,
     )
+    _BOARD_CACHE = (now, board)
+    return board
 
 
-def format_gold_board_text() -> str:
-    """Agent-facing text aligned with App「股票→黄金」三栏看板。"""
+def format_gold_board_text(hint: str = "") -> str:
+    """Agent-facing compact gold quotes — never dump the whole App board for the model to recite."""
     from app.providers.macro import calendar_clock_line
 
     try:
@@ -719,43 +788,113 @@ def format_gold_board_text() -> str:
         logger.exception("format_gold_board_text failed")
         return "黄金看板暂时拉不到（勿编造）。"
 
+    h = (hint or "").strip()
+    want_jd = any(k in h for k in ("积存", "工行", "浙商", "民生"))
+    want_etf = any(
+        k in h for k in ("ETF", "etf", "159937", "518660", "博时", "工银", "基金")
+    )
+    want_intl = any(k in h for k in ("纽约", "伦敦", "国际", "外盘", "盎司", "美元"))
+    want_shop = any(k in h for k in ("门店", "金店", "首饰", "周大福", "老凤祥", "回收"))
+    # 泛问「黄金/金价」：只给锚点价，不展开全页
+    general = not (want_jd or want_etf or want_intl or want_shop)
+
+    by_id: dict[str, object] = {}
+    by_sec: dict[str, list] = {}
+    for sec in board.sections:
+        by_sec[sec.id] = list(sec.items)
+        for it in sec.items:
+            by_id[str(it.id)] = it
+
+    def _fmt(it: object) -> str | None:
+        if it is None or getattr(it, "price", None) is None:
+            return None
+        price = it.price
+        change_pct = getattr(it, "change_pct", None)
+        chg = f"{change_pct:+.2f}%" if change_pct is not None else "—"
+        tag = (getattr(it, "freshness", None) or "").strip() or "时间未知"
+        unit = getattr(it, "unit", None) or "元/克"
+        name = getattr(it, "name", "") or ""
+        return f"{name} {price}{unit}（{chg}，{tag}）"
+
+    picks: list[str] = []
+    spoken: list[str] = []
+
+    def _add(it: object) -> None:
+        bit = _fmt(it)
+        if not bit or bit in picks:
+            return
+        picks.append(bit)
+        change_pct = getattr(it, "change_pct", None)
+        if change_pct is not None and len(spoken) < 2:
+            direction = (
+                "涨了" if change_pct > 0 else ("跌了" if change_pct < 0 else "差不多平盘")
+            )
+            unit = getattr(it, "unit", None) or "元/克"
+            name = getattr(it, "name", "") or ""
+            spoken.append(
+                f"{name}大概 {getattr(it, 'price', '')}{unit}，"
+                f"{direction}约 {abs(change_pct):.2f}%"
+            )
+
+    # 锚点：国内 AU9999 几乎总带（积存/ETF/门店专问时可仍带一句对照）
+    au = by_id.get("au9999")
+    if au is not None:
+        _add(au)
+
+    if want_jd:
+        for it in by_sec.get("domestic") or []:
+            if getattr(it, "id", None) != "au9999" and "积存" in (getattr(it, "name", "") or ""):
+                _add(it)
+                if len(picks) >= 3:
+                    break
+    if want_etf:
+        for it in by_sec.get("domestic") or []:
+            name = getattr(it, "name", "") or ""
+            iid = str(getattr(it, "id", "") or "")
+            if "ETF" in name.upper() or iid in {"159937", "518660"}:
+                _add(it)
+    if want_intl or general:
+        intl = by_sec.get("international") or []
+        # 泛问只要纽约金一个；点名伦敦再加
+        for it in intl:
+            name = getattr(it, "name", "") or ""
+            iid = str(getattr(it, "id", "") or "")
+            if "纽约" in name or iid in {"xau", "gc"}:
+                _add(it)
+                break
+        if want_intl and "伦敦" in h:
+            for it in intl:
+                if "伦敦" in (getattr(it, "name", "") or ""):
+                    _add(it)
+                    break
+    if want_shop:
+        for it in (by_sec.get("shop") or [])[:2]:
+            _add(it)
+
+    # 硬上限：工具里最多 3 条报价，逼模型别念看板
+    picks = picks[:3]
+    spoken = spoken[:2]
+
     lines = [
-        "【黄金 · 与 App「股票→黄金」页一致】国内 / 国际 / 门店；无报价禁止编造。",
-        "只许用下列品种名与数字。禁止说「沪金99」「沪金连续」「黄金连续合约」"
-        "「纽约黄金」等页面没有的叫法；国内现货称 AU9999，国际称纽约金/伦敦金。",
-        "引用方式：嵌进口语短句，不要复述成项目符号看板。",
+        "【黄金速览·精简】与 App 黄金页同源；无报价禁止编造。",
+        "回答纪律（必守）：用户没点名的品种一律别提；"
+        "整段回复最多嵌 1～2 个价格数字，禁止把积存金/ETF/门店/伦敦金一股脑念完；"
+        "两三句口语说完，别列清单。",
+        "禁止「沪金99」「沪金连续」「纽约黄金」等页面没有的叫法。",
         calendar_clock_line(),
     ]
-    if board.note:
-        lines.append(f"说明：{board.note}")
-
-    spoken: list[str] = []
-    for sec in board.sections:
-        bits: list[str] = []
-        items = sec.items
-        # 门店只取前 4 个，避免刷屏
-        if sec.id == "shop":
-            items = items[:4]
-        for it in items:
-            if it.price is None:
-                continue
-            chg = f"{it.change_pct:+.2f}%" if it.change_pct is not None else "—"
-            tag = (it.freshness or "").strip() or "时间未知"
-            unit = it.unit or "元/克"
-            extra = f"，{it.note}" if it.note else ""
-            bits.append(f"{it.name} {it.price} {unit}（{chg}，{tag}{extra}）")
-            if it.change_pct is not None and len(spoken) < 4 and sec.id != "shop":
-                direction = (
-                    "涨了" if it.change_pct > 0 else ("跌了" if it.change_pct < 0 else "差不多平盘")
-                )
-                spoken.append(
-                    f"{it.name}大概 {it.price}{unit}，{direction}约 {abs(it.change_pct):.2f}%"
-                )
-        if bits:
-            lines.append(f"{sec.title}：{'；'.join(bits)}。")
-        else:
-            lines.append(f"{sec.title}：暂无报价。")
-
+    if picks:
+        lines.append("可引用报价：" + "；".join(picks) + "。")
+    else:
+        lines.append("可引用报价：暂无（勿编造）。")
     if spoken:
         lines.append("口语参考：" + "。".join(spoken) + "。")
+    if general:
+        lines.append("用户在泛问金价：优先只说 AU9999，最多再带一句纽约金对照。")
+    elif want_jd:
+        lines.append("用户在问积存金：AU9999 + 对应银行积存即可。")
+    elif want_etf:
+        lines.append("用户在问黄金 ETF：AU9999 + 点名的 ETF 即可。")
+    elif want_shop:
+        lines.append("用户在问门店/首饰：点名门店价，并提醒溢价与回收差，勿荐买。")
     return "\n".join(lines)

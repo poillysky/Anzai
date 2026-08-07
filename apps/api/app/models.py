@@ -24,7 +24,7 @@ class Holding(Base):
     user_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
     symbol: Mapped[str] = mapped_column(String(16), index=True)
     name: Mapped[str] = mapped_column(String(64), default="")
-    market: Mapped[str] = mapped_column(String(8), default="SH")  # SH / SZ / JD（积存金）
+    market: Mapped[str] = mapped_column(String(8), default="SH")  # SH / SZ / JD / OF（场外基金）
     shares: Mapped[float] = mapped_column(Float, default=0)
     cost: Mapped[float] = mapped_column(Float, default=0)
     tags: Mapped[str] = mapped_column(String(128), default="")
@@ -131,6 +131,9 @@ class AgentConversation(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Rolling chat memory (BrewStory-style summary inject)
+    memory_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    memory_until_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class AgentMessage(Base):

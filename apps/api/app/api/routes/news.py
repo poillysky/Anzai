@@ -23,6 +23,7 @@ from app.schemas import (
     NewsInterestOut,
     NewsInterestsOut,
     NewsItemOut,
+    NewsMacroPulseOut,
 )
 
 router = APIRouter(prefix="/news", tags=["news"], dependencies=[Depends(require_user)])
@@ -41,6 +42,7 @@ def _to_out(items) -> list[NewsItemOut]:
             published_at=i.published_at,
             url=i.url,
             symbols=list(i.symbols),
+            region=getattr(i, "region", None) or "cn",
         )
         for i in items
     ]
@@ -57,6 +59,15 @@ def market_boards() -> NewsBoardsOut:
     )
 
 
+@router.get("/macro-pulse", response_model=NewsMacroPulseOut)
+def news_macro_pulse() -> NewsMacroPulseOut:
+    """Shanghai clock + compact gold/oil/FX strip for News market tab."""
+    from app.providers.macro import build_news_macro_strip
+
+    data = build_news_macro_strip()
+    return NewsMacroPulseOut.model_validate(data)
+
+
 @router.get("/market", response_model=NewsFeedOut)
 def market_news(
     limit: int = Query(default=100, ge=1, le=100),
@@ -64,11 +75,16 @@ def market_news(
 ) -> NewsFeedOut:
     board_id = board if board in _BOARD_IDS else "headline"
     title, items = get_market_news(limit=limit, board=board_id)
+    out = _to_out(items)
+    note = ""
+    if not out:
+        note = "资讯源暂时不可用，请稍后下拉刷新"
     return NewsFeedOut(
         kind="market",
         title=title,
         board=board_id,
-        items=_to_out(items),
+        items=out,
+        note=note,
     )
 
 
@@ -79,14 +95,77 @@ def holdings_news(
     user: AuthUser = Depends(require_user),
 ) -> NewsFeedOut:
     rows = (
-        db.query(Holding.symbol)
+        db.query(Holding)
         .filter(Holding.user_id == user.id)
         .order_by(Holding.id.asc())
         .all()
     )
-    symbols = [str(r[0]) for r in rows if r and r[0]]
-    items = get_holdings_news(symbols, limit=limit)
-    return NewsFeedOut(kind="holdings", title="持仓相关", board="", items=_to_out(items))
+    # 按市值/仓位优先：有 shares*cost 粗排；同码去重
+    enriched: list[tuple[float, str, str, str]] = []
+    for h in rows:
+        sym = str(h.symbol or "").strip()
+        if not sym:
+            continue
+        mv = float(h.shares or 0) * float(h.cost or 0)
+        enriched.append((mv, sym, str(h.name or "").strip(), str(h.market or "SH")))
+    enriched.sort(key=lambda x: x[0], reverse=True)
+    symbols: list[str] = []
+    names: dict[str, str] = {}
+    markets: dict[str, str] = {}
+    seen: set[str] = set()
+    for _mv, sym, name, mkt in enriched:
+        if sym in seen:
+            continue
+        seen.add(sym)
+        symbols.append(sym)
+        if name:
+            names[sym] = name
+        markets[sym] = mkt or "SH"
+    items = get_holdings_news(symbols, limit=min(limit * 2, 100), names=names, markets=markets)
+    # Rank by holdings relevance (same scorer as Agent) — cut ETF name-search noise
+    from app.services.news_relevance import news_items_to_dicts, rank_and_trim_news
+
+    hold_kinds: list[str] = []
+    for sym in symbols:
+        mkt = str(markets.get(sym) or "SH").upper()
+        nm = str(names.get(sym) or "")
+        if mkt == "JD" or "黄金" in nm:
+            hold_kinds.append("黄金积存" if mkt == "JD" else "黄金ETF")
+        elif mkt == "OF":
+            hold_kinds.append("场外基金")
+        elif "ETF" in nm.upper() or "基金" in nm:
+            hold_kinds.append("场内ETF")
+        else:
+            hold_kinds.append("股票")
+
+    ranked = rank_and_trim_news(
+        news_items_to_dicts(items, board="holding"),
+        limit=limit,
+        symbols=symbols,
+        names=list(names.values()),
+        asset_kinds=hold_kinds,
+        min_score=0.25,
+    )
+    out_items = [
+        NewsItemOut(
+            id=str(d.get("id") or ""),
+            title=str(d.get("title") or ""),
+            summary=str(d.get("summary") or ""),
+            source=str(d.get("source") or ""),
+            published_at=str(d.get("published_at") or ""),
+            url=str(d.get("url") or ""),
+            symbols=list(d.get("symbols") or []),
+            region=str(d.get("region") or "cn"),
+        )
+        for d in ranked
+    ]
+    return NewsFeedOut(
+        kind="holdings",
+        title="持仓相关",
+        board="",
+        items=out_items,
+        note="" if out_items or not symbols else "暂无与持仓相关的资讯",
+    )
 
 
 @router.get("/interests", response_model=NewsInterestsOut)
@@ -117,7 +196,13 @@ def interests_feed(
     )
     keywords = [str(r[0]) for r in rows if r and r[0]]
     items = get_interests_news(keywords, limit=limit)
-    return NewsFeedOut(kind="interests", title="我的兴趣", board="", items=_to_out(items))
+    out = _to_out(items)
+    note = ""
+    if keywords and not out:
+        note = "兴趣资讯源暂时不可用，请稍后下拉刷新"
+    return NewsFeedOut(
+        kind="interests", title="我的兴趣", board="", items=out, note=note
+    )
 
 
 @router.post("/interests", response_model=NewsInterestOut)

@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 class HoldingBase(BaseModel):
     symbol: str = Field(..., min_length=1, max_length=16)
     name: str = ""
-    market: str = Field(default="SH", pattern="^(SH|SZ|JD)$")
+    market: str = Field(default="SH", pattern="^(SH|SZ|JD|OF)$")
     shares: float = Field(default=0, ge=0)
     cost: float = Field(default=0, ge=0)
     tags: str = ""
@@ -20,7 +20,7 @@ class HoldingCreate(HoldingBase):
 class HoldingUpdate(BaseModel):
     symbol: str | None = Field(default=None, min_length=1, max_length=16)
     name: str | None = None
-    market: str | None = Field(default=None, pattern="^(SH|SZ|JD)$")
+    market: str | None = Field(default=None, pattern="^(SH|SZ|JD|OF)$")
     shares: float | None = Field(default=None, ge=0)
     cost: float | None = Field(default=None, ge=0)
     tags: str | None = None
@@ -173,10 +173,74 @@ class GoldBoardOut(BaseModel):
     note: str = ""
 
 
+class FundBoardItemOut(BaseModel):
+    id: str
+    name: str
+    section: str
+    price: float | None = None
+    change_pct: float | None = None
+    prev: float | None = None
+    unit: str = "元"
+    freshness: str = ""
+    note: str = ""
+    holdable: bool = True
+    symbol: str = ""
+    market: str = ""
+    kind: str = "etf"  # etf | otc
+    chart: list[float] = []
+    chart_times: list[str] = []
+    chart_slots: int = 0
+    chart_session: str = "cn"
+
+
+class FundSearchHitOut(BaseModel):
+    symbol: str
+    name: str
+    market: str = "OF"
+    kind: str = "otc"
+    price: float | None = None
+    change_pct: float | None = None
+    as_of: str = ""
+    fund_type: str = ""
+
+
+class FundSearchOut(BaseModel):
+    query: str
+    items: list[FundSearchHitOut] = []
+
+
+class FundBoardGroupOut(BaseModel):
+    id: str
+    title: str
+    items: list[FundBoardItemOut] = []
+
+
+class FundBoardSectionOut(BaseModel):
+    id: str
+    title: str
+    subtitle: str = ""
+    items: list[FundBoardItemOut] = []
+    groups: list[FundBoardGroupOut] = []
+
+
+class FundBoardOut(BaseModel):
+    sections: list[FundBoardSectionOut] = []
+    note: str = ""
+
+
 class IntradayPointOut(BaseModel):
     time: str
     price: float
     avg: float | None = None
+
+
+class FundNavHistoryOut(BaseModel):
+    symbol: str
+    name: str = ""
+    as_of: str = ""
+    nav: float | None = None
+    change_pct: float | None = None
+    points: list[IntradayPointOut] = []
 
 
 class IntradayOut(BaseModel):
@@ -202,11 +266,13 @@ class ShortBiasOut(BaseModel):
     sample_n: int = 0
     roc_pct: float | None = None
     as_of: str | None = None
+    detail: str | None = None  # 完整多周期说明
+    summary: str | None = None  # 三句：大趋势 / 近端动向 / 可能走向
 
 
 class ShortBiasBatchOut(BaseModel):
     items: list[ShortBiasOut]
-    note: str = "近5根分时动量倾向，非预测、非投资建议"
+    note: str = "多周期动量倾向（含近5分），非预测、非投资建议"
 
 
 class BookLevelOut(BaseModel):
@@ -276,9 +342,10 @@ class SearchHitOut(BaseModel):
     symbol: str
     name: str
     market: str
-    kind: str = "stock"  # stock | etf | index | us
+    kind: str = "stock"  # stock | etf | index | us | ipo
     price: float | None = None
     change_pct: float | None = None
+    note: str | None = None
 
 
 class SearchOut(BaseModel):
@@ -294,6 +361,7 @@ class NewsItemOut(BaseModel):
     published_at: str = ""
     url: str = ""
     symbols: list[str] = []
+    region: str = "cn"
 
 
 class NewsFeedOut(BaseModel):
@@ -301,6 +369,7 @@ class NewsFeedOut(BaseModel):
     title: str
     board: str = ""
     items: list[NewsItemOut]
+    note: str = ""
 
 
 class NewsBoardOut(BaseModel):
@@ -310,6 +379,24 @@ class NewsBoardOut(BaseModel):
 
 class NewsBoardsOut(BaseModel):
     items: list[NewsBoardOut]
+
+
+class NewsMacroPulseItemOut(BaseModel):
+    key: str
+    name: str
+    price: float
+    unit: str = ""
+    change_pct: float | None = None
+    freshness: str = ""
+
+
+class NewsMacroPulseOut(BaseModel):
+    as_of: str = ""
+    weekday: str = ""
+    session_hint: str = ""
+    calendar: str = ""
+    items: list[NewsMacroPulseItemOut] = []
+    note: str = ""
 
 
 class NewsArticleOut(BaseModel):
@@ -392,8 +479,8 @@ class AnalysisCatalogOut(BaseModel):
 
 
 class AnalysisSymbolIn(BaseModel):
-    symbol: str = Field(..., min_length=1, max_length=16)
-    market: str = Field(default="SH", pattern="^(SH|SZ)$")
+    symbol: str = Field(..., min_length=1, max_length=32)
+    market: str = Field(default="SH", pattern="^(SH|SZ|JD|OF|GDS)$")
     name: str = ""
 
 
@@ -436,12 +523,24 @@ class AnalysisDebateRoundOut(BaseModel):
     bullets: list[str] = []
 
 
+class AnalysisRebalanceOut(BaseModel):
+    kind: str = "rebalance"
+    empty: bool = False
+    stance: str = "观望为主"
+    day_pnl_pct: float | None = None
+    head: dict | None = None
+    notes: list[str] = []
+
+
 class AnalysisReportOut(BaseModel):
     verdict: str
     stance: str = "中性"
     confidence: float = 0.5
     highlights: list[str] = []  # ≤2 overall key points
     watch: list[str] = []  # stocks / points to watch after overall verdict
+    watch_refs: list[str] = []
+    open_resolutions: list[str] = []
+    unresolved: list[str] = []
     holding_lines: list[str] = []  # evidence one-liners for current holdings
     items: list[AnalysisSymbolSummaryOut] = []  # per-symbol briefs
     # retained for P1 / older clients; UI no longer surfaces these
@@ -450,7 +549,11 @@ class AnalysisReportOut(BaseModel):
     actions: list[str] = []
     agents: list[AnalysisAgentStepOut] = []
     debate: list[AnalysisDebateRoundOut] = []
+    rebalance: AnalysisRebalanceOut | None = None
     template: bool = False
+    degraded: bool = False
+    failed_seats: list[str] = []
+    quality_note: str = ""
 
 
 class AnalysisJobOut(BaseModel):

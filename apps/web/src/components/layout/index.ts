@@ -1,6 +1,10 @@
 export { AppShell } from "./AppShell";
 export { AppleSplashLinks } from "./AppleSplashLinks";
 export { InstallPrompt } from "./InstallPrompt";
+export { OfflineBanner } from "./OfflineBanner";
+export { ShellBase, ShellLayer, ShellRoot } from "./ShellStack";
+export { ShellChromeProvider, useShellChrome } from "./ShellChromeContext";
 export { StatusBar } from "./StatusBar";
 export { TabBar } from "./TabBar";
 export { TabCache } from "./TabCache";
+export { ServiceWorkerRegister } from "./ServiceWorkerRegister";

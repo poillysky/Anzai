@@ -2,7 +2,7 @@ export type Holding = {
   id: number;
   symbol: string;
   name: string;
-  market: "SH" | "SZ" | "JD";
+  market: "SH" | "SZ" | "JD" | "OF";
   shares: number;
   cost: number;
   tags: string;
@@ -138,10 +138,60 @@ export type GoldBoard = {
   note?: string;
 };
 
+/** Fund board item — ETF (live) or OTC open-end (daily NAV). */
+export type FundBoardItem = GoldBoardItem & {
+  kind?: "etf" | "otc" | string;
+};
+
+export type FundBoardGroup = {
+  id: string;
+  title: string;
+  items: FundBoardItem[];
+};
+
+export type FundBoardSection = {
+  id: string;
+  title: string;
+  subtitle?: string;
+  items: FundBoardItem[];
+  /** Present on 行业：煤炭 / 贵金属 / 电子… */
+  groups?: FundBoardGroup[];
+};
+
+export type FundBoard = {
+  sections: FundBoardSection[];
+  note?: string;
+};
+
+export type FundSearchHit = {
+  symbol: string;
+  name: string;
+  market: string;
+  kind: string;
+  price?: number | null;
+  change_pct?: number | null;
+  as_of?: string;
+  fund_type?: string;
+};
+
+export type FundSearchResult = {
+  query: string;
+  items: FundSearchHit[];
+};
+
 export type IntradayPoint = {
   time: string;
   price: number;
   avg?: number | null;
+};
+
+export type FundNavHistory = {
+  symbol: string;
+  name?: string;
+  as_of?: string;
+  nav?: number | null;
+  change_pct?: number | null;
+  points: IntradayPoint[];
 };
 
 export type IntradaySeries = {
@@ -167,6 +217,10 @@ export type ShortBias = {
   sample_n?: number;
   roc_pct?: number | null;
   as_of?: string | null;
+  /** 完整多周期说明（备用） */
+  detail?: string | null;
+  /** 卡片短文，如「偏涨暂稳」「偏跌中抬头」 */
+  summary?: string | null;
 };
 
 export type ShortBiasBatch = {
@@ -219,8 +273,12 @@ export type LeaderStock = {
   market: string;
   price: number;
   change_pct?: number | null;
+  prev_close?: number | null;
   amount?: number | null;
   turnover?: number | null;
+  /** search/ipo: stock | etf | ipo … */
+  kind?: string | null;
+  note?: string | null;
 };
 
 export type LeadersBoard = {
@@ -241,9 +299,11 @@ export type SearchHit = {
   symbol: string;
   name: string;
   market: string;
-  kind: "stock" | "etf" | "index" | "us" | string;
+  kind: "stock" | "etf" | "index" | "us" | "ipo" | string;
   price?: number | null;
   change_pct?: number | null;
+  /** 新股待上市等补充说明 */
+  note?: string | null;
 };
 
 export type SearchResult = {
@@ -259,6 +319,7 @@ export type NewsItem = {
   published_at: string;
   url: string;
   symbols: string[];
+  region?: string;
 };
 
 export type NewsFeed = {
@@ -266,11 +327,30 @@ export type NewsFeed = {
   title: string;
   board?: string;
   items: NewsItem[];
+  note?: string;
 };
 
 export type NewsBoard = {
   id: string;
   label: string;
+};
+
+export type NewsMacroPulseItem = {
+  key: string;
+  name: string;
+  price: number;
+  unit?: string;
+  change_pct?: number | null;
+  freshness?: string;
+};
+
+export type NewsMacroPulse = {
+  as_of: string;
+  weekday: string;
+  session_hint: string;
+  calendar: string;
+  items: NewsMacroPulseItem[];
+  note?: string;
 };
 
 export type NewsInterest = {
@@ -338,7 +418,7 @@ export type NewsArticle = {
 export type HoldingCreate = {
   symbol: string;
   name?: string;
-  market?: "SH" | "SZ" | "JD";
+  market?: "SH" | "SZ" | "JD" | "OF";
   shares: number;
   cost: number;
   tags?: string;
@@ -348,7 +428,7 @@ export type HoldingCreate = {
 export type HoldingUpdate = {
   symbol?: string;
   name?: string;
-  market?: "SH" | "SZ" | "JD";
+  market?: "SH" | "SZ" | "JD" | "OF";
   shares?: number;
   cost?: number;
   tags?: string;
@@ -430,6 +510,15 @@ export type AnalysisDebateRound = {
   bullets?: string[];
 };
 
+export type AnalysisRebalance = {
+  kind?: "rebalance" | string;
+  empty?: boolean;
+  stance?: string;
+  day_pnl_pct?: number | null;
+  head?: { symbol: string; name: string; weight?: number } | null;
+  notes?: string[];
+};
+
 export type AnalysisReport = {
   verdict: string;
   stance: string;
@@ -449,7 +538,13 @@ export type AnalysisReport = {
   actions?: string[];
   agents?: AnalysisAgentStep[];
   debate?: AnalysisDebateRound[];
+  /** Deterministic 调仓草案（仓库巡检） */
+  rebalance?: AnalysisRebalance | null;
   template?: boolean;
+  /** 部分席位失败或模板兜底 */
+  degraded?: boolean;
+  failed_seats?: string[];
+  quality_note?: string;
 };
 
 export type AnalysisStructureRow = {

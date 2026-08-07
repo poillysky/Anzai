@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 _SH = ZoneInfo("Asia/Shanghai")
@@ -39,6 +39,35 @@ def quote_is_for_shanghai_today(as_of: str | None) -> bool:
     if d is None:
         return True
     return d == shanghai_today()
+
+
+def prev_cn_session_day(d: date | None = None) -> date:
+    """Previous SSE/SZSE session day (skip weekends + published holidays)."""
+    from app.providers.exchange_holidays import is_cn_trading_day
+
+    cur = (d or shanghai_today()) - timedelta(days=1)
+    for _ in range(14):
+        if is_cn_trading_day(cur):
+            return cur
+        cur -= timedelta(days=1)
+    return cur
+
+
+def quote_counts_for_day_pnl(as_of: str | None, market: str = "SH") -> bool:
+    """Whether this quote may feed warehouse 「今日盈亏」.
+
+    - A-share / default: must be Shanghai calendar today (avoid overnight stale %).
+    - OF 场外净值: PDATE is often T−1; accept if ≥ previous session day.
+    - JD 积存金: usually no as_of → True; if dated, same as OF (settle lag ok).
+    """
+    m = (market or "").upper()
+    d = parse_as_of_date(as_of)
+    if d is None:
+        return True
+    today = shanghai_today()
+    if m in {"OF", "JD"}:
+        return d >= prev_cn_session_day(today)
+    return d == today
 
 
 def a_share_day_label(as_of: str | None) -> str:
