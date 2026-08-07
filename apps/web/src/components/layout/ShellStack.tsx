@@ -88,7 +88,6 @@ export function ShellLayer({
   );
 
   const onTouchEnd = useCallback(() => {
-    const start = startRef.current;
     startRef.current = null;
     setDragging(false);
     if (!onEdgeBack) {

@@ -26,7 +26,8 @@ export function ShellChromeProvider({ children }: { children: ReactNode }) {
       if (prev[ownerId] === nextDeep) return prev;
       if (!nextDeep) {
         if (!(ownerId in prev)) return prev;
-        const { [ownerId]: _, ...rest } = prev;
+        const rest = { ...prev };
+        delete rest[ownerId];
         return rest;
       }
       return { ...prev, [ownerId]: true };
@@ -53,7 +54,7 @@ export function useShellChrome() {
   if (!ctx) {
     return {
       tabHidden: false,
-      reportOverlay: (_ownerId: string, _deep: boolean) => {},
+      reportOverlay: () => {},
     };
   }
   return ctx;

@@ -97,7 +97,7 @@ function usTimeToSlot(hhmm: string): number | null {
 function day24TimeToSlot(hhmm: string): number | null {
   const parts = hhmm.split(":");
   if (parts.length < 2) return null;
-  let h = Number(parts[0]);
+  const h = Number(parts[0]);
   const m = Number(parts[1]);
   if (Number.isNaN(h) || Number.isNaN(m)) return null;
   if (h === 24 && m === 0) return DAY24_SLOTS - 1;
