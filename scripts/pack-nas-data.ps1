@@ -41,17 +41,12 @@ Copy-Item (Join-Path $root "deploy\.env.example") (Join-Path $outRoot ".env.exam
 $localEnv = Join-Path $api ".env"
 if (Test-Path $localEnv) {
   Copy-Item $localEnv (Join-Path $outRoot ".env") -Force
-  # Force NAS sqlite path + no knowledge
+  # Force NAS sqlite path only (knowledge URL comes from admin / .env)
   $envText = Get-Content (Join-Path $outRoot ".env") -Raw -Encoding UTF8
   if ($envText -match "(?m)^DATABASE_URL=.*") {
     $envText = $envText -replace "(?m)^DATABASE_URL=.*", "DATABASE_URL=sqlite:////app/data/anzai.db"
   } else {
     $envText = "DATABASE_URL=sqlite:////app/data/anzai.db`r`n" + $envText
-  }
-  if ($envText -match "(?m)^KNOWLEDGE_DATABASE_URL=.*") {
-    $envText = $envText -replace "(?m)^KNOWLEDGE_DATABASE_URL=.*", "KNOWLEDGE_DATABASE_URL="
-  } else {
-    $envText = $envText.TrimEnd() + "`r`nKNOWLEDGE_DATABASE_URL=`r`n"
   }
   Set-Content -Path (Join-Path $outRoot ".env") -Value $envText -Encoding UTF8 -NoNewline
 }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -88,6 +89,15 @@ def write_env_updates(updates: dict[str, str]) -> Path:
 
     ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
     ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # Docker env_file injects vars at start; OS env beats .env in pydantic-settings.
+    # Keep process env in sync so admin saves (e.g. knowledge IP) actually stick.
+    for key, value in clean.items():
+        if value:
+            os.environ[key] = value
+        else:
+            os.environ.pop(key, None)
+
     reload_settings()
     return ENV_PATH
 

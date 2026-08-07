@@ -614,6 +614,9 @@ def admin_knowledge_db_save(
         dbname=KB_DBNAME,
     )
     write_env_updates({"KNOWLEDGE_DATABASE_URL": url})
+    from app.core.config import reload_settings
+
+    reload_settings()
     request.session["admin_ok"] = True
     if url:
         _set_flash(request, "知识库 Postgres 已保存", "ok")

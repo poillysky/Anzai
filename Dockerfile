@@ -1,5 +1,5 @@
 # Combined Anzai image: FastAPI (8515) + Next.js PWA (3515)
-# Build from repo root: docker build -t poillysky/anzai:1.0.1 .
+# Build from repo root: docker build -t poillysky/anzai:1.0.2 .
 
 FROM node:22-bookworm-slim AS web-build
 WORKDIR /web
