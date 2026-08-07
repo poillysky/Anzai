@@ -149,7 +149,7 @@ export function biasChipTitle(bias: ShortBias, market: string, symbol: string): 
   return `${bias.label}${roc} · 近5分动量，非预测`;
 }
 
-export function biasChipClass(bias: ShortBias, market: string, symbol: string): string {
+export function biasChipClass(bias: ShortBias): string {
   if (bias.bias === "closed") {
     return "portfolio-card-bias-chip bias-closed";
   }

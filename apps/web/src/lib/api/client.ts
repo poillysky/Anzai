@@ -59,7 +59,8 @@ async function request<T>(
   init?: RequestInit & { auth?: boolean },
 ): Promise<T> {
   const includeAuth = init?.auth !== false;
-  const { auth: _auth, ...rest } = init || {};
+  const rest: RequestInit = { ...(init || {}) };
+  delete (rest as { auth?: boolean }).auth;
   const res = await fetch(`${API_BASE}${path}`, {
     ...rest,
     headers: {

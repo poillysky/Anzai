@@ -441,7 +441,7 @@ export default function PortfolioScreen() {
   const [returnsOpen, setReturnsOpen] = useState(false);
   const [returnsOpening, setReturnsOpening] = useState(false);
   const [returnsDim, setReturnsDim] = useState<PortfolioReturnsDim>("day");
-  const [returnsRef, setReturnsRef] = useState<string | undefined>();
+  const [, setReturnsRef] = useState<string | undefined>();
   const [returnsData, setReturnsData] = useState<PortfolioReturnsSummary | null>(() =>
     cachePeek<PortfolioReturnsSummary>(PrefetchKeys.portfolioReturns("day")),
   );
